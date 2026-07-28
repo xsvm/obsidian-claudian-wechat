@@ -15,10 +15,12 @@
 
 Claudian 把 Claude Code（以及其他编程 agent）嵌入 Obsidian 的侧边栏聊天窗口。微信 ClawBot 是微信官方开放的能力，允许一个 bot 账号通过长轮询 HTTP 接口跟微信用户收发消息。这两边彼此完全不知道对方的存在，这个项目就是中间那一层。
 
-由两个相互独立的部分组成：
+由两部分组成，但打包成同一个 Obsidian 插件文件夹一起分发：
 
 - `obsidian-plugin/` —— 一个很薄的 Obsidian 插件（`wechat-bridge`），跟 Claudian 一起跑在 Obsidian 里。它对外暴露一个本地 HTTP 接口，直接操作 Claudian 自己的聊天 Tab / 运行时对象，跟 Claudian 自己的 UI 走的是同一套逻辑。
-- `relay/relay.py` —— 一个独立运行的 Python 进程，负责说微信 ClawBot 的协议（扫码登录、长轮询 `getUpdates`、`sendMessage`），把纯文本在微信和这个 Obsidian 插件的 HTTP 接口之间来回转发。
+- `obsidian-plugin/relay.py` —— 跟插件放在同一个文件夹里的 Python 脚本，负责说微信 ClawBot 的协议（扫码登录、长轮询 `getUpdates`、`sendMessage`），把纯文本在微信和这个 Obsidian 插件的 HTTP 接口之间来回转发。
+
+`relay.py` 整个生命周期都由插件自己管理：加载时，插件会找一个系统 Python，在自己的插件文件夹里建一个专用虚拟环境（`venv/`，只在第一次运行时建）、装好需要的 Python 包，如果还没登录过微信就在 Obsidian 里弹一个二维码登录窗口，然后把 `relay.py serve` 当自己的子进程拉起来。插件被禁用或者 Obsidian 关闭，relay 进程也会跟着一起没。不需要单独安装、配置，或者手动保持它常驻——启用插件本身就是全部的安装步骤。
 
 这两部分不会同时跟"微信服务器"和"Obsidian 内部对象"打交道——它们之间唯一的接口就是那次 HTTP 调用，而且永远不会离开 `127.0.0.1`。
 
@@ -31,7 +33,7 @@ Claudian 把 Claude Code（以及其他编程 agent）嵌入 Obsidian 的侧边�
 微信 ClawBot（官方功能，腾讯服务器）
     |  iLink API：扫码登录、长轮询 getUpdates、sendMessage
     v
-relay/relay.py                              （本仓库，Python，常驻运行）
+relay.py                                    （随插件一起打包，由插件拉起并管理）
     |  HTTP POST 127.0.0.1:39217/message     （仅本机回环）
     v
 obsidian-plugin (wechat-bridge)              （本仓库，TypeScript，运行在 Obsidian 内）
@@ -45,6 +47,7 @@ Claude Code / 你配置的 provider
 
 ## 功能
 
+- 零配置连接：插件自己搭建 Python 环境、通过 Obsidian 内嵌的窗口完成微信首次扫码登录、自己管理 relay 进程——启用插件就是全部的安装步骤。
 - 双向对话：微信消息会被当作手动输入注入到 Claudian 专属的一个 Tab 里，Claudian 的回复会发回同一个微信对话。
 - 从微信管理会话：
   - `/list` —— 列出 Claudian 已有的会话（按更新时间倒序）
@@ -58,19 +61,17 @@ Claude Code / 你配置的 provider
 - 回复过滤：只把 assistant 最终的文字叙述发给微信，工具调用、思考过程、子代理这些执行细节不会被转发。
 - 双语回复：这个插件发出的所有文字（帮助、列表、确认提示、报错）都同时准备了中文和英文版本，语言会根据 Claudian 自己的 `locale` 设置自动选择——不需要额外维护一份语言设置。
 - 带重试的转发：跟 Obsidian 插件的连接出现暂时性失败时，会先按短间隔重试几次，重试全部失败才会报错，而不是每次小抖动都直接报给你看。
-- 对开机自启友好：relay 设计成可以无控制台窗口静默运行，并且能容忍在 Obsidian 还没加载完时就被拉起。
+- 上下文窗口用量：每一次真实回复（微信触发的，或 `/listen` 镜像推送的）末尾都会带上一行"上下文窗口：已用/总量"，双语，读取自 Claudian 自己的会话元数据。
 
 ## 依赖要求
 
-- 桌面版 Obsidian（Claudian 是 `isDesktopOnly`，本项目也是）。目前在 Windows 上开发和测试；插件和 relay 脚本本身都没有 Windows 专属的代码，唯一例外是那个可选的开机自启辅助脚本，所以其他桌面平台理论上验证后也能用。
+- 桌面版 Obsidian（Claudian 是 `isDesktopOnly`，本项目也是）。目前在 Windows 上开发和测试；插件和 `relay.py` 本身都没有 Windows 专属的代码，macOS/Linux 理论上验证后也能用。
 - 已安装并启用 [Claudian](https://github.com/YishenTu/claudian)，并配置好一个可用的 provider（本项目目前只管 provider id 为 `claude` 的这个）。
 - 微信（iOS 或安卓）能使用官方 ClawBot 功能。
-- Node.js 和 npm，用来从源码构建 Obsidian 插件。
-- Python 3.11+ 以及 [`wechat-clawbot`](https://github.com/nightsailer/wechat-clawbot)（`pip install wechat-clawbot`），`relay.py` 就是built在它提供的微信 ClawBot iLink 协议客户端（扫码登录、长轮询、媒体/CDN 处理）之上的。
+- 电脑上 `PATH` 里能找到 Python 3.11+（`python`、`python3`、或 Windows 的 `py` 启动器）。插件只需要能找到它一次，用来建自己的专用虚拟环境——不会用你的系统 Python 做别的事，也不需要你提前装好 `wechat-clawbot` 或任何其他包。
+- Node.js 和 npm，仅在你要从源码构建插件时才需要，装现成打包好的发布版就不需要。
 
 ## 安装
-
-### 1. Obsidian 插件
 
 ```
 cd obsidian-plugin
@@ -78,29 +79,18 @@ npm install
 npm run build
 ```
 
-把编译出来的文件——`manifest.json`、`main.js`，如果有的话还有 `data.json`——复制（或软链接）到 `<vault>/.obsidian/plugins/wechat-bridge/`，然后在 设置 -> 第三方插件 里启用 "WeChat Bridge"。记得至少打开一次 Claudian 侧边栏，这样插件才能找到一个视图挂上去。
+把 `obsidian-plugin/` 整个文件夹里的内容——`manifest.json`、`main.js`、`relay.py`，如果有的话还有 `data.json`——复制（或软链接）到 `<vault>/.obsidian/plugins/wechat-bridge/`，然后在 设置 -> 第三方插件 里启用 "WeChat Bridge"。记得至少打开一次 Claudian 侧边栏，这样插件才能找到一个视图挂上去。
 
-这个插件只监听 `127.0.0.1:39217`，不会暴露在任何网络接口上。
+到这就完了。插件第一次加载时会依次：
 
-### 2. 微信 relay
+1. 找系统 Python，在自己的插件文件夹里建 `venv/`（几秒钟，会有 Notice 提示）。
+2. 往这个 venv 里装它需要的 Python 依赖（第一次需要联网）。
+3. 如果还没有保存过微信登录状态，在 Obsidian 里弹一个带二维码的窗口——用微信扫码连接 ClawBot。
+4. 把 `relay.py serve` 当自己的子进程拉起来，开始转发。
 
-```
-pip install wechat-clawbot
-cd relay
-python relay.py login   # 一次性扫码登录，同时会生成 qrcode.png
-python relay.py serve   # 常驻运行：双向转发消息
-```
+从此以后，启用插件就够了：不需要单独开终端、不需要手动 `pip install`、不需要自己配置开机自启项。禁用/卸载插件，relay 进程也会跟着停掉。
 
-`login` 只需要跑一次（凭据会被 `wechat-clawbot` 缓存到 `~/.claude/channels/wechat/`）。`serve` 是需要一直跑着的常驻进程（见下面的开机自启部分）。
-
-### 3. 开机自启（可选）
-
-目标机器上用两个 Windows 启动文件夹快捷方式来实现：
-
-- Obsidian 本体，正常启动（它会自动重新打开上次的 vault）。
-- `relay.py serve`，通过一个很小的 `.vbs` 包装脚本静默启动，避免 `pythonw` 没有控制台导致基于 `print()` 的日志出问题，输出被重定向到日志文件。
-
-`relay.py serve` 会在第一次请求前等待十秒，给 Obsidian 和插件留出加载时间；不管启动顺序如何，它之后都能自愈重试。
+插件的 HTTP 接口永远只监听 `127.0.0.1:39217`，不会暴露在任何网络接口上。如果你想自己手动管理 Python 那一侧，`relay.py` 仍然可以手动运行（`python relay.py login` / `python relay.py serve`）——但**不要在插件启用的同时手动跑一个 `serve`**：插件每次加载都会拉起自己的 `relay.py serve`，并不会检测是否已经有一个实例在跑，两边同时跑会变成两个进程抢同一个微信账号。
 
 ## 用法
 
@@ -138,6 +128,8 @@ python relay.py serve   # 常驻运行：双向转发消息
 
 以上都不是 Claudian 正式声明、有版本保证的公开 API，而是通过 `app.plugins.plugins["realclaudian"]` 拿到的内部对象。TypeScript 的 `private` 只在编译期起作用，所以这样能行得通，但这也意味着它跟 Claudian 当前的内部结构是耦合的，Claudian 版本更新时可能需要跟着做小幅调整。
 
+**relay 的整个生命周期由 `RelayManager` 管理，跟插件自己绑定在一起。** 它会依次尝试 `python`/`python3`/`py` 这几个命令，找到能用的就用它在插件自己的文件夹里建一个专用 `venv/`（完全不碰系统全局的 Python 包），往里面装好那几个依赖，然后才把 `relay.py serve` 当一个直接的子进程（不是 detached）拉起来——这样 relay 的生命周期就精确地等于插件的生命周期，不需要额外配置任何操作系统层面的开机自启项。首次登录复用的是 `relay.py` 原有的扫码登录流程，只是多加了个 `--json` 参数，让它往 stdout 输出一行一个的 JSON 事件（`qrcode`/`success`/`failed`）而不是人类阅读的日志文字，插件这边用 Node 的 `readline` 读取，再用一个很小的、纯 JS、没有原生依赖的二维码渲染库（`qrcode-generator`）把二维码直接渲染进一个 Obsidian 的 `Modal` 里——也就是说二维码是本地生成的，不是从任何地方拉取的图片。
+
 ## 已知限制
 
 - 设计上只针对单个微信 ClawBot 绑定、单个 Claudian provider（`claude`），不是为多账号或多 provider 路由设计的。
@@ -145,6 +137,7 @@ python relay.py serve   # 常驻运行：双向转发消息
 - 机器人不能主动发起对话；微信协议要求必须用户先发消息，才能被动回复。
 - 如果 Claudian 在很早期就回滚了一轮对话（比如 provider 服务还没初始化好，此时还没有任何 assistant 文字生成），这个失败只会以 Obsidian 的 `Notice` 弹层形式出现，本插件看不到这个弹层。这种情况下微信只会收到一条通用的"没有回复"提示，而不是具体的报错内容。
 - 同时从 Claudian 自己的 UI 和从微信操作并不是完全无竞争的；发给插件 HTTP 接口的请求会被串行处理，但两边同时往同一个 Tab 里打字并不是这个项目设计要支持的场景。
+- 插件不会检测是否已经有一个 `relay.py serve` 在跑就直接拉起自己的——如果你在插件启用的同时又手动跑了一个，会变成两个进程同时轮询同一个微信账号。
 
 ## 致谢
 

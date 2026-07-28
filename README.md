@@ -15,10 +15,12 @@ WeChat messages are relayed into a live Claudian session, and Claudian's reply i
 
 Claudian embeds Claude Code (and other coding agents) as a chat sidebar inside Obsidian. WeChat ClawBot is an official WeChat feature that lets a bot account exchange messages with a WeChat user over a long-poll HTTP API. Neither side knows about the other. This project is the piece in between.
 
-It is made of two independent parts:
+It is made of two parts that ship together as one Obsidian plugin folder:
 
 - `obsidian-plugin/` — a small Obsidian plugin (`wechat-bridge`) that runs inside Obsidian alongside Claudian. It exposes a local HTTP endpoint and drives Claudian's own chat tab/runtime objects directly, the same way Claudian's own UI does.
-- `relay/relay.py` — a standalone Python process that speaks the WeChat ClawBot protocol (QR login, long-poll `getUpdates`, `sendMessage`) and forwards plain text to and from the Obsidian plugin's HTTP endpoint.
+- `obsidian-plugin/relay.py` — a Python script, bundled in the same folder, that speaks the WeChat ClawBot protocol (QR login, long-poll `getUpdates`, `sendMessage`) and forwards plain text to and from the Obsidian plugin's HTTP endpoint.
+
+The plugin manages `relay.py`'s entire lifecycle itself: on load, it locates a system Python, creates a private virtual environment inside its own plugin folder (`venv/`, first run only), installs the couple of Python packages it needs, drives QR login through an in-Obsidian modal if there's no saved session yet, and then spawns `relay.py serve` as its own child process. If the plugin is disabled or Obsidian closes, the relay process goes with it. There is nothing to install, configure, or keep running separately - enabling the plugin is the whole setup.
 
 Neither part talks to WeChat's servers and Obsidian's internals at the same time. The HTTP call between them is the only seam, and it never leaves `127.0.0.1`.
 
@@ -31,7 +33,7 @@ WeChat user
 WeChat ClawBot (official, Tencent-hosted)
     |  iLink API: QR login, long-poll getUpdates, sendMessage
     v
-relay/relay.py                              (this repo, Python, always running)
+relay.py                                    (bundled with the plugin, spawned and owned by it)
     |  HTTP POST 127.0.0.1:39217/message     (loopback only)
     v
 obsidian-plugin (wechat-bridge)              (this repo, TypeScript, runs inside Obsidian)
@@ -45,6 +47,7 @@ Claude Code / the configured provider
 
 ## Features
 
+- Zero-config connection: the plugin bootstraps its own Python environment, handles first-time WeChat QR login through an in-Obsidian modal, and manages the relay process itself. Enabling the plugin is the entire setup.
 - Two-way chat: a WeChat message is injected into a dedicated Claudian tab as if typed by hand, and Claudian's reply is sent back to the same WeChat conversation.
 - Conversation management from WeChat:
   - `/list` — list existing Claudian conversations (most recently updated first)
@@ -58,19 +61,17 @@ Claude Code / the configured provider
 - Reply filtering: only the assistant's final narrative text is sent to WeChat. Tool calls, thinking blocks, and subagent chatter are not forwarded.
 - Bilingual replies: every string this bridge sends (help, lists, confirmations, errors) is available in Chinese and English, and the language is picked automatically from Claudian's own `locale` setting — no separate setting to keep in sync.
 - Retried delivery: a transient failure to reach the Obsidian plugin is retried a few times with short backoff before it is reported as an error, instead of surfacing every brief hiccup.
-- Autostart-friendly: the relay is designed to run headless (no console window) and tolerates being launched before Obsidian has finished loading.
+- Context window usage: every real reply (WeChat-triggered or `/listen`-mirrored) ends with a `context window: used/total` line, bilingual, read from Claudian's own session metadata.
 
 ## Requirements
 
-- Desktop Obsidian (Claudian is `isDesktopOnly`, and this bridge is as well). Developed and tested on Windows; nothing in either the plugin or the relay script is Windows-specific except the optional autostart helper, so other desktop platforms should work once verified there.
+- Desktop Obsidian (Claudian is `isDesktopOnly`, and this bridge is as well). Developed and tested on Windows; nothing in either the plugin or `relay.py` is Windows-specific, so macOS/Linux should work once verified there.
 - [Claudian](https://github.com/YishenTu/claudian) installed and enabled, with an active provider (this bridge currently targets provider id `claude`).
 - WeChat (iOS or Android) with access to the official ClawBot feature.
-- Node.js and npm, to build the Obsidian plugin from source.
-- Python 3.11+ and [`wechat-clawbot`](https://github.com/nightsailer/wechat-clawbot) (`pip install wechat-clawbot`), which supplies the WeChat ClawBot iLink protocol client (QR login, long-poll, media/CDN handling) that `relay.py` builds on.
+- A Python 3.11+ installation somewhere on `PATH` (`python`, `python3`, or the Windows `py` launcher). The plugin only needs to be able to find it once, to create its own private virtual environment - it does not use your system Python for anything else, and does not require `wechat-clawbot` or any other package to be pre-installed.
+- Node.js and npm, only if you're building the plugin from source rather than installing a packaged release.
 
 ## Installation
-
-### 1. Obsidian plugin
 
 ```
 cd obsidian-plugin
@@ -78,29 +79,18 @@ npm install
 npm run build
 ```
 
-Copy (or symlink) the resulting folder — `manifest.json`, `main.js`, `data.json` if present — into `<vault>/.obsidian/plugins/wechat-bridge/`, then enable "WeChat Bridge" under Settings -> Community plugins. Keep the Claudian sidebar open at least once so the plugin can find a view to attach to.
+Copy (or symlink) the whole `obsidian-plugin/` folder's contents — `manifest.json`, `main.js`, `relay.py`, `data.json` if present — into `<vault>/.obsidian/plugins/wechat-bridge/`, then enable "WeChat Bridge" under Settings -> Community plugins. Keep the Claudian sidebar open at least once so the plugin can find a view to attach to.
 
-The plugin listens on `127.0.0.1:39217` only. It is never exposed on any network interface.
+That's it. On first load the plugin will, in order:
 
-### 2. WeChat relay
+1. Look for a system Python and create `venv/` inside its own plugin folder (a few seconds, shows a Notice).
+2. Install its Python dependencies into that venv (needs an internet connection the first time only).
+3. If there's no saved WeChat session yet, open a modal in Obsidian with a QR code - scan it with WeChat to connect ClawBot.
+4. Spawn `relay.py serve` as its own child process and start relaying.
 
-```
-pip install wechat-clawbot
-cd relay
-python relay.py login   # one-time QR login; also writes qrcode.png
-python relay.py serve   # long-running: forwards messages both ways
-```
+From then on, enabling the plugin is enough: no separate terminal, no manual `pip install`, no OS-level autostart entry to configure. Disabling/unloading the plugin stops the relay process with it.
 
-`login` only needs to run once (credentials are cached by `wechat-clawbot` under `~/.claude/channels/wechat/`). `serve` is the long-running process and should be kept running (see Autostart below).
-
-### 3. Autostart (optional)
-
-Two Windows Startup-folder shortcuts cover this on the target machine:
-
-- Obsidian itself, launched normally (it reopens the last vault).
-- `relay.py serve`, launched hidden through a small `.vbs` wrapper so `pythonw`'s lack of a console does not break `print()`-based logging, with output redirected to a log file.
-
-`relay.py serve` waits ten seconds before its first request to give Obsidian and the plugin time to finish loading; it self-heals afterward regardless of ordering.
+The plugin's HTTP endpoint only ever listens on `127.0.0.1:39217`; it is never exposed on any network interface. `relay.py` can still be run by hand (`python relay.py login` / `python relay.py serve`) for manual/advanced use - but don't run a manual `serve` at the same time the plugin is enabled: the plugin always spawns its own `relay.py serve` on load, and it does not check whether another instance is already running, so both would end up polling the same WeChat account at once.
 
 ## Usage
 
@@ -138,6 +128,8 @@ All of the above are bilingual; replies come back in Chinese or English dependin
 
 None of the above are declared, versioned public APIs of Claudian; they are internal objects reached through `app.plugins.plugins["realclaudian"]`. TypeScript's `private` only exists at compile time, so this works, but it is coupled to Claudian's current internal structure and may need small updates across Claudian releases.
 
+**The relay's whole lifecycle is owned by `RelayManager`, tied to the plugin's own.** It shells out to whichever of `python`/`python3`/`py` it finds to create a private `venv/` inside the plugin's own folder (never touching any system-wide Python packages), installs its few dependencies into that venv, and only then spawns `relay.py serve` as a direct child process (not detached) - so the relay's lifetime is exactly the plugin's lifetime, with no separate OS-level autostart entry to keep in sync. First-time login reuses `relay.py`'s existing QR flow, just with a `--json` flag that makes it emit single-line JSON events (`qrcode`/`success`/`failed`) on stdout instead of human-readable log text, which the plugin reads with Node's `readline` and renders into an Obsidian `Modal` using a small bundled QR-rendering library (`qrcode-generator`, pure JS, no native dependencies) - so the QR code itself is generated locally, not fetched as an image from anywhere.
+
 ## Limitations
 
 - Targets a single WeChat ClawBot binding and a single Claudian provider (`claude`) by design; not built for multi-account or multi-provider routing.
@@ -145,6 +137,7 @@ None of the above are declared, versioned public APIs of Claudian; they are inte
 - The bot cannot open a conversation first; WeChat's protocol is reply-only until the user sends a message.
 - If Claudian rolls back a turn very early (before any assistant text exists — for example, if the provider service failed to initialize) the failure surfaces only as an Obsidian `Notice` toast, which this bridge cannot see. WeChat gets a generic "no reply" message in that case, not the specific error text.
 - Concurrent use from Claudian's own UI and from WeChat at the same time is not race-proof; requests to the plugin's HTTP endpoint are serialized, but two people typing into the exact same tab simultaneously is not a designed scenario.
+- The plugin does not check whether a `relay.py serve` is already running before spawning its own; running one manually while the plugin is also enabled results in two processes polling the same WeChat account.
 
 ## Acknowledgments
 

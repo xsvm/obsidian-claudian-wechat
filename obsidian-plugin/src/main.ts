@@ -2,6 +2,7 @@ import { Plugin, FileSystemAdapter } from 'obsidian';
 import * as http from 'http';
 import * as fs from 'fs/promises';
 import * as path from 'path';
+import { RelayManager } from './relayManager';
 
 /**
  * WeChat Bridge
@@ -244,17 +245,30 @@ export default class WeChatBridgePlugin extends Plugin {
   /** True while this plugin's own sendChatMessage() is driving a turn, so the
    * /listen poller does not mistake a WeChat-originated turn for a desktop one. */
   private sendingViaBridge = false;
+  private relayManager: RelayManager | null = null;
 
   async onload() {
     const saved = await this.loadData();
     this.data = { ...DEFAULT_DATA, ...(saved ?? {}) };
     this.startServer();
     this.registerInterval(window.setInterval(() => this.checkForDesktopActivity(), LISTEN_POLL_INTERVAL_MS));
+
+    // Owns the whole "get connected" path so installing this plugin is enough
+    // on its own: private Python env, one-time QR login, and the relay
+    // process itself, all tied to this plugin's own lifetime. Runs in the
+    // background; failures surface as Notices rather than blocking onload().
+    const adapter = this.app.vault.adapter;
+    if (adapter instanceof FileSystemAdapter) {
+      const pluginDir = path.join(adapter.getBasePath(), this.manifest.dir ?? '.obsidian/plugins/wechat-bridge');
+      this.relayManager = new RelayManager(this.app, pluginDir);
+      void this.relayManager.ensureRunning();
+    }
   }
 
   async onunload() {
     this.server?.close();
     this.server = null;
+    this.relayManager?.stop();
   }
 
   private startServer() {

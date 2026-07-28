@@ -17,6 +17,8 @@ Usage:
 
 from __future__ import annotations
 
+import json
+import os
 import sys
 
 import anyio
@@ -58,31 +60,56 @@ def _log(msg: str) -> None:
     print(f"[relay] {msg}", flush=True)
 
 
-async def login() -> None:
-    _log("正在获取微信登录二维码...")
+def _emit_json(event: dict) -> None:
+    """Single-line JSON to stdout, for a parent process (the Obsidian plugin)
+    to read event-by-event instead of scraping human-readable log text."""
+    print(json.dumps(event, ensure_ascii=False), flush=True)
+
+
+async def login(as_json: bool = False) -> None:
+    """Interactive QR login.
+
+    Default mode prints human-readable progress and also saves a qrcode.png
+    next to this script, for manual CLI use. `as_json=True` is for the
+    Obsidian plugin driving this as a child process: it emits one JSON object
+    per line instead (qrcode/success/failed) and skips the PNG file - the
+    plugin renders the QR code itself from the raw url.
+    """
+    if not as_json:
+        _log("正在获取微信登录二维码...")
     start_result = await start_weixin_login_with_qr(api_base_url=DEFAULT_BASE_URL, force=True)
     if not start_result.qrcode_url:
-        _log(f"获取二维码失败: {start_result.message}")
+        if as_json:
+            _emit_json({"event": "failed", "message": start_result.message})
+        else:
+            _log(f"获取二维码失败: {start_result.message}")
         sys.exit(1)
 
-    # Save as a PNG so it can be viewed/shown outside the terminal.
-    import qrcode
+    if as_json:
+        _emit_json({"event": "qrcode", "url": start_result.qrcode_url})
+    else:
+        # Save as a PNG next to this script so it can be viewed outside the
+        # terminal. Only for manual CLI use; the embedded/plugin-driven flow
+        # renders the QR itself from the raw url instead.
+        import qrcode
 
-    img = qrcode.make(start_result.qrcode_url)
-    png_path = "F:/obsidian/.wechat-relay/qrcode.png"
-    img.save(png_path)
-    _log(f"二维码已保存: {png_path}")
-    _log(f"二维码内容(如需自行生成): {start_result.qrcode_url}")
+        png_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qrcode.png")
+        qrcode.make(start_result.qrcode_url).save(png_path)
+        _log(f"二维码已保存: {png_path}")
+        _log(f"二维码内容(如需自行生成): {start_result.qrcode_url}")
+        _log("请用微信扫描二维码并确认登录...")
 
-    _log("请用微信扫描二维码并确认登录...")
     wait_result = await wait_for_weixin_login(
         session_key=start_result.session_key,
         api_base_url=DEFAULT_BASE_URL,
-        verbose=True,
+        verbose=not as_json,
     )
 
     if not wait_result.connected or not wait_result.account_id or not wait_result.bot_token:
-        _log(f"登录失败: {wait_result.message}")
+        if as_json:
+            _emit_json({"event": "failed", "message": wait_result.message})
+        else:
+            _log(f"登录失败: {wait_result.message}")
         sys.exit(1)
 
     account = AccountData(
@@ -92,7 +119,11 @@ async def login() -> None:
         user_id=wait_result.user_id,
     )
     save_credentials(account)
-    _log("登录成功，凭据已保存至 " + str(credentials_file_path()))
+
+    if as_json:
+        _emit_json({"event": "success", "accountId": account.account_id, "userId": account.user_id})
+    else:
+        _log("登录成功，凭据已保存至 " + str(credentials_file_path()))
 
 
 BRIDGE_RETRY_ATTEMPTS = 3
@@ -286,11 +317,12 @@ async def serve() -> None:
 def main() -> None:
     cmd = sys.argv[1] if len(sys.argv) > 1 else "help"
     if cmd == "login":
-        anyio.run(login)
+        as_json = "--json" in sys.argv[2:]
+        anyio.run(login, as_json)
     elif cmd == "serve":
         anyio.run(serve)
     else:
-        print("Usage: python relay.py [login|serve]")
+        print("Usage: python relay.py [login [--json]|serve]")
 
 
 if __name__ == "__main__":

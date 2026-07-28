@@ -5,3 +5,4 @@ data.json
 __pycache__/
 *.pyc
 qrcode*.png
+venv/
