@@ -100,6 +100,7 @@ interface ConversationMeta {
   title?: string;
   updatedAt?: number;
   providerId?: string;
+  usage?: { contextTokens?: number; contextWindow?: number };
 }
 
 // ---- i18n ----
@@ -177,6 +178,10 @@ const STRINGS = {
   statusListeningLabel: { zh: '监听: ', en: 'Listening: ' },
   statusListeningOn: { zh: '开启', en: 'on' },
   statusListeningOff: { zh: '关闭', en: 'off' },
+  contextWindowLine: {
+    zh: (used: string, total: string) => `上下文窗口：${used}/${total}`,
+    en: (used: string, total: string) => `Context window: ${used}/${total}`,
+  },
   desktopTurnTemplate: {
     zh: (title: string, prompt: string, reply: string) => `对话: ${title}\nprompt：${prompt}\n\n${reply}`,
     en: (title: string, prompt: string, reply: string) => `Conversation: ${title}\nprompt: ${prompt}\n\n${reply}`,
@@ -592,7 +597,9 @@ export default class WeChatBridgePlugin extends Plugin {
     const reply = this.extractDispatchText(newMessages, lang);
     const metas = await this.readAllConversationMeta();
     const title = metas.find((m) => m.id === tab.conversationId)?.title ?? tab.conversationId ?? '?';
-    this.pendingPushes.push(pick(STRINGS.desktopTurnTemplate, lang)(title, promptMsg.content.trim(), reply));
+    const ctxLine = await this.contextWindowLine(tab.conversationId, lang);
+    const body = ctxLine ? `${reply}\n\n${ctxLine}` : reply;
+    this.pendingPushes.push(pick(STRINGS.desktopTurnTemplate, lang)(title, promptMsg.content.trim(), body));
   }
 
   // ---- history: list past turns in the current conversation, and view one reply ----
@@ -608,6 +615,26 @@ export default class WeChatBridgePlugin extends Plugin {
   private truncate(text: string, max: number): string {
     const flat = text.trim().replace(/\s+/g, ' ');
     return flat.length > max ? `${flat.slice(0, max)}…` : flat;
+  }
+
+  private formatK(n: number): string {
+    return `${Math.round(n / 1000)}k`;
+  }
+
+  /** Appended to real turn replies (normal and /listen) so you can see how full the context window is at a glance. */
+  private async contextWindowLine(conversationId: string | null, lang: Lang): Promise<string | null> {
+    if (!conversationId) return null;
+    // Bypass the meta cache: this is read right after a turn just completed,
+    // and the whole point is to report that turn's up-to-date usage, not a
+    // pre-turn snapshot the cache may still be holding.
+    this.metaCache = null;
+    const metas = await this.readAllConversationMeta();
+    const usage = metas.find((m) => m.id === conversationId)?.usage;
+    if (!usage?.contextTokens || !usage?.contextWindow) return null;
+    return pick(STRINGS.contextWindowLine, lang)(
+      this.formatK(usage.contextTokens),
+      this.formatK(usage.contextWindow),
+    );
   }
 
   private async listHistory(lang: Lang): Promise<string> {
@@ -664,7 +691,9 @@ export default class WeChatBridgePlugin extends Plugin {
       await this.saveData(this.data);
 
       const newMessages = tab.state.messages.slice(beforeCount);
-      return this.extractDispatchText(newMessages, lang);
+      const reply = this.extractDispatchText(newMessages, lang);
+      const ctxLine = await this.contextWindowLine(tab.conversationId, lang);
+      return ctxLine ? `${reply}\n\n${ctxLine}` : reply;
     } finally {
       this.sendingViaBridge = false;
     }
