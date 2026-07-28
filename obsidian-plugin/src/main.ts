@@ -3,6 +3,7 @@ import * as http from 'http';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { RelayManager } from './relayManager';
+import { WeChatBridgeSettingTab } from './settingsTab';
 
 /**
  * WeChat Bridge
@@ -263,12 +264,19 @@ export default class WeChatBridgePlugin extends Plugin {
       this.relayManager = new RelayManager(this.app, pluginDir);
       void this.relayManager.ensureRunning();
     }
+
+    this.addSettingTab(new WeChatBridgeSettingTab(this.app, this));
   }
 
   async onunload() {
     this.server?.close();
     this.server = null;
     this.relayManager?.stop();
+  }
+
+  /** Exposed for the settings tab (connection status, QR reconnect, restart/disconnect). */
+  getRelayManager(): RelayManager | null {
+    return this.relayManager;
   }
 
   private startServer() {

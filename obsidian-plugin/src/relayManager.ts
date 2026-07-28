@@ -26,10 +26,22 @@ interface RelayEvent {
   accountId?: string;
 }
 
+export interface LoginCallbacks {
+  onQrCode(url: string): void;
+  onSuccess(accountId: string): void;
+  onFailed(message: string): void;
+}
+
+interface AccountFile {
+  accountId?: string;
+  userId?: string;
+}
+
 /**
  * Owns the whole lifecycle of the WeChat relay: finding/bootstrapping a
- * private Python environment, driving first-time QR login, and running
- * `relay.py serve` as a child process tied to this plugin's own lifetime.
+ * private Python environment, driving QR login (first-time, or re-connect
+ * from the settings tab), and running `relay.py serve` as a child process
+ * tied to this plugin's own lifetime.
  *
  * The goal is that a fresh install of this plugin, with nothing else set up
  * by hand, ends up connected: no separate `pip install`, no terminal, no
@@ -44,23 +56,34 @@ export class RelayManager {
 
   async ensureRunning(): Promise<void> {
     try {
-      const systemPython = await this.findSystemPython();
-      if (!systemPython) {
-        new Notice(
-          'WeChat Bridge: no Python 3 installation found. Install Python 3.11+ ' +
-          '(python.org or your OS package manager) and reload this plugin.',
-          15000,
-        );
-        return;
+      const venvPython = await this.ensurePythonReady();
+      if (!venvPython) return;
+
+      if (!(await this.isConnected())) {
+        // First run, no saved WeChat session yet: the settings tab is the
+        // proper place to walk through this, but auto-popping a modal here
+        // means a brand-new install doesn't need to know the settings tab
+        // exists at all to get connected.
+        let modal: QrLoginModal | null = null;
+        await this.startInteractiveLogin({
+          onQrCode: (url) => {
+            modal = new QrLoginModal(this.app, url, 'Scan with WeChat to connect ClawBot');
+            modal.open();
+          },
+          onSuccess: () => {
+            modal?.setStatus('Connected.');
+            modal?.close();
+            new Notice('WeChat Bridge: WeChat login succeeded.');
+          },
+          onFailed: (message) => {
+            modal?.setStatus(`Failed: ${message}`);
+            modal?.close();
+            new Notice(`WeChat Bridge: WeChat login failed - ${message}`, 15000);
+          },
+        }).catch(() => { /* already reported via onFailed/Notice above */ });
       }
 
-      const venvPython = await this.ensureVenv(systemPython);
-
-      if (!(await this.fileExists(this.credentialsPath()))) {
-        await this.runLoginFlow(venvPython);
-      }
-
-      this.startRelayProcess(venvPython);
+      await this.startRelayProcess(venvPython);
     } catch (e) {
       new Notice(`WeChat Bridge: relay setup failed - ${e instanceof Error ? e.message : e}`, 15000);
     }
@@ -72,6 +95,118 @@ export class RelayManager {
     this.relayProcess?.kill();
     this.relayProcess = null;
   }
+
+  // ---- status, for the settings tab ----
+
+  async isConnected(): Promise<boolean> {
+    return this.fileExists(this.credentialsPath());
+  }
+
+  async getAccountId(): Promise<string | null> {
+    try {
+      const raw = await fs.readFile(this.credentialsPath(), 'utf-8');
+      const data: AccountFile = JSON.parse(raw);
+      return data.accountId ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  isRelayRunning(): boolean {
+    return this.relayProcess !== null;
+  }
+
+  /** Forgets the saved WeChat session and stops the relay. A fresh `startInteractiveLogin` is needed afterward. */
+  async disconnect(): Promise<void> {
+    this.relayProcess?.kill();
+    this.relayProcess = null;
+    await fs.rm(this.credentialsPath(), { force: true });
+  }
+
+  /** Kills and restarts the relay process (same venv, same script). For manual troubleshooting from the settings tab. */
+  async restartRelay(): Promise<void> {
+    this.relayProcess?.kill();
+    this.relayProcess = null;
+    const venvPython = await this.ensurePythonReady();
+    if (venvPython) await this.startRelayProcess(venvPython);
+  }
+
+  /**
+   * Runs the whole "find Python -> ensure venv -> deps installed" chain and
+   * returns the venv's python path, or null (with a Notice already shown) if
+   * no system Python could be found at all.
+   */
+  async ensurePythonReady(): Promise<string | null> {
+    const systemPython = await this.findSystemPython();
+    if (!systemPython) {
+      new Notice(
+        'WeChat Bridge: no Python 3 installation found. Install Python 3.11+ ' +
+        '(python.org or your OS package manager) and reload this plugin.',
+        15000,
+      );
+      return null;
+    }
+    return this.ensureVenv(systemPython);
+  }
+
+  /**
+   * Spawns `relay.py login --json` and drives it through *callbacks* rather
+   * than owning any UI itself, so the same login flow can be rendered either
+   * as a first-run modal (see ensureRunning above) or inline in the settings
+   * tab (see WeChatBridgeSettingTab).
+   */
+  startInteractiveLogin(callbacks: LoginCallbacks): Promise<void> {
+    return new Promise((resolve, reject) => {
+      void this.ensurePythonReady().then((venvPython) => {
+        if (!venvPython) {
+          reject(new Error('no python'));
+          return;
+        }
+
+        const child = spawn(venvPython, [this.relayScript(), 'login', '--json']);
+        let settled = false;
+
+        const rl = readline.createInterface({ input: child.stdout });
+        rl.on('line', (line) => {
+          let parsed: RelayEvent;
+          try {
+            parsed = JSON.parse(line);
+          } catch {
+            return; // not a JSON event line; ignore
+          }
+
+          if (parsed.event === 'qrcode' && parsed.url) {
+            callbacks.onQrCode(parsed.url);
+          } else if (parsed.event === 'success') {
+            settled = true;
+            callbacks.onSuccess(parsed.accountId ?? '?');
+            resolve();
+          } else if (parsed.event === 'failed') {
+            settled = true;
+            const message = parsed.message ?? 'unknown error';
+            callbacks.onFailed(message);
+            reject(new Error(message));
+          }
+        });
+
+        child.on('error', (err) => {
+          if (!settled) {
+            callbacks.onFailed(err.message);
+            reject(err);
+          }
+        });
+        child.on('exit', (code) => {
+          if (!settled) {
+            const message = `login process exited with code ${code}`;
+            callbacks.onFailed(message);
+            reject(new Error(message));
+          }
+        });
+      });
+    });
+  }
+
+  // ---- paths ----
 
   private credentialsPath(): string {
     return path.join(os.homedir(), '.claude', 'channels', 'wechat', 'account.json');
@@ -89,6 +224,10 @@ export class RelayManager {
 
   private relayScript(): string {
     return path.join(this.pluginDir, 'relay.py');
+  }
+
+  private pidFile(): string {
+    return path.join(this.pluginDir, 'relay.pid');
   }
 
   private async fileExists(p: string): Promise<boolean> {
@@ -130,55 +269,50 @@ export class RelayManager {
     return venvPython;
   }
 
-  /** Spawns `relay.py login --json`, renders the QR it reports, and resolves once WeChat confirms the scan. */
-  private runLoginFlow(venvPython: string): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const child = spawn(venvPython, [this.relayScript(), 'login', '--json']);
-      let modal: QrLoginModal | null = null;
-      let settled = false;
+  /**
+   * If Obsidian is ever killed abruptly (crash, force-quit, `taskkill`)
+   * rather than closed normally, onunload() never runs and the previously
+   * spawned `relay.py serve` is left as an orphan process - a later plugin
+   * load would then spawn a second one, and both would poll the same WeChat
+   * account. Before starting a new instance, check the PID file left by the
+   * last one and kill it if it's still alive.
+   */
+  private async killOrphanFromPreviousRun(): Promise<void> {
+    let pid: number;
+    try {
+      pid = Number((await fs.readFile(this.pidFile(), 'utf-8')).trim());
+    } catch {
+      return; // no PID file - nothing to clean up
+    }
+    if (!Number.isInteger(pid) || pid <= 0) return;
 
-      const rl = readline.createInterface({ input: child.stdout });
-      rl.on('line', (line) => {
-        let parsed: RelayEvent;
-        try {
-          parsed = JSON.parse(line);
-        } catch {
-          return; // not a JSON event line; ignore
-        }
+    try {
+      process.kill(pid, 0); // throws if no such process - doesn't actually signal it
+    } catch {
+      return; // that process isn't running anymore
+    }
 
-        if (parsed.event === 'qrcode' && parsed.url) {
-          modal = new QrLoginModal(this.app, parsed.url, 'Scan with WeChat to connect ClawBot');
-          modal.open();
-        } else if (parsed.event === 'success') {
-          settled = true;
-          modal?.setStatus('Connected.');
-          modal?.close();
-          new Notice('WeChat Bridge: WeChat login succeeded.');
-          resolve();
-        } else if (parsed.event === 'failed') {
-          settled = true;
-          modal?.setStatus(`Failed: ${parsed.message ?? 'unknown error'}`);
-          modal?.close();
-          reject(new Error(parsed.message ?? 'login failed'));
-        }
-      });
-
-      child.on('error', (err) => {
-        if (!settled) reject(err);
-      });
-      child.on('exit', (code) => {
-        if (!settled) reject(new Error(`login process exited with code ${code}`));
-      });
-    });
+    try {
+      process.kill(pid);
+      new Notice('WeChat Bridge: cleaned up a leftover relay process from a previous session.');
+    } catch {
+      // already gone by the time we tried; fine
+    }
   }
 
   /** Starts `relay.py serve` as a child of this plugin's own process lifetime (not detached). */
-  private startRelayProcess(venvPython: string): void {
+  private async startRelayProcess(venvPython: string): Promise<void> {
     if (this.stopped) return; // plugin was unloaded while setup was still running
+
+    await this.killOrphanFromPreviousRun();
 
     this.relayProcess = spawn(venvPython, [this.relayScript(), 'serve'], {
       cwd: this.pluginDir,
     });
+
+    if (this.relayProcess.pid) {
+      await fs.writeFile(this.pidFile(), String(this.relayProcess.pid), 'utf-8').catch(() => {});
+    }
 
     this.relayProcess.on('exit', (code, signal) => {
       this.relayProcess = null;
