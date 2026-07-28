@@ -1,4 +1,4 @@
-import { Plugin, FileSystemAdapter } from 'obsidian';
+import { Plugin, FileSystemAdapter, Notice } from 'obsidian';
 import * as http from 'http';
 import * as fs from 'fs/promises';
 import * as path from 'path';
@@ -31,10 +31,17 @@ import { WeChatBridgeSettingTab } from './settingsTab';
  * reads back a reply as JSON.
  */
 
-const PORT = 39217;
+const PREFERRED_PORT = 39217;
+const MAX_PORT_ATTEMPTS = 20; // preferred port + up to 19 fallbacks if it's taken
 const CLAUDIAN_PLUGIN_ID = 'realclaudian';
-const CLAUDIAN_PROVIDER_ID = 'claude'; // only provider this bridge manages
 const VIEW_TYPE_CLAUDIAN = 'claudian-view';
+
+// Every provider Claudian ships. `claude` has no `enabled` flag in its own
+// registration (ProviderRegistry: `isEnabled: () => true`) - it's always on;
+// the others are opt-in and expose `providerConfigs.<id>.enabled` in
+// Claudian's settings, matching each provider's own registration.ts.
+const ALL_PROVIDER_IDS = ['claude', 'codex', 'opencode', 'pi', 'grok'] as const;
+type ProviderId = (typeof ALL_PROVIDER_IDS)[number];
 
 interface BridgeData {
   conversationId: string | null;
@@ -44,6 +51,13 @@ interface BridgeData {
   listening: boolean;
   /** Message count already seen in the bound tab, so the /listen poller only reports new turns. */
   lastSeenMessageCount: number;
+  /**
+   * Provider to use for the *next* new conversation (set via /provider).
+   * Irrelevant once bound to a conversation - that conversation's own
+   * providerId (from its session metadata) always wins; Claudian doesn't
+   * allow changing a bound conversation's provider anyway.
+   */
+  providerId: ProviderId | null;
 }
 
 // ---- Minimal shape of the parts of Claudian we reach into at runtime. ----
@@ -82,7 +96,15 @@ interface ClaudianTab {
 
 interface ClaudianTabManager {
   getAllTabs(): ClaudianTab[];
-  createTab(conversationId?: string): Promise<ClaudianTab>;
+  /**
+   * `options.defaultProviderId`, for a brand-new blank tab (no conversationId),
+   * makes Claudian pick that provider's own saved default model
+   * (`resolveBlankTabModel` -> `ProviderSettingsCoordinator.getProviderSettingsSnapshot`)
+   * instead of inheriting whatever provider the currently active tab happens
+   * to use - this is how the bridge opens a new conversation on a specific
+   * non-default provider without having to guess a model name itself.
+   */
+  createTab(conversationId?: string, tabId?: string, options?: { defaultProviderId?: string }): Promise<ClaudianTab>;
   getSdkCommands(tabId?: string): Promise<ClaudianSlashCommand[]>;
 }
 
@@ -188,41 +210,59 @@ const STRINGS = {
     zh: (title: string, prompt: string, reply: string) => `对话: ${title}\nprompt：${prompt}\n\n${reply}`,
     en: (title: string, prompt: string, reply: string) => `Conversation: ${title}\nprompt: ${prompt}\n\n${reply}`,
   },
-  help: {
-    zh: [
-      '本插件命令:',
-      '/help — 显示本帮助',
-      '/list 或 /ls — 列出历史会话（编号、标题、更新时间）',
-      '/switch N 或 /goto N — 切换到 /list 中第 N 个会话',
-      '/new — 新建一个全新对话（不影响其他历史会话）',
-      '/status — 查看当前模型、思考强度、权限模式、监听状态',
-      '/hist — 按序号列出当前对话你发过的消息',
-      '/hist N — 查看第 N 条消息对应的回复',
-      '/listen on 或 /listen off — 开关监听：开启后，电脑客户端上发的消息也会推送到这里',
-      '/model <名称> — 切换模型，如 /model opus、/model sonnet',
-      '/effort <等级> — 切换思考强度，如 /effort low、/effort high',
-      '/permission <模式> — 切换权限模式，如 /permission yolo、/permission default',
-      '/commands — 查看 Claude 自带的斜杠命令（跟上面这些是两回事）',
-      '其他任何文字 — 作为普通消息发给 Claudian（Claude 自带的斜杠命令也直接这样发送即可）',
-    ].join('\n'),
-    en: [
-      'Bridge commands:',
-      '/help — show this help',
-      '/list or /ls — list past conversations (number, title, updated time)',
-      '/switch N or /goto N — switch to conversation number N from /list',
-      '/new — start a brand-new conversation (existing ones are untouched)',
-      '/status — show the current model, effort level, permission mode, and listening state',
-      '/hist — list your messages in the current conversation, numbered',
-      '/hist N — show the reply to message number N',
-      '/listen on or /listen off — toggle listening: when on, messages sent from the desktop client are pushed here too',
-      '/model <name> — switch model, e.g. /model opus, /model sonnet',
-      '/effort <level> — switch effort level, e.g. /effort low, /effort high',
-      '/permission <mode> — switch permission mode, e.g. /permission yolo, /permission default',
-      "/commands — list Claude's own slash commands (separate from the bridge commands above)",
-      'anything else — sent to Claudian as a normal message (this is also how you use ‘Claude’s own slash commands themselves)',
-    ].join('\n'),
+  providerLabel: { zh: '供应商: ', en: 'Provider: ' },
+  providerUsage: {
+    zh: (enabled: string) => `用法: /provider <名称>\n可用供应商: ${enabled}`,
+    en: (enabled: string) => `Usage: /provider <name>\nAvailable providers: ${enabled}`,
+  },
+  providerUnknown: {
+    zh: (name: string, enabled: string) => `不认识的供应商 "${name}"。可用供应商: ${enabled}`,
+    en: (name: string, enabled: string) => `Unknown provider "${name}". Available providers: ${enabled}`,
+  },
+  providerSwitched: {
+    zh: (name: string) => `已切换到供应商: ${name}。下一条消息将在这个供应商上开始一个全新的对话。`,
+    en: (name: string) => `Switched to provider: ${name}. The next message will start a brand-new conversation on it.`,
   },
 } as const;
+
+/** /help text. Only mentions /provider when more than one provider is actually enabled in Claudian. */
+function buildHelpText(lang: Lang, showProviderCommand: boolean): string {
+  const zh = [
+    '本插件命令:',
+    '/help — 显示本帮助',
+    '/list 或 /ls — 列出历史会话（编号、标题、更新时间）',
+    '/switch N 或 /goto N — 切换到 /list 中第 N 个会话',
+    '/new — 新建一个全新对话（不影响其他历史会话）',
+    '/status — 查看当前模型、思考强度、权限模式、监听状态',
+    '/hist — 按序号列出当前对话你发过的消息',
+    '/hist N — 查看第 N 条消息对应的回复',
+    '/listen on 或 /listen off — 开关监听：开启后，电脑客户端上发的消息也会推送到这里',
+    '/model <名称> — 切换模型，如 /model opus、/model sonnet',
+    '/effort <等级> — 切换思考强度，如 /effort low、/effort high',
+    '/permission <模式> — 切换权限模式，如 /permission yolo、/permission default',
+    ...(showProviderCommand ? ['/provider <名称> — 切换供应商（会开始一个新对话），发送 /provider 查看可选项'] : []),
+    '/commands — 查看 Claude 自带的斜杠命令（跟上面这些是两回事）',
+    '其他任何文字 — 作为普通消息发给 Claudian（Claude 自带的斜杠命令也直接这样发送即可）',
+  ];
+  const en = [
+    'Bridge commands:',
+    '/help — show this help',
+    '/list or /ls — list past conversations (number, title, updated time)',
+    '/switch N or /goto N — switch to conversation number N from /list',
+    '/new — start a brand-new conversation (existing ones are untouched)',
+    '/status — show the current model, effort level, permission mode, and listening state',
+    '/hist — list your messages in the current conversation, numbered',
+    '/hist N — show the reply to message number N',
+    '/listen on or /listen off — toggle listening: when on, messages sent from the desktop client are pushed here too',
+    '/model <name> — switch model, e.g. /model opus, /model sonnet',
+    '/effort <level> — switch effort level, e.g. /effort low, /effort high',
+    '/permission <mode> — switch permission mode, e.g. /permission yolo, /permission default',
+    ...(showProviderCommand ? ['/provider <name> — switch provider (starts a new conversation); send /provider alone to see options'] : []),
+    "/commands — list Claude's own slash commands (separate from the bridge commands above)",
+    'anything else — sent to Claudian as a normal message (this is also how you use ‘Claude’s own slash commands themselves)',
+  ];
+  return (lang === 'zh' ? zh : en).join('\n');
+}
 
 function pick<T>(entry: { zh: T; en: T }, lang: Lang): T {
   return entry[lang];
@@ -233,6 +273,7 @@ const DEFAULT_DATA: BridgeData = {
   lastListedIds: [],
   listening: false,
   lastSeenMessageCount: 0,
+  providerId: null,
 };
 
 const LISTEN_POLL_INTERVAL_MS = 3000;
@@ -247,21 +288,30 @@ export default class WeChatBridgePlugin extends Plugin {
    * /listen poller does not mistake a WeChat-originated turn for a desktop one. */
   private sendingViaBridge = false;
   private relayManager: RelayManager | null = null;
+  private pluginDir: string | null = null;
 
   async onload() {
     const saved = await this.loadData();
     this.data = { ...DEFAULT_DATA, ...(saved ?? {}) };
-    this.startServer();
+
+    const adapter = this.app.vault.adapter;
+    if (adapter instanceof FileSystemAdapter) {
+      this.pluginDir = path.join(adapter.getBasePath(), this.manifest.dir ?? '.obsidian/plugins/wechat-bridge');
+    }
+
+    // Must finish (and, if it had to fall back to a non-default port, write
+    // port.txt) before the relay is started, since relay.py reads that file
+    // to know where to send messages.
+    await this.startServer();
+
     this.registerInterval(window.setInterval(() => this.checkForDesktopActivity(), LISTEN_POLL_INTERVAL_MS));
 
     // Owns the whole "get connected" path so installing this plugin is enough
     // on its own: private Python env, one-time QR login, and the relay
     // process itself, all tied to this plugin's own lifetime. Runs in the
     // background; failures surface as Notices rather than blocking onload().
-    const adapter = this.app.vault.adapter;
-    if (adapter instanceof FileSystemAdapter) {
-      const pluginDir = path.join(adapter.getBasePath(), this.manifest.dir ?? '.obsidian/plugins/wechat-bridge');
-      this.relayManager = new RelayManager(this.app, pluginDir);
+    if (this.pluginDir) {
+      this.relayManager = new RelayManager(this.app, this.pluginDir);
       void this.relayManager.ensureRunning();
     }
 
@@ -279,8 +329,16 @@ export default class WeChatBridgePlugin extends Plugin {
     return this.relayManager;
   }
 
-  private startServer() {
-    this.server = http.createServer((req, res) => {
+  /**
+   * Binds the HTTP server, trying PREFERRED_PORT first and a handful of
+   * fallbacks after it if that's already taken by something else on this
+   * machine. Whichever port actually succeeds is written to `port.txt` next
+   * to relay.py, which reads it on startup instead of assuming 39217 - so a
+   * busy port degrades to "still works, just not on the default port"
+   * instead of the whole bridge silently never coming up.
+   */
+  private async startServer(): Promise<void> {
+    const server = http.createServer((req, res) => {
       if (req.method === 'GET' && req.url === '/pending') {
         const pushes = this.pendingPushes;
         this.pendingPushes = [];
@@ -318,8 +376,45 @@ export default class WeChatBridgePlugin extends Plugin {
           );
       });
     });
-    // 127.0.0.1 only - never bind 0.0.0.0.
-    this.server.listen(PORT, '127.0.0.1');
+
+    for (let attempt = 0; attempt < MAX_PORT_ATTEMPTS; attempt++) {
+      const candidate = PREFERRED_PORT + attempt;
+      // eslint-disable-next-line no-await-in-loop
+      const bound = await this.tryListen(server, candidate);
+      if (bound) {
+        this.server = server;
+        if (this.pluginDir) {
+          await fs.writeFile(path.join(this.pluginDir, 'port.txt'), String(candidate), 'utf-8').catch(() => {});
+        }
+        if (attempt > 0) {
+          new Notice(`WeChat Bridge: port ${PREFERRED_PORT} was in use; using ${candidate} instead.`);
+        }
+        return;
+      }
+    }
+
+    new Notice(
+      `WeChat Bridge: could not bind any port in ${PREFERRED_PORT}-${PREFERRED_PORT + MAX_PORT_ATTEMPTS - 1}. ` +
+      'The bridge is not running - free up one of those ports and reload the plugin.',
+      20000,
+    );
+  }
+
+  /** Resolves true if `server.listen(port, ...)` succeeded, false on EADDRINUSE (or any other bind error). */
+  private tryListen(server: http.Server, port: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      const onError = () => {
+        server.removeListener('listening', onListening);
+        resolve(false);
+      };
+      const onListening = () => {
+        server.removeListener('error', onError);
+        resolve(true);
+      };
+      server.once('error', onError);
+      server.once('listening', onListening);
+      server.listen(port, '127.0.0.1');
+    });
   }
 
   private async handleIncoming(rawBody: string): Promise<string> {
@@ -333,7 +428,7 @@ export default class WeChatBridgePlugin extends Plugin {
     if (!text) throw new Error(pick(STRINGS.emptyText, lang));
 
     if (/^\/help\b/i.test(text)) {
-      return pick(STRINGS.help, lang);
+      return buildHelpText(lang, this.getEnabledProviders().length > 1);
     }
 
     if (/^\/commands\b/i.test(text)) {
@@ -342,8 +437,15 @@ export default class WeChatBridgePlugin extends Plugin {
 
     const settingsCmd = this.parseSettingsCommand(text);
     if (settingsCmd) {
-      await this.applySettingsCommand(settingsCmd.key, settingsCmd.value);
-      return `OK: ${settingsCmd.key} -> ${settingsCmd.value}`;
+      return await this.applySettingsCommand(settingsCmd.key, settingsCmd.value, lang);
+    }
+
+    const providerMatch = text.match(/^\/provider\s+(\S+)/i);
+    if (providerMatch) {
+      return await this.switchProvider(providerMatch[1].toLowerCase(), lang);
+    }
+    if (/^\/provider\b/i.test(text)) {
+      return pick(STRINGS.providerUsage, lang)(this.getEnabledProviders().join(', '));
     }
 
     if (/^\/(list|ls)\b/i.test(text)) {
@@ -432,7 +534,11 @@ export default class WeChatBridgePlugin extends Plugin {
     return { key, value };
   }
 
-  private async applySettingsCommand(key: 'model' | 'effortLevel' | 'permissionMode', value: string): Promise<void> {
+  private async applySettingsCommand(
+    key: 'model' | 'effortLevel' | 'permissionMode',
+    value: string,
+    lang: Lang,
+  ): Promise<string> {
     const claudian = this.getClaudianPlugin();
     const savedKey = key === 'model'
       ? 'savedProviderModel'
@@ -440,20 +546,74 @@ export default class WeChatBridgePlugin extends Plugin {
         ? 'savedProviderEffort'
         : 'savedProviderPermissionMode';
 
-    // Mirrors ProviderSettingsCoordinator's projection: the flat field is the
-    // "current" value, the savedProviderX map remembers it per provider so
-    // switching providers restores it later. Same pair Claudian's own UI writes.
+    const metas = await this.readAllConversationMeta();
+    const providerId = this.resolveActiveProviderId(metas);
+
+    // Mirrors ProviderSettingsCoordinator.commitProviderSettingsSnapshot: the
+    // savedProviderX map is written unconditionally (every provider's last
+    // value is always remembered), but the flat field - what Claudian's own
+    // UI is showing *right now* - is only overwritten when the provider this
+    // command targets is the one currently active in settings.settingsProvider.
+    // Otherwise we'd silently change what the Claudian sidebar displays for a
+    // provider you're not even looking at.
     await claudian.mutateSettings((settings) => {
-      settings[key] = value;
       if (!settings[savedKey] || typeof settings[savedKey] !== 'object') {
         settings[savedKey] = {};
       }
-      settings[savedKey][CLAUDIAN_PROVIDER_ID] = value;
+      settings[savedKey][providerId] = value;
+      if (providerId === (settings.settingsProvider ?? 'claude')) {
+        settings[key] = value;
+      }
     });
 
     for (const view of claudian.getAllViews?.() ?? []) {
       view.refreshModelSelector?.();
     }
+
+    const label = lang === 'zh' ? '已设置' : 'OK';
+    const providerSuffix = this.getEnabledProviders().length > 1
+      ? `${pick(STRINGS.providerLabel, lang)}${providerId}, `
+      : '';
+    return `${label}: ${providerSuffix}${key} -> ${value}`;
+  }
+
+  // ---- provider selection (only relevant for users with more than one Claudian provider enabled) ----
+
+  /** Every provider id Claudian actually has enabled right now. `claude` has no on/off switch - it's always enabled. */
+  private getEnabledProviders(): ProviderId[] {
+    const configs = this.getClaudianPlugin().settings?.providerConfigs ?? {};
+    return ALL_PROVIDER_IDS.filter((id) => id === 'claude' || configs[id]?.enabled === true);
+  }
+
+  /**
+   * The provider a settings command or a new conversation should target:
+   * the bound conversation's own provider (from its session metadata) if
+   * there is one - Claudian doesn't allow changing a bound conversation's
+   * provider anyway - otherwise whatever /provider last selected for the
+   * next new conversation, defaulting to claude.
+   */
+  private resolveActiveProviderId(metas: ConversationMeta[]): ProviderId {
+    if (this.data.conversationId) {
+      const meta = metas.find((m) => m.id === this.data.conversationId);
+      if (meta?.providerId && (ALL_PROVIDER_IDS as readonly string[]).includes(meta.providerId)) {
+        return meta.providerId as ProviderId;
+      }
+    }
+    return this.data.providerId ?? 'claude';
+  }
+
+  private async switchProvider(name: string, lang: Lang): Promise<string> {
+    const enabled = this.getEnabledProviders();
+    if (!(enabled as string[]).includes(name)) {
+      return pick(STRINGS.providerUnknown, lang)(name, enabled.join(', '));
+    }
+    this.data.providerId = name as ProviderId;
+    // A bound conversation's provider can't be changed after the fact
+    // (Claudian itself rejects that from its own UI); switching provider
+    // here always means "start fresh", same as /new.
+    this.data.conversationId = null;
+    await this.saveData(this.data);
+    return pick(STRINGS.providerSwitched, lang)(name);
   }
 
   // ---- conversation list / switch / new ----
@@ -540,17 +700,31 @@ export default class WeChatBridgePlugin extends Plugin {
 
   // ---- status: current model / effort / permission / listening ----
 
-  private statusText(lang: Lang): string {
+  private async statusText(lang: Lang): Promise<string> {
     const settings = this.getClaudianPlugin().settings ?? {};
+    const metas = await this.readAllConversationMeta();
+    const providerId = this.resolveActiveProviderId(metas);
+    // The flat fields (settings.model etc.) only reflect whichever provider
+    // is currently shown in Claudian's own UI (settings.settingsProvider);
+    // for any other provider, its last value lives in the savedProviderX map
+    // instead (see applySettingsCommand for the same distinction on write).
+    const isActiveInUi = providerId === (settings.settingsProvider ?? 'claude');
+    const model = isActiveInUi ? settings.model : settings.savedProviderModel?.[providerId];
+    const effort = isActiveInUi ? settings.effortLevel : settings.savedProviderEffort?.[providerId];
+    const permission = isActiveInUi ? settings.permissionMode : settings.savedProviderPermissionMode?.[providerId];
+
     const base = pick(STRINGS.statusTemplate, lang)(
-      String(settings.model ?? '?'),
-      String(settings.effortLevel ?? '?'),
-      String(settings.permissionMode ?? '?'),
+      String(model ?? '?'),
+      String(effort ?? '?'),
+      String(permission ?? '?'),
     );
+    const providerLine = this.getEnabledProviders().length > 1
+      ? `\n${pick(STRINGS.providerLabel, lang)}${providerId}`
+      : '';
     const listeningWord = this.data.listening
       ? pick(STRINGS.statusListeningOn, lang)
       : pick(STRINGS.statusListeningOff, lang);
-    return `${base}\n${pick(STRINGS.statusListeningLabel, lang)}${listeningWord}`;
+    return `${base}${providerLine}\n${pick(STRINGS.statusListeningLabel, lang)}${listeningWord}`;
   }
 
   // ---- /listen on|off: mirror desktop-originated turns to WeChat ----
@@ -764,7 +938,15 @@ export default class WeChatBridgePlugin extends Plugin {
       return await tabManager.createTab(this.data.conversationId);
     }
 
-    return await tabManager.createTab();
+    // A brand-new blank tab: if /provider selected something other than the
+    // default, pass it through so Claudian seeds the tab with *that*
+    // provider's own saved model (resolveBlankTabModel) instead of inheriting
+    // whatever provider the currently active Claudian tab happens to be on.
+    return await tabManager.createTab(
+      undefined,
+      undefined,
+      this.data.providerId ? { defaultProviderId: this.data.providerId } : undefined,
+    );
   }
 
   private findClaudianViewViaWorkspace(): ClaudianView | null {

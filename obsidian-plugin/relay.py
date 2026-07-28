@@ -17,6 +17,7 @@ Usage:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
@@ -24,14 +25,16 @@ import sys
 import anyio
 import httpx
 
-from wechat_clawbot.api.client import WeixinApiOptions, get_updates, send_message
+from wechat_clawbot.api.client import WeixinApiOptions, get_config, get_updates, send_message, send_typing
 from wechat_clawbot.api.types import (
     MessageItem,
     MessageItemType,
     MessageState,
     MessageType,
     SendMessageReq,
+    SendTypingReq,
     TextItem,
+    TypingStatus,
     WeixinMessage,
 )
 from wechat_clawbot.auth.accounts import DEFAULT_BASE_URL
@@ -45,8 +48,23 @@ from wechat_clawbot.claude_channel.credentials import (
 from wechat_clawbot.messaging.inbound import body_from_item_list
 from wechat_clawbot.util.random import generate_id
 
-BRIDGE_URL = "http://127.0.0.1:39217/message"
-PENDING_URL = "http://127.0.0.1:39217/pending"
+
+def _read_bridge_port() -> int:
+    """Reads the port the Obsidian plugin actually bound (it falls back to a
+    nearby port if 39217 was already taken by something else on this
+    machine, and writes whichever one it used to port.txt next to this
+    script). Defaults to 39217 if that file isn't there yet."""
+    port_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "port.txt")
+    try:
+        with open(port_file, encoding="utf-8") as f:
+            return int(f.read().strip())
+    except Exception:
+        return 39217
+
+
+BRIDGE_PORT = _read_bridge_port()
+BRIDGE_URL = f"http://127.0.0.1:{BRIDGE_PORT}/message"
+PENDING_URL = f"http://127.0.0.1:{BRIDGE_PORT}/pending"
 LONG_POLL_TIMEOUT_MS = 35_000
 
 # Fast poll while /listen is on, slow poll while it's off, so this relay isn't
@@ -54,6 +72,12 @@ LONG_POLL_TIMEOUT_MS = 35_000
 # not even enabled.
 PENDING_POLL_INTERVAL_ACTIVE_S = 5.0
 PENDING_POLL_INTERVAL_IDLE_S = 30.0
+
+# How often to re-send the typing indicator while waiting for Claudian's
+# reply. WeChat ClawBot's typing indicator is not "set once, stays on" - it
+# needs periodic keepalive, same as the official wechat-clawbot MCP channel
+# server (claude_channel/server.py's _TypingManager) does.
+TYPING_KEEPALIVE_INTERVAL_S = 5.0
 
 
 def _log(msg: str) -> None:
@@ -185,6 +209,64 @@ async def _send_text_reply(opts: WeixinApiOptions, to: str, text: str, context_t
     await send_message(opts, req)
 
 
+async def _get_typing_ticket(opts: WeixinApiOptions, sender_id: str, context_token: str) -> str | None:
+    try:
+        resp = await get_config(opts, ilink_user_id=sender_id, context_token=context_token)
+        if resp.ret == 0 and resp.typing_ticket:
+            return resp.typing_ticket
+    except Exception as e:  # noqa: BLE001
+        _log(f"getConfig 获取 typing_ticket 失败: {e}")
+    return None
+
+
+async def _typing_keepalive(opts: WeixinApiOptions, sender_id: str, ticket: str, stop_event: anyio.Event) -> None:
+    """Re-sends the typing indicator every TYPING_KEEPALIVE_INTERVAL_S until stop_event is set."""
+    while not stop_event.is_set():
+        try:
+            await send_typing(
+                opts,
+                SendTypingReq(ilink_user_id=sender_id, typing_ticket=ticket, status=TypingStatus.TYPING),
+            )
+        except Exception as e:  # noqa: BLE001
+            _log(f"typing keepalive 失败: {e}")
+            return
+        with anyio.move_on_after(TYPING_KEEPALIVE_INTERVAL_S):
+            await stop_event.wait()
+
+
+async def _reply_with_typing_indicator(
+    client: httpx.AsyncClient, opts: WeixinApiOptions, sender_id: str, context_token: str, text: str
+) -> str:
+    """Shows "typing..." in WeChat for as long as _forward_to_bridge takes to come back."""
+    ticket = await _get_typing_ticket(opts, sender_id, context_token)
+    if not ticket:
+        # No ticket available (getConfig failed, or ClawBot doesn't offer one
+        # for this user) - proceed without an indicator rather than fail the
+        # whole reply over a cosmetic feature.
+        try:
+            return await _forward_to_bridge(client, text)
+        except Exception as e:  # noqa: BLE001
+            return f"[桥接连接失败] {e}"
+
+    stop_event = anyio.Event()
+    reply: str
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(_typing_keepalive, opts, sender_id, ticket, stop_event)
+        try:
+            reply = await _forward_to_bridge(client, text)
+        except Exception as e:  # noqa: BLE001
+            reply = f"[桥接连接失败] {e}"
+        finally:
+            stop_event.set()
+
+    with contextlib.suppress(Exception):
+        await send_typing(
+            opts,
+            SendTypingReq(ilink_user_id=sender_id, typing_ticket=ticket, status=TypingStatus.CANCEL),
+        )
+    return reply
+
+
 class _LastTarget:
     """Most recent WeChat sender/context_token, shared between the two loops below.
 
@@ -241,10 +323,7 @@ async def _wechat_poll_loop(
                 target.context_token = context_token
                 _log(f"收到: from={sender_id} text={text[:50]!r}")
 
-                try:
-                    reply = await _forward_to_bridge(client, text)
-                except Exception as e:  # noqa: BLE001
-                    reply = f"[桥接连接失败] {e}"
+                reply = await _reply_with_typing_indicator(client, opts, sender_id, context_token, text)
 
                 try:
                     await _send_text_reply(opts, sender_id, reply, context_token)
