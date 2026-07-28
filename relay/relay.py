@@ -7,6 +7,8 @@ Does NOT talk to Claude Code or any MCP channel. It only:
   3. POSTs the text to the local "wechat-bridge" Obsidian plugin
      (http://127.0.0.1:39217/message), which drives Claudian itself.
   4. Sends the plugin's reply back to WeChat.
+  5. Polls the plugin's /pending endpoint for /listen-mode pushes (desktop-
+     originated turns) and relays those too.
 
 Usage:
     python relay.py login   # one-time QR login, also saves qrcode.png
@@ -44,7 +46,12 @@ from wechat_clawbot.util.random import generate_id
 BRIDGE_URL = "http://127.0.0.1:39217/message"
 PENDING_URL = "http://127.0.0.1:39217/pending"
 LONG_POLL_TIMEOUT_MS = 35_000
-PENDING_POLL_INTERVAL_S = 5.0
+
+# Fast poll while /listen is on, slow poll while it's off, so this relay isn't
+# hitting the plugin every few seconds forever for a feature that's usually
+# not even enabled.
+PENDING_POLL_INTERVAL_ACTIVE_S = 5.0
+PENDING_POLL_INTERVAL_IDLE_S = 30.0
 
 
 def _log(msg: str) -> None:
@@ -91,26 +98,36 @@ async def login() -> None:
 BRIDGE_RETRY_ATTEMPTS = 3
 BRIDGE_RETRY_DELAYS = [1.0, 2.0]  # seconds between attempts 1->2 and 2->3
 
+# Only the *connect* phase gets a timeout: failing to even open a TCP
+# connection to 127.0.0.1 within 5s means Obsidian/the plugin isn't up yet,
+# which is the transient, retry-worthy failure this was built for. There is
+# deliberately no read timeout: a real agentic Claude Code turn can easily run
+# past two minutes, and a fixed read timeout would misclassify "still working"
+# as "failed", causing a retry that re-POSTs the same text - Claudian would
+# then process the same user message a second time as an independent turn,
+# producing a duplicate reply. Waiting indefinitely for the read is the
+# correct behavior here: the plugin's HTTP handler only responds once
+# Claudian's turn has actually finished.
+BRIDGE_TIMEOUT = httpx.Timeout(connect=5.0, read=None, write=30.0, pool=5.0)
 
-async def _forward_to_bridge(text: str) -> str:
-    """POST to the Obsidian plugin, retrying transient connection failures.
+
+async def _forward_to_bridge(client: httpx.AsyncClient, text: str) -> str:
+    """POST to the Obsidian plugin, retrying only connection-stage failures.
 
     Obsidian/the plugin can be briefly unreachable (still loading after a
-    restart, a plugin reload in progress, etc.). A single failed connection
-    attempt used to surface immediately as "[桥接连接失败]" in WeChat, which
-    is noisy for something that often clears up a second later. Only give up
-    and report an error after a few attempts.
+    restart, a plugin reload in progress, etc.) - that's what gets retried.
+    A slow-but-working reply is not a failure and must not be retried (see
+    BRIDGE_TIMEOUT above for why).
     """
     last_error: Exception | None = None
     for attempt in range(BRIDGE_RETRY_ATTEMPTS):
         try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                resp = await client.post(BRIDGE_URL, json={"text": text})
-                data = resp.json()
-                if not data.get("ok"):
-                    return f"[桥接出错] {data.get('error', 'unknown error')}"
-                return data.get("reply", "(no reply)")
-        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as e:
+            resp = await client.post(BRIDGE_URL, json={"text": text}, timeout=BRIDGE_TIMEOUT)
+            data = resp.json()
+            if not data.get("ok"):
+                return f"[桥接出错] {data.get('error', 'unknown error')}"
+            return data.get("reply", "(no reply)")
+        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
             last_error = e
             if attempt < len(BRIDGE_RETRY_DELAYS):
                 _log(
@@ -152,7 +169,9 @@ class _LastTarget:
         self.context_token: str | None = None
 
 
-async def _wechat_poll_loop(account: AccountData, opts: WeixinApiOptions, target: _LastTarget) -> None:
+async def _wechat_poll_loop(
+    account: AccountData, opts: WeixinApiOptions, target: _LastTarget, client: httpx.AsyncClient
+) -> None:
     get_updates_buf = ""
     consecutive_failures = 0
 
@@ -192,7 +211,7 @@ async def _wechat_poll_loop(account: AccountData, opts: WeixinApiOptions, target
                 _log(f"收到: from={sender_id} text={text[:50]!r}")
 
                 try:
-                    reply = await _forward_to_bridge(text)
+                    reply = await _forward_to_bridge(client, text)
                 except Exception as e:  # noqa: BLE001
                     reply = f"[桥接连接失败] {e}"
 
@@ -208,18 +227,26 @@ async def _wechat_poll_loop(account: AccountData, opts: WeixinApiOptions, target
             await anyio.sleep(30 if consecutive_failures >= 3 else 2)
 
 
-async def _pending_push_loop(opts: WeixinApiOptions, target: _LastTarget) -> None:
-    """Polls the plugin's /pending endpoint for /listen-mode pushes and relays them."""
+async def _pending_push_loop(opts: WeixinApiOptions, target: _LastTarget, client: httpx.AsyncClient) -> None:
+    """Polls the plugin's /pending endpoint for /listen-mode pushes and relays them.
+
+    Poll rate adapts to the plugin's reported `listening` state: fast while
+    /listen is on (so desktop-originated turns show up in WeChat quickly),
+    slow while it's off (so this loop isn't making a request every few
+    seconds for a feature nobody has enabled).
+    """
+    interval = PENDING_POLL_INTERVAL_IDLE_S
     while True:
-        await anyio.sleep(PENDING_POLL_INTERVAL_S)
+        await anyio.sleep(interval)
         if not target.sender_id or not target.context_token:
             continue  # No WeChat user has said anything yet; nothing to push to.
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(PENDING_URL)
-                data = resp.json()
+            resp = await client.get(PENDING_URL, timeout=10.0)
+            data = resp.json()
         except Exception:
             continue  # Obsidian/plugin unreachable; quietly retry next tick.
+
+        interval = PENDING_POLL_INTERVAL_ACTIVE_S if data.get("listening") else PENDING_POLL_INTERVAL_IDLE_S
 
         for push in data.get("pushes") or []:
             try:
@@ -247,9 +274,13 @@ async def serve() -> None:
     opts = WeixinApiOptions(base_url=account.base_url, token=account.token)
     target = _LastTarget()
 
-    async with anyio.create_task_group() as tg:
-        tg.start_soon(_wechat_poll_loop, account, opts, target)
-        tg.start_soon(_pending_push_loop, opts, target)
+    # One shared client for both loops: avoids rebuilding a connection pool
+    # (and its TCP handshake) on every single request to the same local
+    # loopback endpoint, whether that's a WeChat message forward, a retry, or
+    # a /pending poll tick.
+    async with httpx.AsyncClient() as client, anyio.create_task_group() as tg:
+        tg.start_soon(_wechat_poll_loop, account, opts, target, client)
+        tg.start_soon(_pending_push_loop, opts, target, client)
 
 
 def main() -> None:

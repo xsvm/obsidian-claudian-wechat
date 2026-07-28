@@ -1,6 +1,6 @@
 import { Plugin, FileSystemAdapter } from 'obsidian';
 import * as http from 'http';
-import * as fs from 'fs';
+import * as fs from 'fs/promises';
 import * as path from 'path';
 
 /**
@@ -130,10 +130,6 @@ const STRINGS = {
     zh: '请先发送 /list 查看会话列表，再用 /switch 序号 切换。',
     en: 'Send /list first to see the conversation list, then use /switch <number>.',
   },
-  switchOutOfRange: {
-    zh: (n: number) => `序号超出范围（1-${n}）。`,
-    en: (n: number) => `Index out of range (1-${n}).`,
-  },
   switchedTo: { zh: (title: string) => `已切换到: ${title}`, en: (title: string) => `Switched to: ${title}` },
   newConversationStarted: {
     zh: '已新建对话，下一条消息将开始一个全新的会话。',
@@ -262,7 +258,10 @@ export default class WeChatBridgePlugin extends Plugin {
         const pushes = this.pendingPushes;
         this.pendingPushes = [];
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ ok: true, pushes }));
+        // `listening` lets the relay back off its poll rate while /listen is
+        // off, instead of hitting this endpoint at a fixed interval forever
+        // regardless of whether the feature is even in use.
+        res.end(JSON.stringify({ ok: true, pushes, listening: this.data.listening }));
         return;
       }
 
@@ -440,28 +439,47 @@ export default class WeChatBridgePlugin extends Plugin {
     return path.join(adapter.getBasePath(), '.claudian', 'sessions');
   }
 
-  private readAllConversationMeta(): ConversationMeta[] {
+  /**
+   * Reads `.claudian/sessions/*.meta.json` asynchronously (fs/promises), so a
+   * large, ever-growing session history never blocks Obsidian's renderer
+   * thread the way synchronous fs calls would.
+   *
+   * Result is cached in memory for `META_CACHE_TTL_MS`: within that window,
+   * repeat callers (e.g. /switch reading the title right after /list already
+   * scanned the same directory, or the /listen poller looking up a title on
+   * every push) reuse the same read instead of re-scanning disk.
+   */
+  private metaCache: { at: number; metas: ConversationMeta[] } | null = null;
+  private static readonly META_CACHE_TTL_MS = 5000;
+
+  private async readAllConversationMeta(): Promise<ConversationMeta[]> {
+    if (this.metaCache && Date.now() - this.metaCache.at < WeChatBridgePlugin.META_CACHE_TTL_MS) {
+      return this.metaCache.metas;
+    }
+
     const dir = this.getSessionsDir();
     let files: string[];
     try {
-      files = fs.readdirSync(dir).filter((f) => f.endsWith('.meta.json'));
+      files = (await fs.readdir(dir)).filter((f) => f.endsWith('.meta.json'));
     } catch {
       return [];
     }
     const metas: ConversationMeta[] = [];
     for (const file of files) {
       try {
-        const raw = fs.readFileSync(path.join(dir, file), 'utf-8');
+        const raw = await fs.readFile(path.join(dir, file), 'utf-8');
         metas.push(JSON.parse(raw));
       } catch {
         // skip unreadable/corrupt meta file
       }
     }
-    return metas.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
+    metas.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
+    this.metaCache = { at: Date.now(), metas };
+    return metas;
   }
 
-  private listConversations(lang: Lang): string {
-    const metas = this.readAllConversationMeta();
+  private async listConversations(lang: Lang): Promise<string> {
+    const metas = await this.readAllConversationMeta();
     this.data.lastListedIds = metas.map((m) => m.id);
     void this.saveData(this.data);
 
@@ -480,7 +498,7 @@ export default class WeChatBridgePlugin extends Plugin {
     const ids = this.data.lastListedIds;
     if (ids.length === 0) return pick(STRINGS.switchNeedsListFirst, lang);
     const id = ids[index - 1];
-    if (!id) return pick(STRINGS.switchOutOfRange, lang)(ids.length);
+    if (!id) return pick(STRINGS.outOfRange, lang)(ids.length);
 
     this.data.conversationId = id;
     await this.saveData(this.data);
@@ -488,7 +506,7 @@ export default class WeChatBridgePlugin extends Plugin {
     // Eagerly resolve/open the tab now so the switch fails fast if something's wrong,
     // instead of silently failing on the next chat message.
     const tab = await this.getOrCreateWeChatTab();
-    const metas = this.readAllConversationMeta();
+    const metas = await this.readAllConversationMeta();
     const title = metas.find((m) => m.id === tab.conversationId)?.title ?? id;
     return pick(STRINGS.switchedTo, lang)(title);
   }
@@ -544,7 +562,24 @@ export default class WeChatBridgePlugin extends Plugin {
     }
 
     const messages = tab.state.messages;
-    if (messages.length <= this.data.lastSeenMessageCount) return;
+
+    // `messages.length` is used as a growth counter, but it isn't guaranteed
+    // to only grow: /compact and rewind can replace the array with a shorter
+    // one. Without this check, a shrink would leave lastSeenMessageCount
+    // permanently above the real length, and `messages.length <= lastSeen`
+    // would then hold forever - /listen would go silent until enough new
+    // messages accumulated to climb back past the old high-water mark. Treat
+    // a shrink as "resync to the current end" instead: we can't know which of
+    // the remaining messages are "new" after a rewind/compact, so we don't
+    // try to reconstruct and push a partial turn - we just stop missing
+    // everything that comes after.
+    if (messages.length < this.data.lastSeenMessageCount) {
+      this.data.lastSeenMessageCount = messages.length;
+      void this.saveData(this.data);
+      return;
+    }
+
+    if (messages.length === this.data.lastSeenMessageCount) return;
 
     const newMessages = messages.slice(this.data.lastSeenMessageCount);
     this.data.lastSeenMessageCount = messages.length;
@@ -555,7 +590,7 @@ export default class WeChatBridgePlugin extends Plugin {
 
     const lang = this.getLangSafe();
     const reply = this.extractDispatchText(newMessages, lang);
-    const metas = this.readAllConversationMeta();
+    const metas = await this.readAllConversationMeta();
     const title = metas.find((m) => m.id === tab.conversationId)?.title ?? tab.conversationId ?? '?';
     this.pendingPushes.push(pick(STRINGS.desktopTurnTemplate, lang)(title, promptMsg.content.trim(), reply));
   }
@@ -577,12 +612,16 @@ export default class WeChatBridgePlugin extends Plugin {
 
   private async listHistory(lang: Lang): Promise<string> {
     const tab = await this.getOrCreateWeChatTab();
-    const userIndices = this.getUserMessageIndices(tab.state.messages);
+    // Claudian's `messages` getter returns a fresh array copy on every access
+    // (ChatState spreads its internal array each time); read it once and
+    // reuse the local reference instead of re-invoking the getter per index.
+    const messages = tab.state.messages;
+    const userIndices = this.getUserMessageIndices(messages);
     if (userIndices.length === 0) return pick(STRINGS.histEmpty, lang);
 
     const lines: string[] = [pick(STRINGS.histHeader, lang)];
     userIndices.forEach((msgIndex, i) => {
-      lines.push(`${i + 1}. ${this.truncate(tab.state.messages[msgIndex].content, 40)}`);
+      lines.push(`${i + 1}. ${this.truncate(messages[msgIndex].content, 40)}`);
     });
     return lines.join('\n');
   }
@@ -646,13 +685,14 @@ export default class WeChatBridgePlugin extends Plugin {
       if (msg.role !== 'assistant') continue;
       if (msg.contentBlocks && msg.contentBlocks.length > 0) {
         for (const block of msg.contentBlocks) {
-          if (block.type === 'text' && block.content.trim()) {
-            parts.push(block.content.trim());
-          }
+          if (block.type !== 'text') continue;
+          const trimmed = block.content.trim();
+          if (trimmed) parts.push(trimmed);
         }
-      } else if (msg.content.trim()) {
+      } else {
         // Fallback for providers/messages without structured content blocks.
-        parts.push(msg.content.trim());
+        const trimmed = msg.content.trim();
+        if (trimmed) parts.push(trimmed);
       }
     }
     return parts.length > 0 ? parts.join('\n\n') : pick(STRINGS.noDispatchText, lang);
