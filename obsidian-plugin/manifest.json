@@ -1,0 +1,9 @@
+{
+  "id": "wechat-bridge",
+  "name": "WeChat Bridge",
+  "version": "0.1.0",
+  "minAppVersion": "1.7.2",
+  "description": "Local HTTP bridge that drives the Claudian plugin from an external WeChat ClawBot relay: injects messages into a dedicated chat tab and lets slash commands change model/effort/permission mode.",
+  "author": "local",
+  "isDesktopOnly": true
+}

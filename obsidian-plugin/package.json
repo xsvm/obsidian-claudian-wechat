@@ -1,0 +1,14 @@
+{
+  "name": "wechat-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "node esbuild.config.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "esbuild": "^0.23.0",
+    "obsidian": "^1.7.2",
+    "typescript": "^5.5.0"
+  }
+}
