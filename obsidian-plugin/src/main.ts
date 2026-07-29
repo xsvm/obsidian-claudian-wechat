@@ -164,6 +164,10 @@ const STRINGS = {
     zh: '(这一轮没有生成文字回复。Claudian 内部可能报错并回滚了这轮对话——请去 Obsidian 里看一下有没有弹出的提示，或直接重试一次。)',
     en: '(No text reply was generated this turn. Claudian may have errored and rolled the turn back — check Obsidian for a notice, or just retry.)',
   },
+  compactedNoText: {
+    zh: '已压缩对话上下文（/compact 执行成功，本身就不会有文字回复）。',
+    en: 'Conversation context was compacted successfully (/compact has no text reply by design).',
+  },
   noClaudeCommands: {
     zh: '没有发现 Claude 自带的斜杠命令（可能还没打开过一次会话）。',
     en: 'No Claude slash commands found (a conversation may not have been opened yet).',
@@ -906,10 +910,15 @@ export default class WeChatBridgePlugin extends Plugin {
    */
   private extractDispatchText(messages: ClaudianChatMessage[], lang: Lang): string {
     const parts: string[] = [];
+    let sawCompactBoundary = false;
     for (const msg of messages) {
       if (msg.role !== 'assistant') continue;
       if (msg.contentBlocks && msg.contentBlocks.length > 0) {
         for (const block of msg.contentBlocks) {
+          if (block.type === 'context_compacted') {
+            sawCompactBoundary = true;
+            continue;
+          }
           if (block.type !== 'text') continue;
           const trimmed = block.content.trim();
           if (trimmed) parts.push(trimmed);
@@ -920,7 +929,14 @@ export default class WeChatBridgePlugin extends Plugin {
         if (trimmed) parts.push(trimmed);
       }
     }
-    return parts.length > 0 ? parts.join('\n\n') : pick(STRINGS.noDispatchText, lang);
+    if (parts.length > 0) return parts.join('\n\n');
+    // /compact (and equivalents on other providers) legitimately produce no
+    // narrative text on success - the only sign it happened is a
+    // context_compacted boundary block. Without this check that success case
+    // was indistinguishable from a genuinely empty/errored turn, and got the
+    // scary "did this fail?" message below even though nothing went wrong.
+    if (sawCompactBoundary) return pick(STRINGS.compactedNoText, lang);
+    return pick(STRINGS.noDispatchText, lang);
   }
 
   private async getOrCreateWeChatTab(): Promise<ClaudianTab> {
