@@ -117,6 +117,19 @@ interface ClaudianTab {
      * provider's UI-level state class. */
     isStreaming: boolean;
   };
+  ui: {
+    /** FileContextManager.autoAttachActiveFile() listens for Obsidian's global
+     * `file-open` workspace event and marks *whatever file the user currently
+     * has open, in any pane* as this tab's "current note" - completely
+     * independent of what conversation the tab is bound to, or who's actually
+     * about to send a message in it. `shouldSendCurrentNote()` then silently
+     * folds that note in as `<linked_note>` context on the tab's next send,
+     * once, until `markCurrentNoteSent()` clears the pending flag. For a
+     * bridge-driven tab nobody is looking at, this means whatever note
+     * happens to be open on the user's screen at that moment rides along on
+     * the next WeChat message with no way to notice from WeChat itself. */
+    fileContextManager: { markCurrentNoteSent(): void } | null;
+  };
 }
 
 interface ClaudianTabManager {
@@ -938,6 +951,13 @@ export default class WeChatBridgePlugin extends Plugin {
 
     this.sendingViaBridge = true;
     try {
+      // The user's currently-open note in Obsidian - whatever that happens to
+      // be, unrelated to this conversation - would otherwise silently ride
+      // along as `<linked_note>` context on this send (see ClaudianTab.ui's
+      // fileContextManager doc comment for why). WeChat has no way to see or
+      // veto that, so pre-empt it before every bridge-driven send.
+      tab.ui.fileContextManager?.markCurrentNoteSent();
+
       const beforeCount = tab.state.messages.length;
       // Reconstruct the same shape Claudian's own paste/drop handler builds
       // (id/name/mediaType/data/size/source) - inputController.sendMessage
