@@ -111,6 +111,11 @@ interface ClaudianTab {
   };
   state: {
     messages: ClaudianChatMessage[];
+    /** True for the whole duration of a turn (set at the start of
+     * executeSendMessage, cleared when it finishes/errors/cancels) - the
+     * actual "is this tab still generating" signal, shared by every
+     * provider's UI-level state class. */
+    isStreaming: boolean;
   };
 }
 
@@ -164,6 +169,10 @@ const STRINGS = {
     en: 'No Claudian view is open. Open the Claudian sidebar once.',
   },
   noTabManager: { zh: 'Claudian 的 tab manager 不可用。', en: 'Claudian tab manager not available.' },
+  tabLimitReached: {
+    zh: 'Claudian 标签页已达上限(10个),无法为桥接创建新标签页。请在桌面端关闭一个标签页后重试。',
+    en: 'Claudian has hit its hard tab limit (10) and could not create a tab for the bridge. Close a tab in the desktop UI and try again.',
+  },
   pluginNotEnabled: {
     zh: (id: string) => `Claudian 插件（"${id}"）未启用。`,
     en: (id: string) => `Claudian plugin ("${id}") is not enabled.`,
@@ -313,9 +322,6 @@ export default class WeChatBridgePlugin extends Plugin {
   private sendingViaBridge = false;
   private relayManager: RelayManager | null = null;
   private pluginDir: string | null = null;
-  /** Set while checkForDesktopActivity() has seen growth but isn't yet sure the
-   * turn finished streaming; see that method for why this exists. */
-  private pendingDesktopSnapshot: { count: number; fingerprint: string } | null = null;
 
   async onload() {
     const saved = await this.loadData();
@@ -771,7 +777,6 @@ export default class WeChatBridgePlugin extends Plugin {
 
   private async setListening(on: boolean, lang: Lang): Promise<string> {
     this.data.listening = on;
-    this.pendingDesktopSnapshot = null;
     if (on) {
       // Baseline against the bound tab's current message count so turning
       // listening on doesn't immediately re-push everything already said.
@@ -817,51 +822,30 @@ export default class WeChatBridgePlugin extends Plugin {
     // everything that comes after.
     if (messages.length < this.data.lastSeenMessageCount) {
       this.data.lastSeenMessageCount = messages.length;
-      this.pendingDesktopSnapshot = null;
       void this.saveData(this.data);
       return;
     }
 
-    if (messages.length === this.data.lastSeenMessageCount) {
-      this.pendingDesktopSnapshot = null;
-      return;
-    }
+    if (messages.length === this.data.lastSeenMessageCount) return;
 
-    // Growth detected - but Claudian streams the assistant's reply into the
-    // *same* message object tick by tick rather than only appending once the
-    // turn is fully done, so `messages.length` can jump to its final value
-    // (user turn + assistant placeholder) the instant the user hits send,
-    // long before there's any text in it. Reporting right here used to catch
-    // that placeholder mid-stream, extract no text, and immediately push the
-    // scary "this turn produced no text" message - even though the desktop
-    // turn was still actively generating. And because the array had already
-    // reached its final length, later ticks saw `messages.length ===
-    // lastSeenMessageCount` and stayed silent forever, so the *real* finished
-    // reply only ever showed up once some unrelated WeChat message nudged the
-    // poller into re-checking.
+    // Growth detected - but Claudian appends the user turn (and the
+    // assistant's placeholder message) to `state.messages` the instant the
+    // user hits send, then streams text into that same message object as it
+    // generates, long before there's any real content in it. An earlier
+    // version of this check reported the turn right here, extracted no text
+    // from the still-empty placeholder, and immediately pushed the scary
+    // "this turn produced no text" message even though the desktop turn was
+    // still actively generating - and then tried to infer "done" purely by
+    // fingerprinting message content across polls, which added several
+    // seconds of pure latency on every single turn and could still misfire.
     //
-    // Fix: don't trust length alone. Fingerprint the new tail (role + text +
-    // block count) and require it to be byte-identical across two
-    // consecutive polls - i.e. nothing changed for a full
-    // LISTEN_POLL_INTERVAL_MS - before treating the turn as settled. This
-    // waits out mid-stream growth automatically, without needing any
-    // internal "is this tab still generating" flag from Claudian.
-    const tail = messages.slice(this.data.lastSeenMessageCount);
-    const fingerprint = JSON.stringify(
-      tail.map((m) => ({ role: m.role, content: m.content, blocks: m.contentBlocks })),
-    );
-    const lastMsg = messages[messages.length - 1];
-    const settled = lastMsg?.role === 'assistant'
-      && this.pendingDesktopSnapshot?.count === messages.length
-      && this.pendingDesktopSnapshot?.fingerprint === fingerprint;
+    // `state.isStreaming` is Claudian's own real signal for this (set true at
+    // the start of executeSendMessage, cleared when the turn finishes,
+    // errors, or is cancelled - shared by every provider's UI-level state
+    // class). Just wait for it to go false instead of guessing from content.
+    if (tab.state.isStreaming) return;
 
-    if (!settled) {
-      this.pendingDesktopSnapshot = { count: messages.length, fingerprint };
-      return;
-    }
-    this.pendingDesktopSnapshot = null;
-
-    const newMessages = tail;
+    const newMessages = messages.slice(this.data.lastSeenMessageCount);
     this.data.lastSeenMessageCount = messages.length;
     void this.saveData(this.data);
 
@@ -1039,18 +1023,50 @@ export default class WeChatBridgePlugin extends Plugin {
       const existing = tabManager.getAllTabs().find((t) => t.conversationId === this.data.conversationId);
       if (existing) return existing;
       // Tab was closed or conversation was never opened in a tab yet; (re)open it.
-      return await tabManager.createTab(this.data.conversationId);
+      await this.ensureTabCapacity(claudian, tabManager);
+      const tab = await tabManager.createTab(this.data.conversationId);
+      if (!tab) throw new Error(pick(STRINGS.tabLimitReached, this.getLangSafe()));
+      return tab;
     }
 
     // A brand-new blank tab: if /provider selected something other than the
     // default, pass it through so Claudian seeds the tab with *that*
     // provider's own saved model (resolveBlankTabModel) instead of inheriting
     // whatever provider the currently active Claudian tab happens to be on.
-    return await tabManager.createTab(
+    await this.ensureTabCapacity(claudian, tabManager);
+    const tab = await tabManager.createTab(
       undefined,
       undefined,
       this.data.providerId ? { defaultProviderId: this.data.providerId } : undefined,
     );
+    if (!tab) throw new Error(pick(STRINGS.tabLimitReached, this.getLangSafe()));
+    return tab;
+  }
+
+  /**
+   * TabManager.createTab() silently returns `null` instead of a tab once
+   * `tabs.size + pendingTabCreations >= maxTabs` (Claudian's own cap, clamped
+   * 3-10 - see main.js's TabManager.createTab). If the bridge's own bound
+   * conversation isn't already open as a tab (view was closed/reopened, or
+   * this is the very first message) and the user already has `maxTabs` tabs
+   * open in the desktop UI, createTab() returns null and the caller crashed
+   * with a bare "Cannot read properties of null (reading 'controllers')" -
+   * this is what that error actually was. Rather than fail (or silently
+   * commandeer one of the user's existing tabs), bump the limit by exactly
+   * one slot so the bridge's own tab can be created without disturbing
+   * anything the user already has open. No-ops if there's already room, and
+   * gives up quietly at Claudian's hard cap of 10 (createTab's own null path
+   * still applies then; the caller's null check reports it clearly instead
+   * of crashing).
+   */
+  private async ensureTabCapacity(claudian: ClaudianPluginInstance, tabManager: ClaudianTabManager): Promise<void> {
+    const configured = claudian.settings?.maxTabs;
+    const maxTabs = typeof configured === 'number' ? Math.max(3, Math.min(10, configured)) : 3;
+    if (tabManager.getAllTabs().length < maxTabs) return;
+    if (maxTabs >= 10) return;
+    await claudian.mutateSettings((settings) => {
+      settings.maxTabs = maxTabs + 1;
+    });
   }
 
   private findClaudianViewViaWorkspace(): ClaudianView | null {
