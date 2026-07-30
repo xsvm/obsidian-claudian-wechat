@@ -293,6 +293,9 @@ export default class WeChatBridgePlugin extends Plugin {
   private sendingViaBridge = false;
   private relayManager: RelayManager | null = null;
   private pluginDir: string | null = null;
+  /** Set while checkForDesktopActivity() has seen growth but isn't yet sure the
+   * turn finished streaming; see that method for why this exists. */
+  private pendingDesktopSnapshot: { count: number; fingerprint: string } | null = null;
 
   async onload() {
     const saved = await this.loadData();
@@ -735,6 +738,7 @@ export default class WeChatBridgePlugin extends Plugin {
 
   private async setListening(on: boolean, lang: Lang): Promise<string> {
     this.data.listening = on;
+    this.pendingDesktopSnapshot = null;
     if (on) {
       // Baseline against the bound tab's current message count so turning
       // listening on doesn't immediately re-push everything already said.
@@ -780,13 +784,51 @@ export default class WeChatBridgePlugin extends Plugin {
     // everything that comes after.
     if (messages.length < this.data.lastSeenMessageCount) {
       this.data.lastSeenMessageCount = messages.length;
+      this.pendingDesktopSnapshot = null;
       void this.saveData(this.data);
       return;
     }
 
-    if (messages.length === this.data.lastSeenMessageCount) return;
+    if (messages.length === this.data.lastSeenMessageCount) {
+      this.pendingDesktopSnapshot = null;
+      return;
+    }
 
-    const newMessages = messages.slice(this.data.lastSeenMessageCount);
+    // Growth detected - but Claudian streams the assistant's reply into the
+    // *same* message object tick by tick rather than only appending once the
+    // turn is fully done, so `messages.length` can jump to its final value
+    // (user turn + assistant placeholder) the instant the user hits send,
+    // long before there's any text in it. Reporting right here used to catch
+    // that placeholder mid-stream, extract no text, and immediately push the
+    // scary "this turn produced no text" message - even though the desktop
+    // turn was still actively generating. And because the array had already
+    // reached its final length, later ticks saw `messages.length ===
+    // lastSeenMessageCount` and stayed silent forever, so the *real* finished
+    // reply only ever showed up once some unrelated WeChat message nudged the
+    // poller into re-checking.
+    //
+    // Fix: don't trust length alone. Fingerprint the new tail (role + text +
+    // block count) and require it to be byte-identical across two
+    // consecutive polls - i.e. nothing changed for a full
+    // LISTEN_POLL_INTERVAL_MS - before treating the turn as settled. This
+    // waits out mid-stream growth automatically, without needing any
+    // internal "is this tab still generating" flag from Claudian.
+    const tail = messages.slice(this.data.lastSeenMessageCount);
+    const fingerprint = JSON.stringify(
+      tail.map((m) => ({ role: m.role, content: m.content, blocks: m.contentBlocks })),
+    );
+    const lastMsg = messages[messages.length - 1];
+    const settled = lastMsg?.role === 'assistant'
+      && this.pendingDesktopSnapshot?.count === messages.length
+      && this.pendingDesktopSnapshot?.fingerprint === fingerprint;
+
+    if (!settled) {
+      this.pendingDesktopSnapshot = { count: messages.length, fingerprint };
+      return;
+    }
+    this.pendingDesktopSnapshot = null;
+
+    const newMessages = tail;
     this.data.lastSeenMessageCount = messages.length;
     void this.saveData(this.data);
 
