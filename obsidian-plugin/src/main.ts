@@ -55,6 +55,16 @@ interface BridgeData {
   lastListedIds: string[];
   /** /listen on|off: mirror turns sent from the desktop Claudian UI to WeChat too. */
   listening: boolean;
+  /**
+   * The conversation /listen was turned on for. Scoped, not global: switching
+   * to a different conversation (via /switch or /new) after turning listening
+   * on must NOT keep mirroring the new one - checkForDesktopActivity() only
+   * acts while this still matches the currently bound conversationId. `null`
+   * means "turned on before any conversation existed yet" - it then binds to
+   * whichever conversation actually gets created by the next message, same as
+   * conversationId itself starts out null and gets filled in lazily.
+   */
+  listeningConversationId: string | null;
   /** Message count already seen in the bound tab, so the /listen poller only reports new turns. */
   lastSeenMessageCount: number;
   /**
@@ -237,8 +247,8 @@ const STRINGS = {
     en: (n: number) => `Index out of range (1-${n}).`,
   },
   listenOn: {
-    zh: '监听已开启：在 Claudian 电脑客户端上发的消息也会推送到这里。',
-    en: 'Listening enabled: messages sent from the Claudian desktop client will also be pushed here.',
+    zh: '监听已开启（仅对当前对话生效）：在 Claudian 电脑客户端上发的消息也会推送到这里。切换到其他对话后监听不会跟过去。',
+    en: 'Listening enabled (scoped to the current conversation only): messages sent from the Claudian desktop client will also be pushed here. Switching to a different conversation stops it from following.',
   },
   listenOff: { zh: '监听已关闭。', en: 'Listening disabled.' },
   listenUsage: {
@@ -318,6 +328,7 @@ const DEFAULT_DATA: BridgeData = {
   conversationId: null,
   lastListedIds: [],
   listening: false,
+  listeningConversationId: null,
   lastSeenMessageCount: 0,
   providerId: null,
 };
@@ -791,12 +802,27 @@ export default class WeChatBridgePlugin extends Plugin {
   private async setListening(on: boolean, lang: Lang): Promise<string> {
     this.data.listening = on;
     if (on) {
+      // Scoped to whichever conversation is currently bound - switching to a
+      // different one afterward (via /switch or /new) must not carry this
+      // along; checkForDesktopActivity() checks this against the live
+      // conversationId on every tick. `null` here just means "no conversation
+      // yet"; it gets filled in the first time one actually exists (see
+      // checkForDesktopActivity and sendChatMessage, which both write
+      // data.conversationId once Claudian assigns one).
+      this.data.listeningConversationId = this.data.conversationId;
       // Baseline against the bound tab's current message count so turning
       // listening on doesn't immediately re-push everything already said.
-      try {
-        const tab = await this.getOrCreateWeChatTab();
-        this.data.lastSeenMessageCount = tab.state.messages.length;
-      } catch {
+      // Only look the tab up if a conversation already exists - doing this
+      // unconditionally would create a brand-new blank conversation as a side
+      // effect of merely toggling /listen on.
+      if (this.data.conversationId) {
+        try {
+          const tab = await this.getOrCreateWeChatTab();
+          this.data.lastSeenMessageCount = tab.state.messages.length;
+        } catch {
+          this.data.lastSeenMessageCount = 0;
+        }
+      } else {
         this.data.lastSeenMessageCount = 0;
       }
     }
@@ -813,6 +839,20 @@ export default class WeChatBridgePlugin extends Plugin {
   private async checkForDesktopActivity(): Promise<void> {
     if (!this.data.listening || this.sendingViaBridge) return;
     if (!this.data.conversationId) return;
+
+    // Scoped to the conversation /listen was turned on for - switching to a
+    // different one (via /switch or /new) afterward must not carry this
+    // along, or turning listening on in conversation A would silently start
+    // mirroring conversation B just because it happens to be the bound one
+    // later. `null` means /listen was turned on before any conversation
+    // existed yet; bind it to whichever one shows up first (this only fires
+    // once, since it's non-null on every subsequent tick).
+    if (this.data.listeningConversationId === null) {
+      this.data.listeningConversationId = this.data.conversationId;
+      void this.saveData(this.data);
+    } else if (this.data.listeningConversationId !== this.data.conversationId) {
+      return;
+    }
 
     let tab: ClaudianTab;
     try {
