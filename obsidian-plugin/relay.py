@@ -3,9 +3,11 @@ WeChat ClawBot <-> Claudian relay.
 
 Does NOT talk to Claude Code or any MCP channel. It only:
   1. QR-authenticates with WeChat ClawBot (reusing wechat_clawbot's login code).
-  2. Long-polls getUpdates for incoming WeChat text messages.
-  3. POSTs the text to the local "wechat-bridge" Obsidian plugin
-     (http://127.0.0.1:39217/message), which drives Claudian itself.
+  2. Long-polls getUpdates for incoming WeChat text and image messages
+     (images are downloaded/decrypted via wechat_clawbot's own CDN pipeline
+     and base64-encoded in memory - never written to disk).
+  3. POSTs the text (and image, if any) to the local "wechat-bridge" Obsidian
+     plugin (http://127.0.0.1:39217/message), which drives Claudian itself.
   4. Sends the plugin's reply back to WeChat.
   5. Polls the plugin's /pending endpoint for /listen-mode pushes (desktop-
      originated turns) and relays those too.
@@ -17,6 +19,7 @@ Usage:
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import json
 import os
@@ -37,7 +40,7 @@ from wechat_clawbot.api.types import (
     TypingStatus,
     WeixinMessage,
 )
-from wechat_clawbot.auth.accounts import DEFAULT_BASE_URL
+from wechat_clawbot.auth.accounts import CDN_BASE_URL, DEFAULT_BASE_URL
 from wechat_clawbot.auth.login_qr import start_weixin_login_with_qr, wait_for_weixin_login
 from wechat_clawbot.claude_channel.credentials import (
     AccountData,
@@ -45,6 +48,7 @@ from wechat_clawbot.claude_channel.credentials import (
     load_credentials,
     save_credentials,
 )
+from wechat_clawbot.media.download import download_media_from_item
 from wechat_clawbot.messaging.inbound import body_from_item_list
 from wechat_clawbot.util.random import generate_id
 
@@ -165,8 +169,87 @@ BRIDGE_RETRY_DELAYS = [1.0, 2.0]  # seconds between attempts 1->2 and 2->3
 # Claudian's turn has actually finished.
 BRIDGE_TIMEOUT = httpx.Timeout(connect=5.0, read=None, write=30.0, pool=5.0)
 
+# Base64 inflates raw bytes by ~4/3 over the local loopback POST; cap the
+# source image so a huge photo can't balloon into a multi-ten-MB JSON body.
+_IMAGE_MAX_BYTES = 10 * 1024 * 1024
 
-async def _forward_to_bridge(client: httpx.AsyncClient, text: str) -> str:
+# Magic-byte sniffers for the handful of image formats WeChat actually sends.
+# download_media_from_item() doesn't hand back a content-type for images (its
+# save_media callback gets content_type=None for the IMAGE branch - see
+# wechat_clawbot/media/download.py) since WeChat's own protocol doesn't carry
+# one either, so this is the only way to know what we downloaded.
+_IMAGE_MAGIC: list[tuple[bytes, str]] = [
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+]
+
+
+def _sniff_image_mime(buf: bytes) -> str:
+    for magic, mime in _IMAGE_MAGIC:
+        if buf.startswith(magic):
+            return mime
+    if buf.startswith(b"RIFF") and buf[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/jpeg"  # WeChat photos are virtually always jpeg; sane default.
+
+
+def _find_image_item(item_list: list[MessageItem] | None) -> MessageItem | None:
+    """First IMAGE item with an actually-downloadable CDN payload, if any.
+
+    Deliberately image-only (not the IMAGE > VIDEO > FILE priority the full
+    process_message.py reference pipeline uses) - this bridge only forwards
+    images to Claudian for now.
+    """
+    if not item_list:
+        return None
+    for item in item_list:
+        if (
+            item.type == MessageItemType.IMAGE
+            and item.image_item
+            and item.image_item.media
+            and item.image_item.media.has_download_source
+        ):
+            return item
+    return None
+
+
+async def _download_incoming_image(item: MessageItem) -> dict[str, str] | None:
+    """Downloads + decrypts a WeChat image message via wechat_clawbot's own CDN
+    pipeline - the same download_media_from_item() the official gateway's
+    process_message.py uses - kept in memory instead of written to disk, since
+    the bridge only needs a base64 blob to hand to Claudian, not a file.
+    """
+    captured: dict[str, bytes] = {}
+
+    async def _save_media(buf: bytes, content_type, subdir, max_bytes, original_filename=None):
+        captured["bytes"] = buf
+        return {"path": "memory"}
+
+    try:
+        opts = await download_media_from_item(
+            item,
+            cdn_base_url=CDN_BASE_URL,
+            save_media=_save_media,
+            log=_log,
+            err_log=_log,
+            label="inbound",
+        )
+    except Exception as e:  # noqa: BLE001
+        _log(f"图片下载失败: {e}")
+        return None
+
+    if not opts.decrypted_pic_path or "bytes" not in captured:
+        return None
+    buf = captured["bytes"]
+    if len(buf) > _IMAGE_MAX_BYTES:
+        _log(f"图片超过 {_IMAGE_MAX_BYTES} 字节上限，已丢弃 (size={len(buf)})")
+        return None
+    return {"mediaType": _sniff_image_mime(buf), "data": base64.b64encode(buf).decode("ascii")}
+
+
+async def _forward_to_bridge(client: httpx.AsyncClient, text: str, image: dict[str, str] | None = None) -> str:
     """POST to the Obsidian plugin, retrying only connection-stage failures.
 
     Obsidian/the plugin can be briefly unreachable (still loading after a
@@ -175,9 +258,12 @@ async def _forward_to_bridge(client: httpx.AsyncClient, text: str) -> str:
     BRIDGE_TIMEOUT above for why).
     """
     last_error: Exception | None = None
+    body: dict[str, object] = {"text": text}
+    if image is not None:
+        body["image"] = image
     for attempt in range(BRIDGE_RETRY_ATTEMPTS):
         try:
-            resp = await client.post(BRIDGE_URL, json={"text": text}, timeout=BRIDGE_TIMEOUT)
+            resp = await client.post(BRIDGE_URL, json=body, timeout=BRIDGE_TIMEOUT)
             data = resp.json()
             if not data.get("ok"):
                 return f"[桥接出错] {data.get('error', 'unknown error')}"
@@ -235,7 +321,12 @@ async def _typing_keepalive(opts: WeixinApiOptions, sender_id: str, ticket: str,
 
 
 async def _reply_with_typing_indicator(
-    client: httpx.AsyncClient, opts: WeixinApiOptions, sender_id: str, context_token: str, text: str
+    client: httpx.AsyncClient,
+    opts: WeixinApiOptions,
+    sender_id: str,
+    context_token: str,
+    text: str,
+    image: dict[str, str] | None = None,
 ) -> str:
     """Shows "typing..." in WeChat for as long as _forward_to_bridge takes to come back."""
     ticket = await _get_typing_ticket(opts, sender_id, context_token)
@@ -244,7 +335,7 @@ async def _reply_with_typing_indicator(
         # for this user) - proceed without an indicator rather than fail the
         # whole reply over a cosmetic feature.
         try:
-            return await _forward_to_bridge(client, text)
+            return await _forward_to_bridge(client, text, image)
         except Exception as e:  # noqa: BLE001
             return f"[桥接连接失败] {e}"
 
@@ -253,7 +344,7 @@ async def _reply_with_typing_indicator(
     async with anyio.create_task_group() as tg:
         tg.start_soon(_typing_keepalive, opts, sender_id, ticket, stop_event)
         try:
-            reply = await _forward_to_bridge(client, text)
+            reply = await _forward_to_bridge(client, text, image)
         except Exception as e:  # noqa: BLE001
             reply = f"[桥接连接失败] {e}"
         finally:
@@ -315,15 +406,19 @@ async def _wechat_poll_loop(
                 if msg.message_type != MessageType.USER:
                     continue
                 text = body_from_item_list(msg.item_list)
-                if not text:
+                image_item = _find_image_item(msg.item_list)
+                image = await _download_incoming_image(image_item) if image_item else None
+                # A bare photo (no caption) has empty text - only skip the
+                # message if there's neither text nor a usable image.
+                if not text and not image:
                     continue
                 sender_id = msg.from_user_id or "unknown"
                 context_token = msg.context_token or ""
                 target.sender_id = sender_id
                 target.context_token = context_token
-                _log(f"收到: from={sender_id} text={text[:50]!r}")
+                _log(f"收到: from={sender_id} text={text[:50]!r} image={'是' if image else '否'}")
 
-                reply = await _reply_with_typing_indicator(client, opts, sender_id, context_token, text)
+                reply = await _reply_with_typing_indicator(client, opts, sender_id, context_token, text, image)
 
                 try:
                     await _send_text_reply(opts, sender_id, reply, context_token)

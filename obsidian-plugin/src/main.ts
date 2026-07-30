@@ -43,6 +43,12 @@ const VIEW_TYPE_CLAUDIAN = 'claudian-view';
 const ALL_PROVIDER_IDS = ['claude', 'codex', 'opencode', 'pi', 'grok'] as const;
 type ProviderId = (typeof ALL_PROVIDER_IDS)[number];
 
+/** Inbound image payload as sent by relay.py's /message POST body. */
+interface IncomingImage {
+  mediaType: string;
+  data: string; // base64, no "data:" prefix
+}
+
 interface BridgeData {
   conversationId: string | null;
   /** conversation ids in the order shown by the last /list, for /switch N to index into. */
@@ -82,12 +88,26 @@ interface ClaudianSlashCommand {
   argumentHint?: string;
 }
 
+/** Shape Claudian's own paste/drop image-attachment code builds (ImageContextManager.addImageFromFile) -
+ * `sendMessage`'s `images` option is a plain array of these, verified against the same call site
+ * (`this.sendMessage({content, images, turnRequestOverride})`) that the queued-message replay path uses. */
+interface ClaudianImageAttachment {
+  id: string;
+  name: string;
+  mediaType: string;
+  data: string; // base64, no "data:" prefix
+  size: number;
+  source: string;
+}
+
 interface ClaudianTab {
   id: string;
   conversationId: string | null;
   lifecycleState: string;
   controllers: {
-    inputController: { sendMessage(opts: { content: string }): Promise<void> } | null;
+    inputController: {
+      sendMessage(opts: { content: string; images?: ClaudianImageAttachment[] }): Promise<void>;
+    } | null;
   };
   state: {
     messages: ClaudianChatMessage[];
@@ -426,13 +446,26 @@ export default class WeChatBridgePlugin extends Plugin {
 
   private async handleIncoming(rawBody: string): Promise<string> {
     let text: string;
+    // Optional inbound image (relay.py downloads+decrypts the WeChat CDN blob
+    // and base64-encodes it before POSTing here - see IncomingImage below).
+    let image: IncomingImage | undefined;
     try {
-      text = String(JSON.parse(rawBody).text ?? '').trim();
+      const parsed = JSON.parse(rawBody);
+      text = String(parsed.text ?? '').trim();
+      if (
+        parsed.image
+        && typeof parsed.image.data === 'string'
+        && typeof parsed.image.mediaType === 'string'
+      ) {
+        image = { data: parsed.image.data, mediaType: parsed.image.mediaType };
+      }
     } catch {
       throw new Error(pick(STRINGS.bodyMustBeJson, this.getLangSafe()));
     }
     const lang = this.getLangSafe();
-    if (!text) throw new Error(pick(STRINGS.emptyText, lang));
+    // A pure image message (no caption) has empty text - only reject the
+    // request if there's neither text nor an image to act on.
+    if (!text && !image) throw new Error(pick(STRINGS.emptyText, lang));
 
     if (/^\/help\b/i.test(text)) {
       return buildHelpText(lang, this.getEnabledProviders().length > 1);
@@ -493,7 +526,7 @@ export default class WeChatBridgePlugin extends Plugin {
     // vault commands, and skills - is sent through as-is. Claudian's own
     // InputController already detects and expands those; this bridge does
     // not need to special-case them.
-    return await this.sendChatMessage(text, lang);
+    return await this.sendChatMessage(text, lang, image);
   }
 
   // ---- locale ----
@@ -913,7 +946,7 @@ export default class WeChatBridgePlugin extends Plugin {
 
   // ---- chat message injection ----
 
-  private async sendChatMessage(text: string, lang: Lang): Promise<string> {
+  private async sendChatMessage(text: string, lang: Lang, image?: IncomingImage): Promise<string> {
     const tab = await this.getOrCreateWeChatTab();
     if (!tab.controllers.inputController) {
       throw new Error(pick(STRINGS.tabNotReady, lang));
@@ -922,7 +955,20 @@ export default class WeChatBridgePlugin extends Plugin {
     this.sendingViaBridge = true;
     try {
       const beforeCount = tab.state.messages.length;
-      await tab.controllers.inputController.sendMessage({ content: text });
+      // Reconstruct the same shape Claudian's own paste/drop handler builds
+      // (id/name/mediaType/data/size/source) - inputController.sendMessage
+      // doesn't care how an image got attached, only that it matches this shape.
+      const images: ClaudianImageAttachment[] | undefined = image
+        ? [{
+            id: `wechat-${Date.now()}`,
+            name: `wechat-image.${image.mediaType.split('/')[1] ?? 'jpg'}`,
+            mediaType: image.mediaType,
+            data: image.data,
+            size: Math.ceil((image.data.length * 3) / 4),
+            source: 'wechat',
+          }]
+        : undefined;
+      await tab.controllers.inputController.sendMessage({ content: text, images });
 
       if (tab.conversationId && tab.conversationId !== this.data.conversationId) {
         this.data.conversationId = tab.conversationId;
