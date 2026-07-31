@@ -477,7 +477,7 @@ export default class WeChatBridgePlugin extends Plugin {
    * pushed to WeChat, so flushProgressive() only ever pushes each settled
    * chunk once.
    */
-  private progressiveCursors: Map<string, { pushedMessageCount: number; pushedBlocksInCurrent: number }> = new Map();
+  private progressiveCursors: Map<string, { pushedMessageCount: number; pushedBlocksInCurrent: number; everPushed: boolean }> = new Map();
 
   async onload() {
     const saved = await this.loadData();
@@ -1211,7 +1211,7 @@ export default class WeChatBridgePlugin extends Plugin {
       let progressiveTimer: number | null = null;
       let pushedAnything = false;
       if (progressive) {
-        this.progressiveCursors.set(tab.id, { pushedMessageCount: 0, pushedBlocksInCurrent: 0 });
+        this.progressiveCursors.set(tab.id, { pushedMessageCount: 0, pushedBlocksInCurrent: 0, everPushed: false });
         progressiveTimer = window.setInterval(() => this.flushProgressive(tab, beforeCount, false), PROGRESSIVE_POLL_INTERVAL_MS);
       }
       try {
@@ -1219,13 +1219,15 @@ export default class WeChatBridgePlugin extends Plugin {
       } finally {
         if (progressiveTimer !== null) window.clearInterval(progressiveTimer);
         if (progressive) {
-          // Final flush treats the very last block as settled too (it can
-          // no longer still be growing - the turn is over), so nothing
-          // produced right at the tail end between the last poll tick and
-          // completion gets missed.
-          this.flushProgressive(tab, beforeCount, true);
-          const cursor = this.progressiveCursors.get(tab.id);
-          pushedAnything = !!cursor && (cursor.pushedMessageCount > 0 || cursor.pushedBlocksInCurrent > 0);
+          // Computed here, before the final flush, so it can ride along on
+          // the very last chunk instead of arriving as its own separate
+          // WeChat message (flushProgressive appends it to the last line it
+          // pushes this call). Final flush treats the very last block as
+          // settled too (it can no longer still be growing - the turn is
+          // over), so nothing produced right at the tail end between the
+          // last poll tick and completion gets missed.
+          const ctxLineForFlush = await this.contextWindowLine(tab.conversationId, lang);
+          pushedAnything = this.flushProgressive(tab, beforeCount, true, ctxLineForFlush ?? undefined);
           this.progressiveCursors.delete(tab.id);
         }
       }
@@ -1252,13 +1254,11 @@ export default class WeChatBridgePlugin extends Plugin {
       const body = ctxLine ? `${reply}\n\n${ctxLine}` : reply;
 
       if (progressive && pushedAnything) {
-        // Every chunk already went out individually via flushProgressive() as
-        // the turn ran (each one tagged with the conversation title if it
-        // wasn't the current one at push time) - repeating the whole thing
-        // here would duplicate everything the user just saw arrive piece by
-        // piece. Only the context-window line rides along in the HTTP reply,
-        // since that's computed once at the end and was never part of a chunk.
-        return ctxLine ?? '';
+        // Every chunk (including the context-window line, appended to the
+        // last one by flushProgressive) already went out individually as the
+        // turn ran - repeating any of it here would duplicate everything the
+        // user just saw arrive piece by piece.
+        return '';
       }
 
       if (stillCurrent) return body;
@@ -1297,11 +1297,15 @@ export default class WeChatBridgePlugin extends Plugin {
    * user switched away mid-turn), same intent as switchedAwayTag but applied
    * per-chunk since chunks go out individually rather than as one reply.
    */
-  private flushProgressive(tab: ClaudianTab, beforeCount: number, final: boolean): boolean {
+  private flushProgressive(tab: ClaudianTab, beforeCount: number, final: boolean, appendSuffix?: string): boolean {
     const cursor = this.progressiveCursors.get(tab.id);
     if (!cursor) return false;
     const messages = tab.state.messages.slice(beforeCount);
-    let pushedSomething = false;
+    // Collected locally first (not pushed to pendingPushes immediately) so
+    // `appendSuffix` (the context-window line, on the final call) can be
+    // glued onto the very last chunk instead of going out as its own
+    // separate WeChat message.
+    const chunksThisCall: string[] = [];
 
     // Best-effort tag: no time to await a fresh conversation-list read from a
     // setInterval tick, so this reuses whatever readAllConversationMeta()
@@ -1328,10 +1332,7 @@ export default class WeChatBridgePlugin extends Plugin {
         const block = blocks[bi];
         if (block.type === 'text') {
           const trimmed = block.content.trim();
-          if (trimmed) {
-            this.pendingPushes.push(`${tag}${trimmed}`);
-            pushedSomething = true;
-          }
+          if (trimmed) chunksThisCall.push(`${tag}${trimmed}`);
         }
         cursor.pushedBlocksInCurrent = bi + 1;
       }
@@ -1341,7 +1342,22 @@ export default class WeChatBridgePlugin extends Plugin {
       cursor.pushedBlocksInCurrent = 0;
     }
 
-    return pushedSomething;
+    if (appendSuffix) {
+      if (chunksThisCall.length > 0) {
+        chunksThisCall[chunksThisCall.length - 1] += `\n\n${appendSuffix}`;
+      } else {
+        // Nothing new to attach it to this call (e.g. the turn ended on a
+        // tool call with no trailing narrative text) - send it on its own
+        // rather than lose it.
+        chunksThisCall.push(appendSuffix);
+      }
+    }
+
+    if (chunksThisCall.length > 0) {
+      this.pendingPushes.push(...chunksThisCall);
+      cursor.everPushed = true;
+    }
+    return cursor.everPushed;
   }
 
   /**
