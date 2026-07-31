@@ -248,6 +248,10 @@ const STRINGS = {
     en: (id: string) => `Claudian plugin ("${id}") is not enabled.`,
   },
   noConversations: { zh: '没有找到任何会话。', en: 'No conversations found.' },
+  listTruncated: {
+    zh: (n: number) => `... 还有 ${n} 个更早的会话未显示，发送 /list all 或 /ls all 查看全部。`,
+    en: (n: number) => `... ${n} more older conversation(s) not shown; send /list all or /ls all to see everything.`,
+  },
   untitled: { zh: '(无标题)', en: '(untitled)' },
   current: { zh: ' (当前)', en: ' (current)' },
   switchNeedsListFirst: {
@@ -379,7 +383,8 @@ function buildHelpText(lang: Lang, showProviderCommand: boolean): string {
   const zh = [
     '本插件命令:',
     '/help — 显示本帮助',
-    '/list 或 /ls — 列出历史会话（编号、标题、更新时间）',
+    '/list 或 /ls — 列出最近 10 个历史会话（编号、标题、更新时间）',
+    '/list all 或 /ls all — 列出全部历史会话，不限制数量',
     '/switch N 或 /goto N — 切换到 /list 中第 N 个会话',
     '/new — 新建一个全新对话（不影响其他历史会话）',
     '/status — 查看当前模型、思考强度、权限模式、监听状态',
@@ -399,7 +404,8 @@ function buildHelpText(lang: Lang, showProviderCommand: boolean): string {
   const en = [
     'Bridge commands:',
     '/help — show this help',
-    '/list or /ls — list past conversations (number, title, updated time)',
+    '/list or /ls — list the 10 most recent conversations (number, title, updated time)',
+    '/list all or /ls all — list every conversation, no limit',
     '/switch N or /goto N — switch to conversation number N from /list',
     '/new — start a brand-new conversation (existing ones are untouched)',
     '/status — show the current model, effort level, permission mode, and listening state',
@@ -434,6 +440,8 @@ const DEFAULT_DATA: BridgeData = {
 };
 
 const LISTEN_POLL_INTERVAL_MS = 3000;
+/** /list and /ls default to the most recent conversations only; /list all or /ls all shows everything. */
+const LIST_DEFAULT_LIMIT = 10;
 /** How often an in-flight bridge-driven send is checked for newly-settled text chunks while /progressive is on. */
 const PROGRESSIVE_POLL_INTERVAL_MS = 1200;
 
@@ -664,8 +672,9 @@ export default class WeChatBridgePlugin extends Plugin {
       return pick(STRINGS.providerUsage, lang)(this.getEnabledProviders().join(', '));
     }
 
-    if (/^\/(list|ls)\b/i.test(text)) {
-      return this.listConversations(lang);
+    const listMatch = text.match(/^\/(?:list|ls)(?:\s+(all))?\b/i);
+    if (listMatch) {
+      return this.listConversations(lang, Boolean(listMatch[1]));
     }
 
     const switchMatch = text.match(/^\/(switch|goto)\s+(\d+)/i);
@@ -891,19 +900,26 @@ export default class WeChatBridgePlugin extends Plugin {
     return metas;
   }
 
-  private async listConversations(lang: Lang): Promise<string> {
+  private async listConversations(lang: Lang, showAll: boolean): Promise<string> {
     const metas = await this.readAllConversationMeta();
+    // Always recorded in full (not truncated to what's displayed) so /switch
+    // N still resolves correctly for any N within the real list, even one
+    // past what a default (non-"all") /list actually printed.
     this.data.lastListedIds = metas.map((m) => m.id);
     void this.saveData(this.data);
 
     if (metas.length === 0) return pick(STRINGS.noConversations, lang);
 
+    const shown = showAll ? metas : metas.slice(0, LIST_DEFAULT_LIMIT);
     const localeTag = lang === 'zh' ? 'zh-CN' : 'en-US';
-    const lines = metas.map((m, i) => {
+    const lines = shown.map((m, i) => {
       const marker = m.id === this.data.conversationId ? pick(STRINGS.current, lang) : '';
       const when = m.updatedAt ? new Date(m.updatedAt).toLocaleString(localeTag) : '';
       return `${i + 1}. ${m.title || pick(STRINGS.untitled, lang)}${marker} — ${when}`;
     });
+    if (!showAll && metas.length > LIST_DEFAULT_LIMIT) {
+      lines.push(pick(STRINGS.listTruncated, lang)(metas.length - LIST_DEFAULT_LIMIT));
+    }
     return lines.join('\n');
   }
 
