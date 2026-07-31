@@ -74,6 +74,15 @@ interface BridgeData {
    * allow changing a bound conversation's provider anyway.
    */
   providerId: ProviderId | null;
+  /**
+   * /progressive on|off: a genuinely global, not conversation-scoped switch
+   * (unlike /listen) - it changes *how any bridge-driven send delivers its
+   * reply*, for every conversation this bridge talks to, not what it mirrors.
+   * When on, each completed narrative-text chunk of a turn is pushed to
+   * WeChat as its own message as soon as it settles (see flushProgressive),
+   * instead of buffering the whole turn and replying once at the end.
+   */
+  progressiveReply: boolean;
 }
 
 // ---- Minimal shape of the parts of Claudian we reach into at runtime. ----
@@ -352,6 +361,13 @@ const STRINGS = {
     zh: (d: string) => `已提交: ${d}`,
     en: (d: string) => `Submitted: ${d}`,
   },
+  progressiveOn: {
+    zh: '渐进式回复已开启（全局生效，所有对话）：Claudian 每说完一段就会单独推送一条，不再等整轮结束才一次性回复。',
+    en: 'Progressive replies enabled (global, applies to every conversation): each finished chunk is pushed as its own message instead of waiting for the whole turn.',
+  },
+  progressiveOff: { zh: '渐进式回复已关闭，恢复为整轮结束后一次性回复。', en: 'Progressive replies disabled; back to one reply per turn.' },
+  progressiveUsage: { zh: '用法: /progressive on 或 /progressive off', en: 'Usage: /progressive on or /progressive off' },
+  statusProgressiveLabel: { zh: '渐进式回复: ', en: 'Progressive replies: ' },
   switchedAwayTag: {
     zh: (title: string, prompt: string, reply: string) => `[来自其他对话] ${title}\nprompt：${prompt}\n\n${reply}`,
     en: (title: string, prompt: string, reply: string) => `[From another conversation] ${title}\nprompt: ${prompt}\n\n${reply}`,
@@ -372,6 +388,7 @@ function buildHelpText(lang: Lang, showProviderCommand: boolean): string {
     '/listen on 或 /listen off — 开关监听：开启后，电脑客户端上发的消息也会推送到这里',
     '/answer — 回答 Claudian 反向提出的问题（AskUserQuestion），收到推送后按提示格式回复',
     '/approve accept|always|deny|cancel — 回应 Claudian 的权限请求，收到推送后使用',
+    '/progressive on 或 /progressive off — 开关渐进式回复（全局）：开启后每说完一段就单独推送，不等整轮结束',
     '/model <名称> — 切换模型，如 /model opus、/model sonnet',
     '/effort <等级> — 切换思考强度，如 /effort low、/effort high',
     '/permission <模式> — 切换权限模式，如 /permission yolo、/permission default',
@@ -391,6 +408,7 @@ function buildHelpText(lang: Lang, showProviderCommand: boolean): string {
     '/listen on or /listen off — toggle listening: when on, messages sent from the desktop client are pushed here too',
     '/answer — answer a question Claudian asked back (AskUserQuestion); reply in the format shown in the push notification',
     '/approve accept|always|deny|cancel — respond to a Claudian approval request; use after a push notification',
+    '/progressive on or /progressive off — toggle progressive replies (global): when on, each finished chunk is pushed separately instead of waiting for the whole turn',
     '/model <name> — switch model, e.g. /model opus, /model sonnet',
     '/effort <level> — switch effort level, e.g. /effort low, /effort high',
     '/permission <mode> — switch permission mode, e.g. /permission yolo, /permission default',
@@ -412,9 +430,12 @@ const DEFAULT_DATA: BridgeData = {
   listeningConversationId: null,
   lastSeenMessageCount: 0,
   providerId: null,
+  progressiveReply: false,
 };
 
 const LISTEN_POLL_INTERVAL_MS = 3000;
+/** How often an in-flight bridge-driven send is checked for newly-settled text chunks while /progressive is on. */
+const PROGRESSIVE_POLL_INTERVAL_MS = 1200;
 
 export default class WeChatBridgePlugin extends Plugin {
   private server: http.Server | null = null;
@@ -449,6 +470,14 @@ export default class WeChatBridgePlugin extends Plugin {
    * Promise resolver to disk).
    */
   private pendingInteractive: PendingInteractive | null = null;
+  /**
+   * Per-tab progress cursor for /progressive mode, live only for the duration
+   * of one queued send (created and torn down inside sendChatMessage). Tracks
+   * how much of the in-flight turn's messages/blocks have already been
+   * pushed to WeChat, so flushProgressive() only ever pushes each settled
+   * chunk once.
+   */
+  private progressiveCursors: Map<string, { pushedMessageCount: number; pushedBlocksInCurrent: number }> = new Map();
 
   async onload() {
     const saved = await this.loadData();
@@ -506,7 +535,7 @@ export default class WeChatBridgePlugin extends Plugin {
         // `listening` lets the relay back off its poll rate while /listen is
         // off, instead of hitting this endpoint at a fixed interval forever
         // regardless of whether the feature is even in use.
-        res.end(JSON.stringify({ ok: true, pushes, listening: this.data.listening }));
+        res.end(JSON.stringify({ ok: true, pushes, listening: this.data.listening, progressive: this.data.progressiveReply }));
         return;
       }
 
@@ -661,6 +690,16 @@ export default class WeChatBridgePlugin extends Plugin {
     }
     if (/^\/listen\b/i.test(text)) {
       return pick(STRINGS.listenUsage, lang);
+    }
+
+    const progressiveMatch = text.match(/^\/progressive\s+(on|off)\b/i);
+    if (progressiveMatch) {
+      this.data.progressiveReply = progressiveMatch[1].toLowerCase() === 'on';
+      await this.saveData(this.data);
+      return pick(this.data.progressiveReply ? STRINGS.progressiveOn : STRINGS.progressiveOff, lang);
+    }
+    if (/^\/progressive\b/i.test(text)) {
+      return pick(STRINGS.progressiveUsage, lang);
     }
 
     if (/^\/new\b/i.test(text)) {
@@ -911,7 +950,10 @@ export default class WeChatBridgePlugin extends Plugin {
     const listeningWord = this.data.listening
       ? pick(STRINGS.statusListeningOn, lang)
       : pick(STRINGS.statusListeningOff, lang);
-    return `${base}${providerLine}\n${pick(STRINGS.statusListeningLabel, lang)}${listeningWord}`;
+    const progressiveWord = this.data.progressiveReply
+      ? pick(STRINGS.statusListeningOn, lang)
+      : pick(STRINGS.statusListeningOff, lang);
+    return `${base}${providerLine}\n${pick(STRINGS.statusListeningLabel, lang)}${listeningWord}\n${pick(STRINGS.statusProgressiveLabel, lang)}${progressiveWord}`;
   }
 
   // ---- /listen on|off: mirror desktop-originated turns to WeChat ----
@@ -1164,7 +1206,29 @@ export default class WeChatBridgePlugin extends Plugin {
             source: 'wechat',
           }]
         : undefined;
-      await tab.controllers.inputController.sendMessage({ content: text, images });
+
+      const progressive = this.data.progressiveReply;
+      let progressiveTimer: number | null = null;
+      let pushedAnything = false;
+      if (progressive) {
+        this.progressiveCursors.set(tab.id, { pushedMessageCount: 0, pushedBlocksInCurrent: 0 });
+        progressiveTimer = window.setInterval(() => this.flushProgressive(tab, beforeCount, false), PROGRESSIVE_POLL_INTERVAL_MS);
+      }
+      try {
+        await tab.controllers.inputController.sendMessage({ content: text, images });
+      } finally {
+        if (progressiveTimer !== null) window.clearInterval(progressiveTimer);
+        if (progressive) {
+          // Final flush treats the very last block as settled too (it can
+          // no longer still be growing - the turn is over), so nothing
+          // produced right at the tail end between the last poll tick and
+          // completion gets missed.
+          this.flushProgressive(tab, beforeCount, true);
+          const cursor = this.progressiveCursors.get(tab.id);
+          pushedAnything = !!cursor && (cursor.pushedMessageCount > 0 || cursor.pushedBlocksInCurrent > 0);
+          this.progressiveCursors.delete(tab.id);
+        }
+      }
 
       // Only rebind data.conversationId / lastSeenMessageCount if nothing
       // else has claimed the "current conversation" slot while this send was
@@ -1187,6 +1251,16 @@ export default class WeChatBridgePlugin extends Plugin {
       const ctxLine = await this.contextWindowLine(tab.conversationId, lang);
       const body = ctxLine ? `${reply}\n\n${ctxLine}` : reply;
 
+      if (progressive && pushedAnything) {
+        // Every chunk already went out individually via flushProgressive() as
+        // the turn ran (each one tagged with the conversation title if it
+        // wasn't the current one at push time) - repeating the whole thing
+        // here would duplicate everything the user just saw arrive piece by
+        // piece. Only the context-window line rides along in the HTTP reply,
+        // since that's computed once at the end and was never part of a chunk.
+        return ctxLine ?? '';
+      }
+
       if (stillCurrent) return body;
 
       // The user switched to a different conversation (or started a new one)
@@ -1200,6 +1274,74 @@ export default class WeChatBridgePlugin extends Plugin {
     } finally {
       this.sendingViaBridgeTabIds.delete(tab.id);
     }
+  }
+
+  /**
+   * Pushes any newly-settled narrative-text chunks from `tab`'s messages
+   * (from `beforeCount` onward, i.e. just this turn) to WeChat, advancing
+   * this tab's progressiveCursors entry so nothing is ever pushed twice.
+   *
+   * A block is "settled" - safe to push - once something else is known to
+   * come after it (a later block in the same message, or the message itself
+   * is no longer the last one): Claudian streams text into the *last* block
+   * of the *last* message in place, so that one specific block is the only
+   * one that can still still be actively growing. `final=true` (passed once,
+   * right after the turn's own sendMessage() promise resolves) means the
+   * whole turn is over and even that last block can no longer change, so it
+   * gets flushed too.
+   *
+   * Only `text` content blocks are pushed - same filter extractDispatchText()
+   * uses for the normal (non-progressive) reply - tool_use/thinking/subagent
+   * blocks stay silent. Each pushed chunk is tagged with the conversation
+   * title if that conversation is no longer the one currently bound (the
+   * user switched away mid-turn), same intent as switchedAwayTag but applied
+   * per-chunk since chunks go out individually rather than as one reply.
+   */
+  private flushProgressive(tab: ClaudianTab, beforeCount: number, final: boolean): boolean {
+    const cursor = this.progressiveCursors.get(tab.id);
+    if (!cursor) return false;
+    const messages = tab.state.messages.slice(beforeCount);
+    let pushedSomething = false;
+
+    // Best-effort tag: no time to await a fresh conversation-list read from a
+    // setInterval tick, so this reuses whatever readAllConversationMeta()
+    // last cached (refreshed at least once per /list, /switch, or turn-end),
+    // falling back to the raw id if nothing's cached yet.
+    const tag = tab.conversationId && tab.conversationId !== this.data.conversationId
+      ? `[${this.metaCache?.metas.find((m) => m.id === tab.conversationId)?.title ?? tab.conversationId}] `
+      : '';
+
+    for (let mi = cursor.pushedMessageCount; mi < messages.length; mi++) {
+      const msg = messages[mi];
+      const isLastMessage = mi === messages.length - 1;
+      if (msg.role !== 'assistant') {
+        cursor.pushedMessageCount = mi + 1;
+        cursor.pushedBlocksInCurrent = 0;
+        continue;
+      }
+      const blocks: ContentBlock[] = msg.contentBlocks && msg.contentBlocks.length > 0
+        ? msg.contentBlocks
+        : (msg.content.trim() ? [{ type: 'text', content: msg.content }] : []);
+      const settledCount = (isLastMessage && !final) ? Math.max(0, blocks.length - 1) : blocks.length;
+
+      for (let bi = cursor.pushedBlocksInCurrent; bi < settledCount; bi++) {
+        const block = blocks[bi];
+        if (block.type === 'text') {
+          const trimmed = block.content.trim();
+          if (trimmed) {
+            this.pendingPushes.push(`${tag}${trimmed}`);
+            pushedSomething = true;
+          }
+        }
+        cursor.pushedBlocksInCurrent = bi + 1;
+      }
+
+      if (isLastMessage && !final) break; // still the active message; may grow more blocks next tick
+      cursor.pushedMessageCount = mi + 1;
+      cursor.pushedBlocksInCurrent = 0;
+    }
+
+    return pushedSomething;
   }
 
   /**

@@ -71,10 +71,13 @@ BRIDGE_URL = f"http://127.0.0.1:{BRIDGE_PORT}/message"
 PENDING_URL = f"http://127.0.0.1:{BRIDGE_PORT}/pending"
 LONG_POLL_TIMEOUT_MS = 35_000
 
-# Fast poll while /listen is on, slow poll while it's off, so this relay isn't
-# hitting the plugin every few seconds forever for a feature that's usually
-# not even enabled.
+# Fast poll while /listen or /progressive is on, slow poll while both are
+# off, so this relay isn't hitting the plugin every few seconds forever for
+# features that are usually not even enabled. /progressive polls faster still
+# than plain /listen - it's meant to feel like the reply is arriving as it's
+# generated, not just "eventually".
 PENDING_POLL_INTERVAL_ACTIVE_S = 5.0
+PENDING_POLL_INTERVAL_PROGRESSIVE_S = 2.0
 PENDING_POLL_INTERVAL_IDLE_S = 30.0
 
 # How often to re-send the typing indicator while waiting for Claudian's
@@ -397,6 +400,14 @@ async def _handle_one_message(
 
     reply = await _reply_with_typing_indicator(client, opts, sender_id, context_token, text, image)
 
+    if not reply.strip():
+        # /progressive mode: every chunk of this turn already went out
+        # individually via _pending_push_loop as it happened: the bridge
+        # deliberately returns an empty reply here instead of repeating
+        # everything a second time in one lump message.
+        _log(f"已回复: to={sender_id} (渐进式模式，内容已单独推送)")
+        return
+
     try:
         await _send_text_reply(opts, sender_id, reply, context_token)
         _log(f"已回复: to={sender_id} text={reply[:50]!r}")
@@ -472,7 +483,12 @@ async def _pending_push_loop(opts: WeixinApiOptions, target: _LastTarget, client
         except Exception:
             continue  # Obsidian/plugin unreachable; quietly retry next tick.
 
-        interval = PENDING_POLL_INTERVAL_ACTIVE_S if data.get("listening") else PENDING_POLL_INTERVAL_IDLE_S
+        if data.get("progressive"):
+            interval = PENDING_POLL_INTERVAL_PROGRESSIVE_S
+        elif data.get("listening"):
+            interval = PENDING_POLL_INTERVAL_ACTIVE_S
+        else:
+            interval = PENDING_POLL_INTERVAL_IDLE_S
 
         for push in data.get("pushes") or []:
             try:
