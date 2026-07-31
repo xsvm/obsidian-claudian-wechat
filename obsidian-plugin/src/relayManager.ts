@@ -300,6 +300,10 @@ export class RelayManager {
     }
   }
 
+  private logFile(): string {
+    return path.join(this.pluginDir, 'relay.log');
+  }
+
   /** Starts `relay.py serve` as a child of this plugin's own process lifetime (not detached). */
   private async startRelayProcess(venvPython: string): Promise<void> {
     if (this.stopped) return; // plugin was unloaded while setup was still running
@@ -313,6 +317,22 @@ export class RelayManager {
     if (this.relayProcess.pid) {
       await fs.writeFile(this.pidFile(), String(this.relayProcess.pid), 'utf-8').catch(() => {});
     }
+
+    // relay.py's own _log() output (every message received/replied/failed)
+    // was previously going nowhere - stdout/stderr are piped by default but
+    // nothing ever read them, so there was no way to tell, after the fact,
+    // whether a reply that never reached WeChat had failed to send, been
+    // skipped, or something else entirely. Appended (not overwritten) so a
+    // plugin reload doesn't erase the history of the previous run; truncated
+    // back to a reasonable size occasionally would be nicer, but this is a
+    // low-volume text log (one line per WeChat message) so unbounded growth
+    // over the life of a vault is not a practical concern.
+    const logPath = this.logFile();
+    const appendLog = (chunk: Buffer) => {
+      void fs.appendFile(logPath, chunk).catch(() => {});
+    };
+    this.relayProcess.stdout?.on('data', appendLog);
+    this.relayProcess.stderr?.on('data', appendLog);
 
     this.relayProcess.on('exit', (code, signal) => {
       this.relayProcess = null;

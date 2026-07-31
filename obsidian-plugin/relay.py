@@ -384,35 +384,75 @@ async def _handle_one_message(
     so a message that makes Claudian block on an approval/question doesn't
     stop the poll loop from picking up the next message (e.g. the /answer or
     /approve that's needed to unblock it in the first place).
+
+    The entire body is wrapped in try/except: this task is spawned into a
+    long-lived anyio task group that also owns the get_updates() polling
+    itself (see _wechat_poll_loop) - an exception escaping here would cancel
+    that *whole* task group (anyio's default behavior on a child task
+    failing), silently killing the poll loop for every future WeChat message,
+    not just this one. RelayManager does not auto-restart a crashed relay
+    process, so that failure mode would otherwise look exactly like "Claudian
+    replied but WeChat got nothing, forever, until someone reloads the
+    plugin" - never allow that.
     """
-    text = body_from_item_list(msg.item_list)
-    image_item = _find_image_item(msg.item_list)
-    image = await _download_incoming_image(image_item) if image_item else None
-    # A bare photo (no caption) has empty text - only skip the message if
-    # there's neither text nor a usable image.
-    if not text and not image:
-        return
-    sender_id = msg.from_user_id or "unknown"
-    context_token = msg.context_token or ""
-    target.sender_id = sender_id
-    target.context_token = context_token
-    _log(f"收到: from={sender_id} text={text[:50]!r} image={'是' if image else '否'}")
+    try:
+        text = body_from_item_list(msg.item_list)
+        image_item = _find_image_item(msg.item_list)
+        image = await _download_incoming_image(image_item) if image_item else None
+        # A bare photo (no caption) has empty text - only skip the message if
+        # there's neither text nor a usable image.
+        if not text and not image:
+            return
+        sender_id = msg.from_user_id or "unknown"
+        context_token = msg.context_token or ""
+        target.sender_id = sender_id
+        target.context_token = context_token
+        _log(f"收到: from={sender_id} text={text[:50]!r} image={'是' if image else '否'}")
 
-    reply = await _reply_with_typing_indicator(client, opts, sender_id, context_token, text, image)
+        reply = await _reply_with_typing_indicator(client, opts, sender_id, context_token, text, image)
 
-    if not reply.strip():
-        # /progressive mode: every chunk of this turn already went out
-        # individually via _pending_push_loop as it happened: the bridge
-        # deliberately returns an empty reply here instead of repeating
-        # everything a second time in one lump message.
-        _log(f"已回复: to={sender_id} (渐进式模式，内容已单独推送)")
-        return
+        if not reply.strip():
+            # /progressive mode: every chunk of this turn already went out
+            # individually via _pending_push_loop as it happened: the bridge
+            # deliberately returns an empty reply here instead of repeating
+            # everything a second time in one lump message.
+            _log(f"已回复: to={sender_id} (渐进式模式，内容已单独推送)")
+            return
 
+        await _send_reply_with_retry(opts, sender_id, reply, context_token, target)
+    except Exception as e:  # noqa: BLE001
+        _log(f"处理消息时发生未预期的异常（已忽略，不影响后续消息）: {e}")
+
+
+async def _send_reply_with_retry(
+    opts: WeixinApiOptions, sender_id: str, reply: str, context_token: str, target: _LastTarget
+) -> None:
+    """Sends the final reply, retrying once with whatever context_token is
+    currently freshest if the original one fails.
+
+    A long agentic Claudian turn (several tool calls, a slow build, etc.) can
+    easily run past however long WeChat's own context_token stays valid for
+    replying - the turn finishes correctly on the Claudian side, but sending
+    the reply back fails with a now-stale token, and previously that failure
+    was only ever written to a log nobody could see: from WeChat it looked
+    exactly like Claudian silently never replied at all. `target.context_token`
+    is whatever the most recent inbound message actually used (kept fresh by
+    every message this loop processes, including this same one), so retrying
+    with it is a real chance at success instead of repeating the same failure.
+    """
     try:
         await _send_text_reply(opts, sender_id, reply, context_token)
         _log(f"已回复: to={sender_id} text={reply[:50]!r}")
+        return
     except Exception as e:  # noqa: BLE001
-        _log(f"发送回复失败: {e}")
+        _log(f"发送回复失败（将用最新 context_token 重试一次）: {e}")
+
+    if target.context_token and target.context_token != context_token:
+        try:
+            await _send_text_reply(opts, sender_id, reply, target.context_token)
+            _log(f"已回复(重试成功): to={sender_id} text={reply[:50]!r}")
+        except Exception as e:  # noqa: BLE001
+            _log(f"重试后仍然发送回复失败，本条回复已丢失: {e}")
 
 
 async def _wechat_poll_loop(

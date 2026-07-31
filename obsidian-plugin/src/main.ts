@@ -577,6 +577,22 @@ export default class WeChatBridgePlugin extends Plugin {
       });
     });
 
+    // Node 18+'s http.Server defaults to killing any request that takes
+    // longer than 5 minutes end-to-end (`requestTimeout`), and any idle
+    // connection past 5 minutes (`server.timeout`) - both meant for public-
+    // facing servers guarding against slow-loris-style abuse, neither
+    // relevant to a 127.0.0.1-only bridge. A real agentic Claudian turn
+    // (several tool calls, a long-running build, etc.) can easily run past
+    // 5 minutes: the request would then get killed *after* Claudian actually
+    // finished and replied, but *before* that reply could be written to the
+    // response - relay.py would see the connection reset (not a clean error,
+    // just a dead socket) and the WeChat side would get nothing at all, with
+    // no visible error, even though Claudian's own UI shows the turn
+    // completed fine. Disabling both removes that ceiling entirely; nothing
+    // else here depends on either timeout existing.
+    server.requestTimeout = 0;
+    server.timeout = 0;
+
     for (let attempt = 0; attempt < MAX_PORT_ATTEMPTS; attempt++) {
       const candidate = PREFERRED_PORT + attempt;
       // eslint-disable-next-line no-await-in-loop
