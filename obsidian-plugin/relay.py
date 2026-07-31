@@ -373,6 +373,37 @@ class _LastTarget:
         self.context_token: str | None = None
 
 
+async def _handle_one_message(
+    opts: WeixinApiOptions, target: _LastTarget, client: httpx.AsyncClient, msg: WeixinMessage
+) -> None:
+    """Downloads media (if any), forwards to the bridge, and replies - for exactly
+    one WeChat message. Run as its own background task (see _wechat_poll_loop)
+    so a message that makes Claudian block on an approval/question doesn't
+    stop the poll loop from picking up the next message (e.g. the /answer or
+    /approve that's needed to unblock it in the first place).
+    """
+    text = body_from_item_list(msg.item_list)
+    image_item = _find_image_item(msg.item_list)
+    image = await _download_incoming_image(image_item) if image_item else None
+    # A bare photo (no caption) has empty text - only skip the message if
+    # there's neither text nor a usable image.
+    if not text and not image:
+        return
+    sender_id = msg.from_user_id or "unknown"
+    context_token = msg.context_token or ""
+    target.sender_id = sender_id
+    target.context_token = context_token
+    _log(f"收到: from={sender_id} text={text[:50]!r} image={'是' if image else '否'}")
+
+    reply = await _reply_with_typing_indicator(client, opts, sender_id, context_token, text, image)
+
+    try:
+        await _send_text_reply(opts, sender_id, reply, context_token)
+        _log(f"已回复: to={sender_id} text={reply[:50]!r}")
+    except Exception as e:  # noqa: BLE001
+        _log(f"发送回复失败: {e}")
+
+
 async def _wechat_poll_loop(
     account: AccountData, opts: WeixinApiOptions, target: _LastTarget, client: httpx.AsyncClient
 ) -> None:
@@ -380,56 +411,46 @@ async def _wechat_poll_loop(
     consecutive_failures = 0
 
     _log("开始监听微信消息...")
-    while True:
-        try:
-            resp = await get_updates(
-                base_url=account.base_url,
-                token=account.token,
-                get_updates_buf=get_updates_buf,
-                timeout_ms=LONG_POLL_TIMEOUT_MS,
-            )
+    # One task group for the whole poll loop's lifetime: each inbound message
+    # is spawned into it and runs independently (see _handle_one_message), so
+    # a message that's still waiting on a slow/blocked Claudian turn never
+    # delays get_updates() from being called again - which is what previously
+    # made /answer and /approve impossible to ever deliver (this loop would
+    # already be stuck awaiting the *previous* message's reply, indefinitely,
+    # since that reply was itself waiting on the /answer that could only ever
+    # arrive via this same loop).
+    async with anyio.create_task_group() as tg:
+        while True:
+            try:
+                resp = await get_updates(
+                    base_url=account.base_url,
+                    token=account.token,
+                    get_updates_buf=get_updates_buf,
+                    timeout_ms=LONG_POLL_TIMEOUT_MS,
+                )
 
-            is_error = (resp.ret is not None and resp.ret != 0) or (
-                resp.errcode is not None and resp.errcode != 0
-            )
-            if is_error:
+                is_error = (resp.ret is not None and resp.ret != 0) or (
+                    resp.errcode is not None and resp.errcode != 0
+                )
+                if is_error:
+                    consecutive_failures += 1
+                    _log(f"getUpdates 失败: ret={resp.ret} errcode={resp.errcode} errmsg={resp.errmsg}")
+                    await anyio.sleep(30 if consecutive_failures >= 3 else 2)
+                    continue
+                consecutive_failures = 0
+
+                if resp.get_updates_buf:
+                    get_updates_buf = resp.get_updates_buf
+
+                for msg in resp.msgs or []:
+                    if msg.message_type != MessageType.USER:
+                        continue
+                    tg.start_soon(_handle_one_message, opts, target, client, msg)
+
+            except Exception as e:  # noqa: BLE001
                 consecutive_failures += 1
-                _log(f"getUpdates 失败: ret={resp.ret} errcode={resp.errcode} errmsg={resp.errmsg}")
+                _log(f"轮询异常: {e}")
                 await anyio.sleep(30 if consecutive_failures >= 3 else 2)
-                continue
-            consecutive_failures = 0
-
-            if resp.get_updates_buf:
-                get_updates_buf = resp.get_updates_buf
-
-            for msg in resp.msgs or []:
-                if msg.message_type != MessageType.USER:
-                    continue
-                text = body_from_item_list(msg.item_list)
-                image_item = _find_image_item(msg.item_list)
-                image = await _download_incoming_image(image_item) if image_item else None
-                # A bare photo (no caption) has empty text - only skip the
-                # message if there's neither text nor a usable image.
-                if not text and not image:
-                    continue
-                sender_id = msg.from_user_id or "unknown"
-                context_token = msg.context_token or ""
-                target.sender_id = sender_id
-                target.context_token = context_token
-                _log(f"收到: from={sender_id} text={text[:50]!r} image={'是' if image else '否'}")
-
-                reply = await _reply_with_typing_indicator(client, opts, sender_id, context_token, text, image)
-
-                try:
-                    await _send_text_reply(opts, sender_id, reply, context_token)
-                    _log(f"已回复: to={sender_id} text={reply[:50]!r}")
-                except Exception as e:  # noqa: BLE001
-                    _log(f"发送回复失败: {e}")
-
-        except Exception as e:  # noqa: BLE001
-            consecutive_failures += 1
-            _log(f"轮询异常: {e}")
-            await anyio.sleep(30 if consecutive_failures >= 3 else 2)
 
 
 async def _pending_push_loop(opts: WeixinApiOptions, target: _LastTarget, client: httpx.AsyncClient) -> None:

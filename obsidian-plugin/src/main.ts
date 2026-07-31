@@ -117,6 +117,16 @@ interface ClaudianTab {
   controllers: {
     inputController: {
       sendMessage(opts: { content: string; images?: ClaudianImageAttachment[] }): Promise<void>;
+      /** Renders Claudian's inline "AskUserQuestion" widget and resolves with the
+       * user's picks. This bridge replaces it per-tab (see installInteractiveHooks)
+       * so a question can be answered from WeChat via /answer instead of only from
+       * the desktop UI. `input` is the raw tool_use params (shape: `{questions:[...]}`,
+       * reverse-engineered from Claudian's own OA widget class - see parseQuestions). */
+      handleAskUserQuestion?(input: any, signal?: AbortSignal): Promise<any>;
+      /** Renders Claudian's inline command/file/permission approval widget.
+       * Replaced the same way, answerable from WeChat via /approve. `kind` is
+       * "command_execution" | "file_change" | "permissions". */
+      handleApprovalRequest?(kind: string, details: any, title: string, opts: any): Promise<any>;
     } | null;
   };
   state: {
@@ -166,6 +176,34 @@ interface ClaudianPluginInstance {
   mutateSettings(mutation: (settings: Record<string, any>) => void): Promise<void>;
   getAllViews?(): ClaudianView[];
 }
+
+/** One question from an AskUserQuestion tool_use, normalized from the raw
+ * `{question, id?, header?, options, multiSelect?}` shape (reverse-engineered
+ * from Claudian's OA inline-question widget's own parseQuestions()). */
+interface ParsedQuestion {
+  /** Result object key for this question: `id` if the tool call provided one, else the question text itself - same fallback OA's own submit path uses. */
+  key: string;
+  question: string;
+  header: string;
+  multiSelect: boolean;
+  options: { label: string; value: string }[];
+}
+
+type PendingInteractive =
+  | {
+      kind: 'question';
+      tabId: string;
+      questions: ParsedQuestion[];
+      /** question index -> set of selected option *values* (or a single freeform string for isOther-style answers). */
+      selections: Map<number, Set<string>>;
+      resolve: (value: Record<string, string | string[]> | null) => void;
+    }
+  | {
+      kind: 'approval';
+      tabId: string;
+      title: string;
+      resolve: (value: 'accept' | 'acceptForSession' | 'decline' | 'cancel') => void;
+    };
 
 interface ConversationMeta {
   id: string;
@@ -279,6 +317,45 @@ const STRINGS = {
     zh: (name: string) => `已切换到供应商: ${name}。下一条消息将在这个供应商上开始一个全新的对话。`,
     en: (name: string) => `Switched to provider: ${name}. The next message will start a brand-new conversation on it.`,
   },
+  // ---- reverse questions (AskUserQuestion) / approval prompts ----
+  askUserQuestionHeader: {
+    zh: 'Claudian 有问题想问你：',
+    en: 'Claudian is asking you something:',
+  },
+  askUserQuestionUsageSingle: {
+    zh: '回复 /answer 序号（如 /answer 2，多选用逗号分隔如 /answer 1,3）或 /answer 你的文字回答；/answer cancel 取消。',
+    en: 'Reply /answer <number> (e.g. /answer 2; comma-separate for multi-select like /answer 1,3), or /answer <free text>. /answer cancel to cancel.',
+  },
+  askUserQuestionUsageMulti: {
+    zh: '回复 /answer 题号 选项（如 /answer 1 2，多选逗号分隔），每题回复一次，答完自动提交；/answer cancel 取消。',
+    en: 'Reply /answer <question#> <option#> (e.g. /answer 1 2; comma-separate for multi-select) once per question - submits automatically once all are answered. /answer cancel to cancel.',
+  },
+  answerUsage: { zh: '用法: /answer <序号|文字>，或 /answer cancel', en: 'Usage: /answer <number|text>, or /answer cancel' },
+  answerUsageMulti: {
+    zh: '有多道题，请用 /answer 题号 选项 的格式，如 /answer 1 2。',
+    en: 'Multiple questions pending - use /answer <question#> <option#>, e.g. /answer 1 2.',
+  },
+  noPendingQuestion: { zh: '当前没有待回答的问题。', en: 'No question is currently pending.' },
+  questionCancelled: { zh: '已取消该问题。', en: 'Question cancelled.' },
+  questionAnswered: { zh: '已提交回答，Claudian 将继续处理。', en: 'Answer submitted; Claudian will continue.' },
+  questionPartial: {
+    zh: (done: number, total: number) => `已记录 (${done}/${total})，请继续回答剩余问题。`,
+    en: (done: number, total: number) => `Recorded (${done}/${total}) - keep answering the remaining questions.`,
+  },
+  approvalHeader: {
+    zh: (title: string, desc: string) => `Claudian 请求权限:\n${title}\n${desc}\n\n回复 /approve accept（仅本次）、/approve always（本次会话内始终允许）、/approve deny（拒绝）或 /approve cancel（取消本轮）。`,
+    en: (title: string, desc: string) => `Claudian is requesting approval:\n${title}\n${desc}\n\nReply /approve accept (just once), /approve always (allow for this session), /approve deny, or /approve cancel.`,
+  },
+  approveUsage: { zh: '用法: /approve accept|always|deny|cancel', en: 'Usage: /approve accept|always|deny|cancel' },
+  noPendingApproval: { zh: '当前没有待处理的权限请求。', en: 'No approval request is currently pending.' },
+  approvalResolved: {
+    zh: (d: string) => `已提交: ${d}`,
+    en: (d: string) => `Submitted: ${d}`,
+  },
+  switchedAwayTag: {
+    zh: (title: string, prompt: string, reply: string) => `[来自其他对话] ${title}\nprompt：${prompt}\n\n${reply}`,
+    en: (title: string, prompt: string, reply: string) => `[From another conversation] ${title}\nprompt: ${prompt}\n\n${reply}`,
+  },
 } as const;
 
 /** /help text. Only mentions /provider when more than one provider is actually enabled in Claudian. */
@@ -293,6 +370,8 @@ function buildHelpText(lang: Lang, showProviderCommand: boolean): string {
     '/hist — 按序号列出当前对话你发过的消息',
     '/hist N — 查看第 N 条消息对应的回复',
     '/listen on 或 /listen off — 开关监听：开启后，电脑客户端上发的消息也会推送到这里',
+    '/answer — 回答 Claudian 反向提出的问题（AskUserQuestion），收到推送后按提示格式回复',
+    '/approve accept|always|deny|cancel — 回应 Claudian 的权限请求，收到推送后使用',
     '/model <名称> — 切换模型，如 /model opus、/model sonnet',
     '/effort <等级> — 切换思考强度，如 /effort low、/effort high',
     '/permission <模式> — 切换权限模式，如 /permission yolo、/permission default',
@@ -310,6 +389,8 @@ function buildHelpText(lang: Lang, showProviderCommand: boolean): string {
     '/hist — list your messages in the current conversation, numbered',
     '/hist N — show the reply to message number N',
     '/listen on or /listen off — toggle listening: when on, messages sent from the desktop client are pushed here too',
+    '/answer — answer a question Claudian asked back (AskUserQuestion); reply in the format shown in the push notification',
+    '/approve accept|always|deny|cancel — respond to a Claudian approval request; use after a push notification',
     '/model <name> — switch model, e.g. /model opus, /model sonnet',
     '/effort <level> — switch effort level, e.g. /effort low, /effort high',
     '/permission <mode> — switch permission mode, e.g. /permission yolo, /permission default',
@@ -337,15 +418,37 @@ const LISTEN_POLL_INTERVAL_MS = 3000;
 
 export default class WeChatBridgePlugin extends Plugin {
   private server: http.Server | null = null;
-  private busy: Promise<unknown> = Promise.resolve();
   private data: BridgeData = { ...DEFAULT_DATA };
   /** Pushes queued by the /listen poller, drained by the relay's /pending polling. */
   private pendingPushes: string[] = [];
-  /** True while this plugin's own sendChatMessage() is driving a turn, so the
-   * /listen poller does not mistake a WeChat-originated turn for a desktop one. */
-  private sendingViaBridge = false;
+  /** tab.id's currently being driven by this plugin's own sendChatMessage(), so
+   * the /listen poller does not mistake a WeChat-originated turn for a desktop
+   * one. A set, not a single flag, because sends to different tabs can now be
+   * in flight concurrently (see sendQueues doc comment). */
+  private sendingViaBridgeTabIds: Set<string> = new Set();
   private relayManager: RelayManager | null = null;
   private pluginDir: string | null = null;
+  /**
+   * Per-tab send queues, keyed by tab.id. A chat message to conversation A no
+   * longer blocks a /switch, /new, /answer, /approve, or a message sent to a
+   * *different* conversation - only two sends to the *same* tab still
+   * serialize against each other (so they don't corrupt one turn). Quick
+   * commands (everything except the final "send this as a chat message"
+   * fallback) never touch this at all; they run immediately. This replaces
+   * the old single global `busy` chain, which used to make every command -
+   * even /switch - wait for whatever chat turn was already in flight, which
+   * is exactly the deadlock that made /answer and /approve impossible: they
+   * exist to unblock an in-flight turn, but couldn't run until it unblocked.
+   */
+  private sendQueues: Map<string, Promise<unknown>> = new Map();
+  /**
+   * A single outstanding AskUserQuestion or approval request, surfaced via
+   * pendingPushes and resolved by /answer or /approve. Not persisted across
+   * reloads (a reload mid-question loses it; Claudian's own turn would then
+   * just hang - rare enough, and safer than trying to serialize a live
+   * Promise resolver to disk).
+   */
+  private pendingInteractive: PendingInteractive | null = null;
 
   async onload() {
     const saved = await this.loadData();
@@ -417,10 +520,13 @@ export default class WeChatBridgePlugin extends Plugin {
         // Concatenate raw bytes before decoding so a multi-byte UTF-8
         // character split across two TCP chunks never gets mis-decoded.
         const body = Buffer.concat(chunks).toString('utf8');
-        // Serialize handling so concurrent WeChat messages don't race the
-        // same tab/session.
-        this.busy = this.busy
-          .then(() => this.handleIncoming(body))
+        // No global serialization here on purpose: a long-running chat turn
+        // for one conversation must not block /switch, /new, /answer,
+        // /approve, or a message aimed at a different conversation from being
+        // handled right away (see sendQueues doc comment). Only sends to the
+        // *same* tab still serialize against each other, inside
+        // sendChatMessageQueued.
+        this.handleIncoming(body)
           .then(
             (reply) => {
               res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -497,6 +603,17 @@ export default class WeChatBridgePlugin extends Plugin {
     // request if there's neither text nor an image to act on.
     if (!text && !image) throw new Error(pick(STRINGS.emptyText, lang));
 
+    // /answer and /approve must never wait behind an in-flight chat turn -
+    // they exist specifically to unblock one (Claudian is paused mid-turn
+    // waiting on exactly this). Handled first, synchronously, against
+    // in-memory state only.
+    if (/^\/answer\b/i.test(text)) {
+      return await this.handleAnswerCommand(text, lang);
+    }
+    if (/^\/approve\b/i.test(text)) {
+      return await this.handleApproveCommand(text, lang);
+    }
+
     if (/^\/help\b/i.test(text)) {
       return buildHelpText(lang, this.getEnabledProviders().length > 1);
     }
@@ -556,7 +673,7 @@ export default class WeChatBridgePlugin extends Plugin {
     // vault commands, and skills - is sent through as-is. Claudian's own
     // InputController already detects and expands those; this bridge does
     // not need to special-case them.
-    return await this.sendChatMessage(text, lang, image);
+    return await this.sendChatMessageQueued(text, lang, image);
   }
 
   // ---- locale ----
@@ -837,7 +954,7 @@ export default class WeChatBridgePlugin extends Plugin {
    * relay to push to WeChat.
    */
   private async checkForDesktopActivity(): Promise<void> {
-    if (!this.data.listening || this.sendingViaBridge) return;
+    if (!this.data.listening) return;
     if (!this.data.conversationId) return;
 
     // Scoped to the conversation /listen was turned on for - switching to a
@@ -860,6 +977,9 @@ export default class WeChatBridgePlugin extends Plugin {
     } catch {
       return; // No Claudian view open yet, or similar transient state; try again next tick.
     }
+    // A bridge-driven send to this exact tab is in flight; its own reply path
+    // (sendChatMessage/sendChatMessageQueued) reports it, not this poller.
+    if (this.sendingViaBridgeTabIds.has(tab.id)) return;
 
     const messages = tab.state.messages;
 
@@ -983,13 +1103,45 @@ export default class WeChatBridgePlugin extends Plugin {
 
   // ---- chat message injection ----
 
-  private async sendChatMessage(text: string, lang: Lang, image?: IncomingImage): Promise<string> {
+  /**
+   * Entry point used by handleIncoming(). Resolves the target tab *before*
+   * queuing, then queues only the actual send against that specific tab's
+   * own queue - so a slow turn on tab A never delays a message aimed at tab
+   * B (a different conversation), and a /switch or /new that runs in between
+   * (outside this queue entirely - see handleIncoming) is never blocked by
+   * either.
+   */
+  private async sendChatMessageQueued(text: string, lang: Lang, image?: IncomingImage): Promise<string> {
     const tab = await this.getOrCreateWeChatTab();
+    // Snapshot which conversation this send targets and which one is
+    // "current" *before* queuing, not after: if the user fires off /switch or
+    // /new while this send is still waiting in line, this call must still
+    // finish delivering the turn it was actually asked to send, to the
+    // conversation it was actually sent to - only the *labeling* of the
+    // reply (see sendChatMessage) depends on whether that's still the
+    // "current" one by the time it completes.
+    const conversationIdAtQueueTime = this.data.conversationId;
+    const previous = this.sendQueues.get(tab.id) ?? Promise.resolve();
+    const run = previous.catch(() => {}).then(() => this.sendChatMessage(tab, text, lang, image, conversationIdAtQueueTime));
+    // Store a settle-agnostic tail so the *next* queued send for this tab
+    // waits for this one regardless of whether it threw, without this
+    // rejection also propagating to whoever's awaiting `run` for the reply.
+    this.sendQueues.set(tab.id, run.catch(() => {}));
+    return run;
+  }
+
+  private async sendChatMessage(
+    tab: ClaudianTab,
+    text: string,
+    lang: Lang,
+    image: IncomingImage | undefined,
+    conversationIdAtQueueTime: string | null,
+  ): Promise<string> {
     if (!tab.controllers.inputController) {
       throw new Error(pick(STRINGS.tabNotReady, lang));
     }
 
-    this.sendingViaBridge = true;
+    this.sendingViaBridgeTabIds.add(tab.id);
     try {
       // The user's currently-open note in Obsidian - whatever that happens to
       // be, unrelated to this conversation - would otherwise silently ride
@@ -1014,20 +1166,39 @@ export default class WeChatBridgePlugin extends Plugin {
         : undefined;
       await tab.controllers.inputController.sendMessage({ content: text, images });
 
-      if (tab.conversationId && tab.conversationId !== this.data.conversationId) {
-        this.data.conversationId = tab.conversationId;
+      // Only rebind data.conversationId / lastSeenMessageCount if nothing
+      // else has claimed the "current conversation" slot while this send was
+      // running (i.e. no /switch or /new happened meanwhile). If it *has*
+      // changed, leave the current binding alone - some other conversation is
+      // now live and this reply must not silently reattach to it.
+      const stillCurrent = this.data.conversationId === conversationIdAtQueueTime;
+      if (stillCurrent) {
+        if (tab.conversationId && tab.conversationId !== this.data.conversationId) {
+          this.data.conversationId = tab.conversationId;
+        }
+        // Keep the /listen poller's baseline in sync so it doesn't re-report
+        // the turn this call itself just produced.
+        this.data.lastSeenMessageCount = tab.state.messages.length;
+        await this.saveData(this.data);
       }
-      // Keep the /listen poller's baseline in sync so it doesn't re-report
-      // the turn this call itself just produced.
-      this.data.lastSeenMessageCount = tab.state.messages.length;
-      await this.saveData(this.data);
 
       const newMessages = tab.state.messages.slice(beforeCount);
       const reply = this.extractDispatchText(newMessages, lang);
       const ctxLine = await this.contextWindowLine(tab.conversationId, lang);
-      return ctxLine ? `${reply}\n\n${ctxLine}` : reply;
+      const body = ctxLine ? `${reply}\n\n${ctxLine}` : reply;
+
+      if (stillCurrent) return body;
+
+      // The user switched to a different conversation (or started a new one)
+      // while this turn was still running. The reply is still delivered -
+      // dropping it would silently lose a turn that Claudian actually ran -
+      // but tagged with which conversation and prompt it belongs to, since
+      // by the time it arrives it's no longer obvious from context.
+      const metas = await this.readAllConversationMeta();
+      const title = metas.find((m) => m.id === tab.conversationId)?.title ?? tab.conversationId ?? '?';
+      return pick(STRINGS.switchedAwayTag, lang)(title, text, body);
     } finally {
-      this.sendingViaBridge = false;
+      this.sendingViaBridgeTabIds.delete(tab.id);
     }
   }
 
@@ -1081,11 +1252,15 @@ export default class WeChatBridgePlugin extends Plugin {
 
     if (this.data.conversationId) {
       const existing = tabManager.getAllTabs().find((t) => t.conversationId === this.data.conversationId);
-      if (existing) return existing;
+      if (existing) {
+        this.installInteractiveHooks(existing);
+        return existing;
+      }
       // Tab was closed or conversation was never opened in a tab yet; (re)open it.
       await this.ensureTabCapacity(claudian, tabManager);
       const tab = await tabManager.createTab(this.data.conversationId);
       if (!tab) throw new Error(pick(STRINGS.tabLimitReached, this.getLangSafe()));
+      this.installInteractiveHooks(tab);
       return tab;
     }
 
@@ -1100,7 +1275,162 @@ export default class WeChatBridgePlugin extends Plugin {
       this.data.providerId ? { defaultProviderId: this.data.providerId } : undefined,
     );
     if (!tab) throw new Error(pick(STRINGS.tabLimitReached, this.getLangSafe()));
+    this.installInteractiveHooks(tab);
     return tab;
+  }
+
+  /**
+   * Replaces this tab's inputController.handleAskUserQuestion /
+   * handleApprovalRequest with headless versions that push a WeChat
+   * notification and resolve from /answer or /approve, instead of rendering
+   * Claudian's inline DOM widgets (OA / the approval-inline widget) that
+   * nobody is looking at for a bridge-driven tab. Idempotent per
+   * inputController instance (guarded by a marker property) since
+   * getOrCreateWeChatTab() runs this on every call.
+   *
+   * Trade-off: once installed, this tab's native desktop UI no longer shows
+   * its own inline question/approval widgets either - acceptable since this
+   * tab exists specifically to be driven remotely from WeChat.
+   */
+  private installInteractiveHooks(tab: ClaudianTab): void {
+    const ic = tab.controllers.inputController as (ClaudianTab['controllers']['inputController'] & { __wechatBridgePatched?: boolean }) | null;
+    if (!ic || ic.__wechatBridgePatched) return;
+    ic.__wechatBridgePatched = true;
+    ic.handleAskUserQuestion = async (input: any) => this.handleAskUserQuestionHeadless(tab, input);
+    ic.handleApprovalRequest = async (kind: string, details: any, title: string, opts: any) =>
+      this.handleApprovalRequestHeadless(tab, kind, details, title, opts);
+  }
+
+  /**
+   * Headless stand-in for Claudian's inline AskUserQuestion widget (OA class
+   * in main.js). Normalizes the raw tool_use `questions` array the same way
+   * OA.parseQuestions() does, pushes a WeChat notification, and resolves once
+   * /answer has collected an answer for every question - matching the result
+   * shape OA's own submit path builds: `{[question.id ?? question.question]: value | value[]}`.
+   */
+  private async handleAskUserQuestionHeadless(tab: ClaudianTab, input: any): Promise<Record<string, string | string[]> | null> {
+    const rawQuestions = Array.isArray(input?.questions) ? input.questions : [];
+    const questions: ParsedQuestion[] = rawQuestions
+      .filter((q: any) => q && typeof q === 'object' && typeof q.question === 'string' && Array.isArray(q.options) && q.options.length > 0)
+      .map((q: any, i: number) => ({
+        key: typeof q.id === 'string' ? q.id : q.question,
+        question: q.question,
+        header: typeof q.header === 'string' ? q.header.slice(0, 12) : `Q${i + 1}`,
+        multiSelect: q.multiSelect === true,
+        options: (q.options as any[]).map((o) => {
+          if (o && typeof o === 'object') {
+            const label = typeof o.label === 'string' ? o.label : typeof o.value === 'string' ? o.value : typeof o.text === 'string' ? o.text : typeof o.name === 'string' ? o.name : 'Option';
+            const value = typeof o.value === 'string' ? o.value : typeof o.id === 'string' ? o.id : label;
+            return { label: String(label), value: String(value) };
+          }
+          return { label: String(o), value: String(o) };
+        }),
+      }));
+
+    if (questions.length === 0) return null;
+
+    const lang = this.getLangSafe();
+    const lines: string[] = [pick(STRINGS.askUserQuestionHeader, lang)];
+    questions.forEach((q, qi) => {
+      lines.push(`\n${questions.length > 1 ? `[${qi + 1}] ` : ''}${q.question}`);
+      q.options.forEach((o, oi) => lines.push(`  ${oi + 1}. ${o.label}`));
+    });
+    lines.push('\n' + pick(questions.length > 1 ? STRINGS.askUserQuestionUsageMulti : STRINGS.askUserQuestionUsageSingle, lang));
+
+    return new Promise((resolve) => {
+      this.pendingInteractive = { kind: 'question', tabId: tab.id, questions, selections: new Map(), resolve };
+      this.pendingPushes.push(lines.join('\n'));
+    });
+  }
+
+  /** Headless stand-in for Claudian's inline command/file/permission approval widget. */
+  private async handleApprovalRequestHeadless(
+    tab: ClaudianTab,
+    kind: string,
+    details: any,
+    title: string,
+    _opts: any,
+  ): Promise<'accept' | 'acceptForSession' | 'decline' | 'cancel'> {
+    const lang = this.getLangSafe();
+    const desc = kind === 'command_execution' && typeof details?.command === 'string'
+      ? details.command
+      : String(details?.reason ?? title ?? kind);
+    return new Promise((resolve) => {
+      this.pendingInteractive = { kind: 'approval', tabId: tab.id, title, resolve };
+      this.pendingPushes.push(pick(STRINGS.approvalHeader, lang)(title, desc));
+    });
+  }
+
+  /** Handles `/answer ...`, resolving whatever handleAskUserQuestionHeadless() is currently waiting on. */
+  private async handleAnswerCommand(text: string, lang: Lang): Promise<string> {
+    const pending = this.pendingInteractive;
+    if (!pending || pending.kind !== 'question') return pick(STRINGS.noPendingQuestion, lang);
+
+    const rest = text.replace(/^\/answer\s*/i, '').trim();
+    if (/^cancel$/i.test(rest)) {
+      pending.resolve(null);
+      this.pendingInteractive = null;
+      return pick(STRINGS.questionCancelled, lang);
+    }
+    if (!rest) return pick(STRINGS.answerUsage, lang);
+
+    let qIndex: number;
+    let selectionText: string;
+    if (pending.questions.length > 1) {
+      const m = rest.match(/^(\d+)\s+(.+)$/);
+      if (!m) return pick(STRINGS.answerUsageMulti, lang);
+      qIndex = Number(m[1]) - 1;
+      selectionText = m[2];
+    } else {
+      qIndex = 0;
+      selectionText = rest;
+    }
+    const q = pending.questions[qIndex];
+    if (!q) return pick(STRINGS.outOfRange, lang)(pending.questions.length);
+
+    const set = pending.selections.get(qIndex) ?? new Set<string>();
+    const parts = selectionText.split(',').map((s) => s.trim()).filter(Boolean);
+    const allNumeric = parts.length > 0 && parts.every((p) => /^\d+$/.test(p));
+    if (allNumeric) {
+      if (!q.multiSelect) set.clear();
+      for (const p of parts) {
+        const opt = q.options[Number(p) - 1];
+        if (opt) set.add(opt.value);
+      }
+    } else {
+      // Freeform text answer (e.g. for an "other" option Claude offered, or
+      // just typing the option's label instead of its number).
+      const matched = q.options.find((o) => o.label.toLowerCase() === selectionText.trim().toLowerCase());
+      set.clear();
+      set.add(matched ? matched.value : selectionText.trim());
+    }
+    pending.selections.set(qIndex, set);
+
+    if (pending.selections.size >= pending.questions.length) {
+      const result: Record<string, string | string[]> = {};
+      pending.questions.forEach((qq, i) => {
+        const sel = pending.selections.get(i);
+        if (!sel || sel.size === 0) return;
+        result[qq.key] = qq.multiSelect ? Array.from(sel) : Array.from(sel)[0];
+      });
+      pending.resolve(result);
+      this.pendingInteractive = null;
+      return pick(STRINGS.questionAnswered, lang);
+    }
+    return pick(STRINGS.questionPartial, lang)(pending.selections.size, pending.questions.length);
+  }
+
+  /** Handles `/approve accept|always|deny|cancel`, resolving handleApprovalRequestHeadless(). */
+  private async handleApproveCommand(text: string, lang: Lang): Promise<string> {
+    const pending = this.pendingInteractive;
+    if (!pending || pending.kind !== 'approval') return pick(STRINGS.noPendingApproval, lang);
+    const m = text.match(/^\/approve\s+(accept|always|deny|cancel)\b/i);
+    if (!m) return pick(STRINGS.approveUsage, lang);
+    const word = m[1].toLowerCase();
+    const decision = word === 'accept' ? 'accept' : word === 'always' ? 'acceptForSession' : word === 'deny' ? 'decline' : 'cancel';
+    pending.resolve(decision as 'accept' | 'acceptForSession' | 'decline' | 'cancel');
+    this.pendingInteractive = null;
+    return pick(STRINGS.approvalResolved, lang)(decision);
   }
 
   /**
