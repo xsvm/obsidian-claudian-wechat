@@ -29,6 +29,16 @@ import anyio
 import httpx
 
 from wechat_clawbot.api.client import WeixinApiOptions, get_config, get_updates, send_message, send_typing
+from wechat_clawbot.cdn.upload import (
+    upload_file_attachment_to_weixin,
+    upload_file_to_weixin,
+    upload_video_to_weixin,
+)
+from wechat_clawbot.messaging.send import (
+    send_file_message_weixin,
+    send_image_message_weixin,
+    send_video_message_weixin,
+)
 from wechat_clawbot.api.types import (
     MessageItem,
     MessageItemType,
@@ -420,6 +430,60 @@ async def _reply_with_typing_indicator(
     return reply
 
 
+# Mirrors the plugin side's own FILE_SEND_MAX_BYTES check (main.ts rejects
+# oversized files before ever queuing them) - kept here too as a second line
+# of defense in case a file grows between being queued and actually being
+# read off disk for upload.
+_FILE_SEND_MAX_BYTES = 20 * 1024 * 1024
+
+_UPLOAD_SEND_BY_CATEGORY = {
+    "image": (upload_file_to_weixin, send_image_message_weixin),
+    "video": (upload_video_to_weixin, send_video_message_weixin),
+    "file": (upload_file_attachment_to_weixin, send_file_message_weixin),
+}
+
+
+async def _send_file_push(opts: WeixinApiOptions, target: "_LastTarget", item: dict) -> None:
+    """Uploads and sends one file queued by the plugin's /send or /getfile
+    (see PendingFileItem in main.ts). Failures are reported back to the user
+    as a plain WeChat text message instead of only ever ending up in
+    relay.log - same reasoning as the truncation-diagnosis work: a send that
+    silently fails looks indistinguishable from one that was never
+    attempted, from the user's side.
+    """
+    path = item.get("absolutePath")
+    name = item.get("fileName") or (os.path.basename(path) if path else "?")
+    category = item.get("category") if item.get("category") in _UPLOAD_SEND_BY_CATEGORY else "file"
+
+    if not path or not os.path.isfile(path):
+        _log(f"待发送文件不存在，已跳过: {path}")
+        return
+
+    size = os.path.getsize(path)
+    if size > _FILE_SEND_MAX_BYTES:
+        _log(f"待发送文件超过 {_FILE_SEND_MAX_BYTES} 字节上限，已跳过: {path} size={size}")
+        with contextlib.suppress(Exception):
+            await _send_text_chunks(
+                opts, target.sender_id, f"[未发送，文件过大] {name}", target.context_token
+            )
+        return
+
+    upload_fn, send_fn = _UPLOAD_SEND_BY_CATEGORY[category]
+    try:
+        uploaded = await upload_fn(path, target.sender_id, opts, CDN_BASE_URL)
+        if send_fn is send_file_message_weixin:
+            await send_fn(target.sender_id, "", name, uploaded, opts)
+        else:
+            await send_fn(target.sender_id, "", uploaded, opts)
+        _log(f"已发送文件: to={target.sender_id} name={name} category={category} size={size}")
+    except Exception as e:  # noqa: BLE001
+        _log(f"发送文件失败: name={name} category={category} err={e}")
+        with contextlib.suppress(Exception):
+            await _send_text_chunks(
+                opts, target.sender_id, f"[发送失败] {name}: {e}", target.context_token
+            )
+
+
 class _LastTarget:
     """Most recent WeChat sender/context_token, shared between the two loops below.
 
@@ -613,6 +677,9 @@ async def _pending_push_loop(opts: WeixinApiOptions, target: _LastTarget, client
                 _log(f"已推送监听内容: to={target.sender_id} chars={len(push)} chunks={n} text={push[:50]!r}")
             except Exception as e:  # noqa: BLE001
                 _log(f"推送监听内容失败: {e}")
+
+        for item in data.get("files") or []:
+            await _send_file_push(opts, target, item)
 
 
 async def serve() -> None:

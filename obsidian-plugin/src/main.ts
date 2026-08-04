@@ -49,6 +49,22 @@ interface IncomingImage {
   data: string; // base64, no "data:" prefix
 }
 
+/**
+ * A file queued for outbound delivery to WeChat, drained by relay.py through
+ * /pending the same way pendingPushes (text) already is. relay.py and this
+ * plugin run on the same machine (the plugin spawns relay.py itself), so
+ * this carries a plain local filesystem path rather than base64 bytes - no
+ * reason to round-trip a potentially large file through JSON over loopback
+ * when relay.py can just read it straight off disk (wechat_clawbot's own
+ * upload_*_to_weixin helpers already take a file path, not a buffer).
+ */
+interface PendingFileItem {
+  absolutePath: string;
+  fileName: string;
+  /** Picks which wechat_clawbot upload/send pair relay.py uses. */
+  category: 'image' | 'video' | 'file';
+}
+
 interface BridgeData {
   conversationId: string | null;
   /** conversation ids in the order shown by the last /list, for /switch N to index into. */
@@ -99,6 +115,17 @@ interface ClaudianChatMessage {
   role: 'user' | 'assistant';
   content: string;
   contentBlocks?: ContentBlock[];
+  /**
+   * The raw tool calls behind this message's `tool_use` content blocks -
+   * contentBlocks only carries a bare `toolId` (see ContentBlock above);
+   * this is where the actual `name`/`input` live, reverse-engineered from
+   * Claudian's message-building code (LBe() for the Claude provider,
+   * equivalents for Codex/pi). `input` is provider- and tool-specific -
+   * for Claude Code's own Write/Edit/Read/NotebookEdit tools it's
+   * `{file_path: string, ...}`; used by extractReferencedFiles() to find
+   * files a turn actually touched, without having to guess from prose.
+   */
+  toolCalls?: { id: string; name: string; input?: Record<string, unknown> }[];
 }
 
 interface ClaudianSlashCommand {
@@ -392,6 +419,43 @@ const STRINGS = {
     zh: '当前没有正在进行的回复可以打断。',
     en: 'Nothing is currently generating to interrupt.',
   },
+  // ---- outbound files/images: /files, /getfile, /send ----
+  filesHeader: {
+    zh: '最近一轮回复中涉及的文件:',
+    en: 'Files referenced in the most recent turn:',
+  },
+  filesNone: {
+    zh: '最近一轮回复没有发现可识别的文件（没有双链引用，也没有涉及文件的工具调用）。',
+    en: 'No recognizable files in the most recent turn (no wikilinks, and no tool calls that touched a file).',
+  },
+  getfileUsage: {
+    zh: '发送 /getfile 序号 获取对应文件，多个用逗号分隔，如 /getfile 1,2',
+    en: 'Send /getfile <number> to fetch a file, comma-separate for several, e.g. /getfile 1,2',
+  },
+  getfileNeedsListFirst: {
+    zh: '请先发送 /files 查看这一轮涉及的文件，再用 /getfile 序号 获取。',
+    en: 'Send /files first to see this turn’s files, then use /getfile <number>.',
+  },
+  queuedForSend: {
+    zh: (name: string) => `已加入发送队列: ${name}`,
+    en: (name: string) => `Queued for sending: ${name}`,
+  },
+  fileNotFound: {
+    zh: (p: string) => `文件不存在或不可读: ${p}`,
+    en: (p: string) => `File not found or unreadable: ${p}`,
+  },
+  fileTooLarge: {
+    zh: (name: string, mb: number) => `文件过大（约 ${mb}MB，超过上限），未发送: ${name}`,
+    en: (name: string, mb: number) => `File too large (~${mb}MB, over the limit) - not sent: ${name}`,
+  },
+  sendUsage: {
+    zh: '用法: /send <vault内的相对路径>，如 /send attachments/report.pdf',
+    en: 'Usage: /send <path relative to the vault>, e.g. /send attachments/report.pdf',
+  },
+  pathOutsideVault: {
+    zh: (p: string) => `路径必须在 vault 内: ${p}`,
+    en: (p: string) => `Path must stay inside the vault: ${p}`,
+  },
 } as const;
 
 /** /help text. Only mentions /provider when more than one provider is actually enabled in Claudian. */
@@ -411,6 +475,9 @@ function buildHelpText(lang: Lang, showProviderCommand: boolean): string {
     '/approve accept|always|deny|cancel — 回应 Claudian 的权限请求，收到推送后使用',
     '/progressive on 或 /progressive off — 开关渐进式回复（全局）：开启后每说完一段就单独推送，不等整轮结束',
     '/esc — 打断 Claudian 正在进行的回复（等同电脑客户端的 Stop），已生成的内容仍会照常回复',
+    '/files — 列出最近一轮回复涉及的文件（双链引用 + 实际操作过的文件），配合 /getfile 使用',
+    '/getfile 序号 — 获取 /files 列出的文件并发送过来，多个用逗号分隔，如 /getfile 1,2',
+    '/send <路径> — 直接发送 vault 内某个文件（相对路径），不需要先 /files',
     '/model <名称> — 切换模型，如 /model opus、/model sonnet',
     '/effort <等级> — 切换思考强度，如 /effort low、/effort high',
     '/permission <模式> — 切换权限模式，如 /permission yolo、/permission default',
@@ -433,6 +500,9 @@ function buildHelpText(lang: Lang, showProviderCommand: boolean): string {
     '/approve accept|always|deny|cancel — respond to a Claudian approval request; use after a push notification',
     '/progressive on or /progressive off — toggle progressive replies (global): when on, each finished chunk is pushed separately instead of waiting for the whole turn',
     '/esc — interrupt whatever Claudian is currently generating (same as Stop on the desktop client); whatever was already generated is still sent back',
+    '/files — list files referenced in the most recent turn (wikilinks + files actually touched by tool calls), use with /getfile',
+    '/getfile <number> — fetch a file listed by /files and send it to you, comma-separate for several, e.g. /getfile 1,2',
+    '/send <path> — send a specific file from the vault directly (relative path), no need to run /files first',
     '/model <name> — switch model, e.g. /model opus, /model sonnet',
     '/effort <level> — switch effort level, e.g. /effort low, /effort high',
     '/permission <mode> — switch permission mode, e.g. /permission yolo, /permission default',
@@ -462,6 +532,21 @@ const LISTEN_POLL_INTERVAL_MS = 3000;
 const LIST_DEFAULT_LIMIT = 10;
 /** How often an in-flight bridge-driven send is checked for newly-settled text chunks while /progressive is on. */
 const PROGRESSIVE_POLL_INTERVAL_MS = 1200;
+/** Same cap style as relay.py's own _IMAGE_MAX_BYTES for inbound images - just checked here instead, before a file is even queued, so a huge file fails fast with a clear reason instead of relay.py silently choking on the CDN upload later. */
+const FILE_SEND_MAX_BYTES = 20 * 1024 * 1024;
+const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp']);
+const VIDEO_EXTENSIONS = new Set(['mp4', 'mov', 'avi', 'mkv', 'webm']);
+/** Wikilink / embed syntax Claudian's own reply renderer turns into clickable
+ * "jump to this file" links (reverse-engineered: `jue()`/`Bue` in main.js) -
+ * reused here to find the same files, just surfaced as a numbered /files
+ * list instead of a click target. */
+const WIKILINK_RE = /!?\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g;
+/** Common parameter names across providers' file-touching tools (Claude
+ * Code's Write/Edit/Read/NotebookEdit all use file_path; other providers
+ * vary) - checked generically rather than allow-listing exact tool names per
+ * provider, since a false-positive candidate just gets filtered out later by
+ * queueFileForSend's own existence check anyway. */
+const TOOL_INPUT_PATH_KEYS = ['file_path', 'filePath', 'path', 'notebook_path', 'notebookPath'];
 
 export default class WeChatBridgePlugin extends Plugin {
   private server: http.Server | null = null;
@@ -504,6 +589,15 @@ export default class WeChatBridgePlugin extends Plugin {
    * chunk once.
    */
   private progressiveCursors: Map<string, { pushedMessageCount: number; pushedBlocksInCurrent: number; everPushed: boolean }> = new Map();
+  /** Files queued by /send or /getfile, drained by relay.py through /pending (same shape as pendingPushes for text). */
+  private pendingFiles: PendingFileItem[] = [];
+  /**
+   * The candidate list built by the most recent /files call, for /getfile N
+   * to index into - same pattern as lastListedIds for /switch. Not
+   * persisted (a reload losing "what /files last showed" is fine; just run
+   * /files again).
+   */
+  private lastReferencedFiles: { display: string; absolutePath: string }[] = [];
 
   async onload() {
     const saved = await this.loadData();
@@ -557,11 +651,13 @@ export default class WeChatBridgePlugin extends Plugin {
       if (req.method === 'GET' && req.url === '/pending') {
         const pushes = this.pendingPushes;
         this.pendingPushes = [];
+        const files = this.pendingFiles;
+        this.pendingFiles = [];
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         // `listening` lets the relay back off its poll rate while /listen is
         // off, instead of hitting this endpoint at a fixed interval forever
         // regardless of whether the feature is even in use.
-        res.end(JSON.stringify({ ok: true, pushes, listening: this.data.listening, progressive: this.data.progressiveReply }));
+        res.end(JSON.stringify({ ok: true, pushes, files, listening: this.data.listening, progressive: this.data.progressiveReply }));
         return;
       }
 
@@ -688,6 +784,22 @@ export default class WeChatBridgePlugin extends Plugin {
     // wait behind that same turn's own send finishing first.
     if (/^\/esc\b/i.test(text)) {
       return await this.handleEscCommand(lang);
+    }
+    // /files, /getfile and /send never touch Claudian at all (they read
+    // already-generated messages / the vault filesystem directly) - no
+    // reason to wait behind an in-flight chat turn either.
+    if (/^\/files\b/i.test(text)) {
+      return await this.listReferencedFiles(lang);
+    }
+    if (/^\/getfile\b/i.test(text)) {
+      return await this.handleGetFileCommand(text, lang);
+    }
+    const sendMatch = text.match(/^\/send\s+(\S.*)$/i);
+    if (sendMatch) {
+      return await this.handleSendCommand(sendMatch[1].trim(), lang);
+    }
+    if (/^\/send\b/i.test(text)) {
+      return pick(STRINGS.sendUsage, lang);
     }
 
     if (/^\/help\b/i.test(text)) {
@@ -1473,6 +1585,146 @@ export default class WeChatBridgePlugin extends Plugin {
     // scary "did this fail?" message below even though nothing went wrong.
     if (sawCompactBoundary) return pick(STRINGS.compactedNoText, lang);
     return pick(STRINGS.noDispatchText, lang);
+  }
+
+  // ---- outbound files/images: /files, /getfile, /send ----
+
+  /**
+   * Scans `messages` (normally just the most recent turn) for files
+   * Claudian's own reply either linked to or actually touched via a tool
+   * call, deduplicated by resolved absolute path. Two independent sources,
+   * combined:
+   *
+   *  - Wikilinks/embeds (`[[x]]`, `![[x]]`) in narrative text - the same
+   *    syntax Claudian's own renderer turns into a clickable "jump to this
+   *    file" link, resolved the same way it does (Obsidian's public
+   *    `metadataCache.getFirstLinkpathDest`).
+   *  - `toolCalls[].input` on assistant messages (Write/Edit/Read/
+   *    NotebookEdit and equivalents) - often the *only* signal for a file
+   *    Claude actually generated, since a turn frequently never bothers to
+   *    link back to a file it just wrote.
+   *
+   * Deliberately does not check the filesystem here (existence, size) -
+   * that happens once, lazily, only for whichever candidate is actually
+   * picked via /getfile (queueFileForSend) - so building this list never
+   * does more I/O than a user ends up asking for.
+   */
+  private extractReferencedFiles(messages: ClaudianChatMessage[]): { display: string; absolutePath: string }[] {
+    const adapter = this.app.vault.adapter;
+    if (!(adapter instanceof FileSystemAdapter)) return [];
+    const base = adapter.getBasePath();
+
+    const seen = new Set<string>();
+    const results: { display: string; absolutePath: string }[] = [];
+    const add = (absolutePath: string) => {
+      if (seen.has(absolutePath)) return;
+      seen.add(absolutePath);
+      results.push({ display: path.relative(base, absolutePath) || path.basename(absolutePath), absolutePath });
+    };
+
+    for (const msg of messages) {
+      if (msg.role !== 'assistant') continue;
+
+      for (const block of msg.contentBlocks ?? []) {
+        if (block.type !== 'text') continue;
+        WIKILINK_RE.lastIndex = 0;
+        let match: RegExpExecArray | null;
+        while ((match = WIKILINK_RE.exec(block.content))) {
+          const linkpath = match[1].split(/[#^]/)[0].trim();
+          if (!linkpath) continue;
+          const dest = this.app.metadataCache.getFirstLinkpathDest(linkpath, '');
+          if (dest) add(path.resolve(base, dest.path));
+        }
+      }
+
+      for (const call of msg.toolCalls ?? []) {
+        const input = call.input;
+        if (!input || typeof input !== 'object') continue;
+        for (const key of TOOL_INPUT_PATH_KEYS) {
+          const value = input[key];
+          if (typeof value === 'string' && value.trim()) {
+            add(path.isAbsolute(value) ? value : path.resolve(base, value));
+          }
+        }
+      }
+    }
+    return results;
+  }
+
+  /** `/files`: lists the files extractReferencedFiles() finds in the current tab's most recent completed turn. */
+  private async listReferencedFiles(lang: Lang): Promise<string> {
+    const tab = await this.getOrCreateWeChatTab();
+    const messages = tab.state.messages;
+    const userIndices = this.getUserMessageIndices(messages);
+    if (userIndices.length === 0) return pick(STRINGS.histEmpty, lang);
+
+    const lastTurn = messages.slice(userIndices[userIndices.length - 1] + 1);
+    const candidates = this.extractReferencedFiles(lastTurn);
+    this.lastReferencedFiles = candidates;
+    if (candidates.length === 0) return pick(STRINGS.filesNone, lang);
+
+    const lines: string[] = [pick(STRINGS.filesHeader, lang)];
+    candidates.forEach((c, i) => lines.push(`${i + 1}. ${c.display}`));
+    lines.push(pick(STRINGS.getfileUsage, lang));
+    return lines.join('\n');
+  }
+
+  /** `/getfile <n[,n...]>`: queues one or more files from the last /files list. */
+  private async handleGetFileCommand(text: string, lang: Lang): Promise<string> {
+    const rest = text.replace(/^\/getfile\s*/i, '').trim();
+    if (!rest) return pick(STRINGS.getfileUsage, lang);
+    if (this.lastReferencedFiles.length === 0) return pick(STRINGS.getfileNeedsListFirst, lang);
+
+    const indices = rest.split(',').map((s) => Number(s.trim())).filter((n) => Number.isInteger(n));
+    if (indices.length === 0) return pick(STRINGS.getfileUsage, lang);
+
+    const results: string[] = [];
+    for (const idx of indices) {
+      const item = this.lastReferencedFiles[idx - 1];
+      results.push(
+        item
+          ? await this.queueFileForSend(item.absolutePath, lang)
+          : pick(STRINGS.outOfRange, lang)(this.lastReferencedFiles.length),
+      );
+    }
+    return results.join('\n');
+  }
+
+  /** `/send <path>`: queues one explicit vault-relative path, no /files list involved. */
+  private async handleSendCommand(relativePath: string, lang: Lang): Promise<string> {
+    const adapter = this.app.vault.adapter;
+    if (!(adapter instanceof FileSystemAdapter)) throw new Error(pick(STRINGS.noTabManager, lang));
+    const base = adapter.getBasePath();
+    const resolved = path.resolve(base, relativePath);
+    const normalizedBase = path.resolve(base);
+    if (resolved !== normalizedBase && !resolved.startsWith(normalizedBase + path.sep)) {
+      return pick(STRINGS.pathOutsideVault, lang)(relativePath);
+    }
+    return this.queueFileForSend(resolved, lang);
+  }
+
+  private classifyFileCategory(fileName: string): PendingFileItem['category'] {
+    const ext = fileName.split('.').pop()?.toLowerCase() ?? '';
+    if (IMAGE_EXTENSIONS.has(ext)) return 'image';
+    if (VIDEO_EXTENSIONS.has(ext)) return 'video';
+    return 'file';
+  }
+
+  /** Shared by /send and /getfile: validates a resolved absolute path exists and isn't too large, then queues it. */
+  private async queueFileForSend(absolutePath: string, lang: Lang): Promise<string> {
+    let stat;
+    try {
+      stat = await fs.stat(absolutePath);
+    } catch {
+      return pick(STRINGS.fileNotFound, lang)(absolutePath);
+    }
+    if (!stat.isFile()) return pick(STRINGS.fileNotFound, lang)(absolutePath);
+    const fileName = path.basename(absolutePath);
+    if (stat.size > FILE_SEND_MAX_BYTES) {
+      return pick(STRINGS.fileTooLarge, lang)(fileName, Math.round(stat.size / (1024 * 1024)));
+    }
+    this.pendingFiles.push({ absolutePath, fileName, category: this.classifyFileCategory(fileName) });
+    return pick(STRINGS.queuedForSend, lang)(fileName);
   }
 
   private async getOrCreateWeChatTab(): Promise<ClaudianTab> {
