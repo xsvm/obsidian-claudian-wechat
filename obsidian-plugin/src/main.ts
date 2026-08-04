@@ -136,6 +136,14 @@ interface ClaudianTab {
        * Replaced the same way, answerable from WeChat via /approve. `kind` is
        * "command_execution" | "file_change" | "permissions". */
       handleApprovalRequest?(kind: string, details: any, title: string, opts: any): Promise<any>;
+      /** Interrupts the in-flight turn (same call the desktop UI's own "Stop"
+       * button and Escape key make - reverse-engineered as InputController's
+       * `cancelStreaming()`: aborts the provider's abortController, marks the
+       * session interrupted, and hides the thinking indicator). The turn's
+       * own `sendMessage()` promise still resolves normally afterward with
+       * whatever text had already streamed in, same as clicking Stop does -
+       * this bridge doesn't need to synthesize a reply for /esc itself. */
+      cancelStreaming?(): void;
     } | null;
   };
   state: {
@@ -376,6 +384,14 @@ const STRINGS = {
     zh: (title: string, prompt: string, reply: string) => `[来自其他对话] ${title}\nprompt：${prompt}\n\n${reply}`,
     en: (title: string, prompt: string, reply: string) => `[From another conversation] ${title}\nprompt: ${prompt}\n\n${reply}`,
   },
+  escInterrupted: {
+    zh: '已发送中断请求，已生成的内容会照常回复过来。',
+    en: 'Interrupt requested; whatever was already generated will still be sent back as usual.',
+  },
+  escNothingToInterrupt: {
+    zh: '当前没有正在进行的回复可以打断。',
+    en: 'Nothing is currently generating to interrupt.',
+  },
 } as const;
 
 /** /help text. Only mentions /provider when more than one provider is actually enabled in Claudian. */
@@ -394,6 +410,7 @@ function buildHelpText(lang: Lang, showProviderCommand: boolean): string {
     '/answer — 回答 Claudian 反向提出的问题（AskUserQuestion），收到推送后按提示格式回复',
     '/approve accept|always|deny|cancel — 回应 Claudian 的权限请求，收到推送后使用',
     '/progressive on 或 /progressive off — 开关渐进式回复（全局）：开启后每说完一段就单独推送，不等整轮结束',
+    '/esc — 打断 Claudian 正在进行的回复（等同电脑客户端的 Stop），已生成的内容仍会照常回复',
     '/model <名称> — 切换模型，如 /model opus、/model sonnet',
     '/effort <等级> — 切换思考强度，如 /effort low、/effort high',
     '/permission <模式> — 切换权限模式，如 /permission yolo、/permission default',
@@ -415,6 +432,7 @@ function buildHelpText(lang: Lang, showProviderCommand: boolean): string {
     '/answer — answer a question Claudian asked back (AskUserQuestion); reply in the format shown in the push notification',
     '/approve accept|always|deny|cancel — respond to a Claudian approval request; use after a push notification',
     '/progressive on or /progressive off — toggle progressive replies (global): when on, each finished chunk is pushed separately instead of waiting for the whole turn',
+    '/esc — interrupt whatever Claudian is currently generating (same as Stop on the desktop client); whatever was already generated is still sent back',
     '/model <name> — switch model, e.g. /model opus, /model sonnet',
     '/effort <level> — switch effort level, e.g. /effort low, /effort high',
     '/permission <mode> — switch permission mode, e.g. /permission yolo, /permission default',
@@ -665,6 +683,11 @@ export default class WeChatBridgePlugin extends Plugin {
     }
     if (/^\/approve\b/i.test(text)) {
       return await this.handleApproveCommand(text, lang);
+    }
+    // Same reasoning as /answer and /approve: interrupting a turn must not
+    // wait behind that same turn's own send finishing first.
+    if (/^\/esc\b/i.test(text)) {
+      return await this.handleEscCommand(lang);
     }
 
     if (/^\/help\b/i.test(text)) {
@@ -952,7 +975,7 @@ export default class WeChatBridgePlugin extends Plugin {
     // instead of silently failing on the next chat message.
     const tab = await this.getOrCreateWeChatTab();
     const metas = await this.readAllConversationMeta();
-    const title = metas.find((m) => m.id === tab.conversationId)?.title ?? id;
+    const title = this.titleFor(tab.conversationId, metas);
     return pick(STRINGS.switchedTo, lang)(title);
   }
 
@@ -1102,7 +1125,7 @@ export default class WeChatBridgePlugin extends Plugin {
     const lang = this.getLangSafe();
     const reply = this.extractDispatchText(newMessages, lang);
     const metas = await this.readAllConversationMeta();
-    const title = metas.find((m) => m.id === tab.conversationId)?.title ?? tab.conversationId ?? '?';
+    const title = this.titleFor(tab.conversationId, metas);
     const ctxLine = await this.contextWindowLine(tab.conversationId, lang);
     const body = ctxLine ? `${reply}\n\n${ctxLine}` : reply;
     this.pendingPushes.push(pick(STRINGS.desktopTurnTemplate, lang)(title, promptMsg.content.trim(), body));
@@ -1116,6 +1139,13 @@ export default class WeChatBridgePlugin extends Plugin {
       if (m.role === 'user') indices.push(i);
     });
     return indices;
+  }
+
+  /** Shared by every call site that needs "the title of this conversation, or
+   * something reasonable if it has none" - the raw id as a last resort,
+   * '?' only if there's no id at all. */
+  private titleFor(conversationId: string | null, metas: ConversationMeta[]): string {
+    return metas.find((m) => m.id === conversationId)?.title ?? conversationId ?? '?';
   }
 
   private truncate(text: string, max: number): string {
@@ -1314,7 +1344,7 @@ export default class WeChatBridgePlugin extends Plugin {
       // but tagged with which conversation and prompt it belongs to, since
       // by the time it arrives it's no longer obvious from context.
       const metas = await this.readAllConversationMeta();
-      const title = metas.find((m) => m.id === tab.conversationId)?.title ?? tab.conversationId ?? '?';
+      const title = this.titleFor(tab.conversationId, metas);
       return pick(STRINGS.switchedAwayTag, lang)(title, text, body);
     } finally {
       this.sendingViaBridgeTabIds.delete(tab.id);
@@ -1621,6 +1651,37 @@ export default class WeChatBridgePlugin extends Plugin {
       return pick(STRINGS.questionAnswered, lang);
     }
     return pick(STRINGS.questionPartial, lang)(pending.selections.size, pending.questions.length);
+  }
+
+  /**
+   * Handles `/esc`: interrupts whichever turn(s) this bridge itself set in
+   * flight (tab ids currently in sendingViaBridgeTabIds - the same guard
+   * checkForDesktopActivity uses), by calling the tab's own cancelStreaming(),
+   * the same call the desktop UI's Stop button/Escape key makes. Does not try
+   * to synthesize or return the partial reply itself - the in-flight
+   * sendChatMessage() call for that tab resolves normally once the turn
+   * actually stops (same as it would on natural completion) and delivers
+   * whatever text had streamed in by then through its own existing reply
+   * path, including progressive chunks already pushed.
+   */
+  private async handleEscCommand(lang: Lang): Promise<string> {
+    if (this.sendingViaBridgeTabIds.size === 0) {
+      return pick(STRINGS.escNothingToInterrupt, lang);
+    }
+    const view = (this.getClaudianPlugin().getAllViews?.() ?? [])[0] ?? this.findClaudianViewViaWorkspace();
+    const tabManager = view?.getTabManager?.();
+    if (!tabManager) throw new Error(pick(STRINGS.noTabManager, lang));
+
+    const allTabs = tabManager.getAllTabs();
+    let interrupted = false;
+    for (const tabId of this.sendingViaBridgeTabIds) {
+      const tab = allTabs.find((t) => t.id === tabId);
+      if (tab?.state.isStreaming && tab.controllers.inputController?.cancelStreaming) {
+        tab.controllers.inputController.cancelStreaming();
+        interrupted = true;
+      }
+    }
+    return pick(interrupted ? STRINGS.escInterrupted : STRINGS.escNothingToInterrupt, lang);
   }
 
   /** Handles `/approve accept|always|deny|cancel`, resolving handleApprovalRequestHeadless(). */

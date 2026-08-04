@@ -298,6 +298,65 @@ async def _send_text_reply(opts: WeixinApiOptions, to: str, text: str, context_t
     await send_message(opts, req)
 
 
+# WeChat's sendmessage API returns a plain 200 OK even when it silently drops
+# (or the client silently displays only part of) a very long single text
+# message - `_api_post_fetch` in wechat_clawbot only raises on HTTP >=400 and
+# never inspects the response body, so there is no signal to detect this from
+# the API call itself. Confirmed as the actual cause of "Claudian replied in
+# full but WeChat only showed the first part" reports: character counts
+# logged by the caller matched what Claudian generated, so nothing was lost
+# on our side before the send - only after. The fix is to never hand a single
+# message longer than this to sendmessage at all: split into consecutive
+# messages instead, so each individual one stays well under whatever limit
+# WeChat enforces. Conservative (WeChat's actual cap is unconfirmed, and CJK
+# text runs ~3 bytes/char in UTF-8, so this stays safely under a 4KB body).
+WECHAT_TEXT_CHUNK_LIMIT = 1200
+
+
+def _split_text_chunks(text: str, limit: int = WECHAT_TEXT_CHUNK_LIMIT) -> list[str]:
+    """Splits `text` into consecutive chunks of at most `limit` characters
+    each, preferring to break on a blank line, then a single newline, then a
+    space - only a hard mid-word cut if none of those appear in the back half
+    of the window, so chunk boundaries don't usually fall mid-sentence."""
+    text = text.strip()
+    if not text:
+        return []
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        window = remaining[:limit]
+        cut = -1
+        for sep in ("\n\n", "\n", " "):
+            idx = window.rfind(sep, limit // 2)
+            if idx != -1:
+                cut = idx + len(sep)
+                break
+        if cut == -1:
+            cut = limit
+        piece = remaining[:cut].rstrip()
+        if piece:
+            chunks.append(piece)
+        remaining = remaining[cut:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+async def _send_text_chunks(opts: WeixinApiOptions, to: str, text: str, context_token: str) -> int:
+    """Sends `text` as one or more WeChat messages (see WECHAT_TEXT_CHUNK_LIMIT),
+    sequentially so they arrive in order. Returns how many messages were sent.
+    The single call site for outbound text in this file - every reply/push
+    path routes through this instead of calling _send_text_reply directly, so
+    the chunking fix applies everywhere without duplicating the split logic."""
+    chunks = _split_text_chunks(text)
+    for chunk in chunks:
+        await _send_text_reply(opts, to, chunk, context_token)
+    return len(chunks)
+
+
 async def _get_typing_ticket(opts: WeixinApiOptions, sender_id: str, context_token: str) -> str | None:
     try:
         resp = await get_config(opts, ilink_user_id=sender_id, context_token=context_token)
@@ -451,16 +510,16 @@ async def _send_reply_with_retry(
     # truncated indicator) - a case we currently have no way to detect on
     # our own.
     try:
-        await _send_text_reply(opts, sender_id, reply, context_token)
-        _log(f"已回复: to={sender_id} chars={len(reply)} text={reply[:50]!r}")
+        n = await _send_text_chunks(opts, sender_id, reply, context_token)
+        _log(f"已回复: to={sender_id} chars={len(reply)} chunks={n} text={reply[:50]!r}")
         return
     except Exception as e:  # noqa: BLE001
         _log(f"发送回复失败（将用最新 context_token 重试一次）: {e}")
 
     if target.context_token and target.context_token != context_token:
         try:
-            await _send_text_reply(opts, sender_id, reply, target.context_token)
-            _log(f"已回复(重试成功): to={sender_id} chars={len(reply)} text={reply[:50]!r}")
+            n = await _send_text_chunks(opts, sender_id, reply, target.context_token)
+            _log(f"已回复(重试成功): to={sender_id} chars={len(reply)} chunks={n} text={reply[:50]!r}")
         except Exception as e:  # noqa: BLE001
             _log(f"重试后仍然发送回复失败，本条回复已丢失: {e}")
 
@@ -542,12 +601,16 @@ async def _pending_push_loop(opts: WeixinApiOptions, target: _LastTarget, client
 
         for push in data.get("pushes") or []:
             try:
-                await _send_text_reply(opts, target.sender_id, push, target.context_token)
                 # This is the path /progressive chunks actually go out
                 # through (not _send_reply_with_retry, whose reply is empty
                 # once anything's been pushed progressively) - `chars=` here
-                # is what to check first against a truncation report.
-                _log(f"已推送监听内容: to={target.sender_id} chars={len(push)} text={push[:50]!r}")
+                # is what to check first against a truncation report. Each
+                # push is itself now chunk-split too: a single /progressive
+                # chunk (one settled block of Claudian's reply) can still be
+                # long enough on its own to hit WeChat's silent-truncation
+                # limit.
+                n = await _send_text_chunks(opts, target.sender_id, push, target.context_token)
+                _log(f"已推送监听内容: to={target.sender_id} chars={len(push)} chunks={n} text={push[:50]!r}")
             except Exception as e:  # noqa: BLE001
                 _log(f"推送监听内容失败: {e}")
 
