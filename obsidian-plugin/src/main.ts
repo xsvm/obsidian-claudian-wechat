@@ -1251,6 +1251,19 @@ export default class WeChatBridgePlugin extends Plugin {
       } finally {
         if (progressiveTimer !== null) window.clearInterval(progressiveTimer);
         if (progressive) {
+          // Unverified-but-cheap safety margin: inputController.sendMessage()'s
+          // promise is trusted to resolve only once the whole turn is done
+          // (extractDispatchText has relied on that for non-progressive
+          // replies since before /progressive existed, with no truncation
+          // reports), but if Claudian has *any* async "commit the streaming
+          // buffer to its final form" step that runs after that promise
+          // resolves - the same category of race /listen originally had
+          // with isStreaming - reading tab.state.messages at the instant the
+          // promise resolves could catch the second-to-last version of the
+          // final block, silently missing the last bit of text. A short
+          // grace delay before the final read is a no-cost way to not care
+          // whether that's true.
+          await new Promise((resolve) => setTimeout(resolve, 250));
           // Computed here, before the final flush, so it can ride along on
           // the very last chunk instead of arriving as its own separate
           // WeChat message (flushProgressive appends it to the last line it

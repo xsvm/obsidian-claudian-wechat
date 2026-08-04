@@ -440,9 +440,19 @@ async def _send_reply_with_retry(
     every message this loop processes, including this same one), so retrying
     with it is a real chance at success instead of repeating the same failure.
     """
+    # `chars=` logged on every send (not just previewed) specifically so a
+    # future "reply got cut off" report can be checked against fact instead
+    # of guesswork: compare this number to what actually arrived in WeChat.
+    # If they match, whatever's missing was never sent by us in the first
+    # place (a bug on this side); if WeChat shows fewer characters than this,
+    # the platform itself truncated it after accepting the request with a
+    # plain 200 OK (see _api_post_fetch in wechat_clawbot, which only raises
+    # on HTTP >=400 and never inspects the response body for a partial/
+    # truncated indicator) - a case we currently have no way to detect on
+    # our own.
     try:
         await _send_text_reply(opts, sender_id, reply, context_token)
-        _log(f"已回复: to={sender_id} text={reply[:50]!r}")
+        _log(f"已回复: to={sender_id} chars={len(reply)} text={reply[:50]!r}")
         return
     except Exception as e:  # noqa: BLE001
         _log(f"发送回复失败（将用最新 context_token 重试一次）: {e}")
@@ -450,7 +460,7 @@ async def _send_reply_with_retry(
     if target.context_token and target.context_token != context_token:
         try:
             await _send_text_reply(opts, sender_id, reply, target.context_token)
-            _log(f"已回复(重试成功): to={sender_id} text={reply[:50]!r}")
+            _log(f"已回复(重试成功): to={sender_id} chars={len(reply)} text={reply[:50]!r}")
         except Exception as e:  # noqa: BLE001
             _log(f"重试后仍然发送回复失败，本条回复已丢失: {e}")
 
@@ -533,7 +543,11 @@ async def _pending_push_loop(opts: WeixinApiOptions, target: _LastTarget, client
         for push in data.get("pushes") or []:
             try:
                 await _send_text_reply(opts, target.sender_id, push, target.context_token)
-                _log(f"已推送监听内容: to={target.sender_id} text={push[:50]!r}")
+                # This is the path /progressive chunks actually go out
+                # through (not _send_reply_with_retry, whose reply is empty
+                # once anything's been pushed progressively) - `chars=` here
+                # is what to check first against a truncation report.
+                _log(f"已推送监听内容: to={target.sender_id} chars={len(push)} text={push[:50]!r}")
             except Exception as e:  # noqa: BLE001
                 _log(f"推送监听内容失败: {e}")
 
