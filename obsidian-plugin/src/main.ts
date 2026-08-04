@@ -1435,7 +1435,20 @@ export default class WeChatBridgePlugin extends Plugin {
         await this.saveData(this.data);
       }
 
-      const newMessages = tab.state.messages.slice(beforeCount);
+      // `/compact` (and rewind) can *replace* tab.state.messages with a
+      // shorter array instead of appending to it - see the shrink comment in
+      // checkForDesktopActivity for the same phenomenon on the /listen path.
+      // Slicing from the pre-send `beforeCount` against a now-shorter array
+      // silently yields [] (JS slice doesn't error on an out-of-range
+      // start), which would skip right past the context_compacted boundary
+      // block and fall into the generic "no text" reply instead of the
+      // intended "compacted successfully" one. If it shrank, we can't know
+      // which of the remaining messages are "new" either, so just take the
+      // whole (now-short) array - for a /compact turn that's exactly the
+      // compact-boundary message we need extractDispatchText to see.
+      const newMessages = tab.state.messages.length >= beforeCount
+        ? tab.state.messages.slice(beforeCount)
+        : tab.state.messages;
       const reply = this.extractDispatchText(newMessages, lang);
       const ctxLine = await this.contextWindowLine(tab.conversationId, lang);
       const body = ctxLine ? `${reply}\n\n${ctxLine}` : reply;
