@@ -274,30 +274,84 @@ export class RelayManager {
    * rather than closed normally, onunload() never runs and the previously
    * spawned `relay.py serve` is left as an orphan process - a later plugin
    * load would then spawn a second one, and both would poll the same WeChat
-   * account. Before starting a new instance, check the PID file left by the
-   * last one and kill it if it's still alive.
+   * account (this is exactly what was found happening in practice: two
+   * `relay.py serve` processes running at once).
+   *
+   * The old version of this only checked the single PID recorded in
+   * relay.pid - but that file gets overwritten on every start, so it only
+   * ever remembers the *most recent* process. If more than one orphan had
+   * ever accumulated (e.g. a couple of crashes in a row, or a plugin reload
+   * that raced with a still-starting previous instance), every orphan older
+   * than the latest one was permanently unreachable through the PID file -
+   * its own PID was already lost the moment a newer one got written over it.
+   *
+   * This instead asks the OS directly for every process whose command line
+   * actually references *this exact* relay.py path, and kills all of them
+   * (bar this run's own process, as a safety check) - so the count of
+   * matching orphans found and the count actually cleaned up are always the
+   * same, regardless of how many accumulated or how they got there.
    */
-  private async killOrphanFromPreviousRun(): Promise<void> {
-    let pid: number;
+  private async killAllOrphans(): Promise<void> {
+    const scriptPath = this.relayScript();
+    let pids: number[];
     try {
-      pid = Number((await fs.readFile(this.pidFile(), 'utf-8')).trim());
+      pids = process.platform === 'win32'
+        ? await this.findPidsByCommandLineWindows(scriptPath)
+        : await this.findPidsByCommandLineUnix(scriptPath);
     } catch {
-      return; // no PID file - nothing to clean up
-    }
-    if (!Number.isInteger(pid) || pid <= 0) return;
-
-    try {
-      process.kill(pid, 0); // throws if no such process - doesn't actually signal it
-    } catch {
-      return; // that process isn't running anymore
+      return; // best-effort - if process enumeration itself fails, just skip cleanup this run
     }
 
-    try {
-      process.kill(pid);
-      new Notice('WeChat Bridge: cleaned up a leftover relay process from a previous session.');
-    } catch {
-      // already gone by the time we tried; fine
+    const others = pids.filter((pid) => pid !== process.pid);
+    if (others.length === 0) return;
+
+    let killed = 0;
+    for (const pid of others) {
+      try {
+        process.kill(pid);
+        killed += 1;
+      } catch {
+        // already gone between enumeration and kill; fine
+      }
     }
+    if (killed > 0) {
+      new Notice(
+        killed === 1
+          ? 'WeChat Bridge: cleaned up a leftover relay process from a previous session.'
+          : `WeChat Bridge: cleaned up ${killed} leftover relay processes from previous sessions.`,
+      );
+    }
+  }
+
+  /** All PIDs of processes whose command line contains `needle`, via PowerShell (works regardless of which python.exe launched it). */
+  private async findPidsByCommandLineWindows(needle: string): Promise<number[]> {
+    const escaped = needle.replace(/'/g, "''");
+    const { stdout } = await execFileAsync('powershell', [
+      '-NoProfile',
+      '-NonInteractive',
+      '-Command',
+      `Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine.Contains('${escaped}') } | Select-Object -ExpandProperty ProcessId`,
+    ]);
+    return this.parsePidLines(stdout);
+  }
+
+  /** Same idea via `pgrep -f` on macOS/Linux. */
+  private async findPidsByCommandLineUnix(needle: string): Promise<number[]> {
+    try {
+      const { stdout } = await execFileAsync('pgrep', ['-f', needle]);
+      return this.parsePidLines(stdout);
+    } catch {
+      // pgrep exits non-zero (throws) when it finds nothing - that's the
+      // common case, not a real failure.
+      return [];
+    }
+  }
+
+  private parsePidLines(stdout: string): number[] {
+    return stdout
+      .split(/\r?\n/)
+      .map((line) => Number(line.trim()))
+      .filter((n) => Number.isInteger(n) && n > 0);
   }
 
   private logFile(): string {
@@ -308,7 +362,7 @@ export class RelayManager {
   private async startRelayProcess(venvPython: string): Promise<void> {
     if (this.stopped) return; // plugin was unloaded while setup was still running
 
-    await this.killOrphanFromPreviousRun();
+    await this.killAllOrphans();
 
     this.relayProcess = spawn(venvPython, [this.relayScript(), 'serve'], {
       cwd: this.pluginDir,
