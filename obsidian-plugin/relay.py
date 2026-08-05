@@ -355,16 +355,49 @@ def _split_text_chunks(text: str, limit: int = WECHAT_TEXT_CHUNK_LIMIT) -> list[
     return chunks
 
 
-async def _send_text_chunks(opts: WeixinApiOptions, to: str, text: str, context_token: str) -> int:
+async def _send_text_chunks(
+    opts: WeixinApiOptions,
+    to: str,
+    text: str,
+    context_token: str,
+    fallback_context_token: str | None = None,
+) -> int:
     """Sends `text` as one or more WeChat messages (see WECHAT_TEXT_CHUNK_LIMIT),
-    sequentially so they arrive in order. Returns how many messages were sent.
-    The single call site for outbound text in this file - every reply/push
-    path routes through this instead of calling _send_text_reply directly, so
-    the chunking fix applies everywhere without duplicating the split logic."""
-    chunks = _split_text_chunks(text)
-    for chunk in chunks:
-        await _send_text_reply(opts, to, chunk, context_token)
-    return len(chunks)
+    sequentially so they arrive in order. Returns how many chunks were
+    actually delivered. The single call site for outbound text in this file -
+    every reply/push path routes through this instead of calling
+    _send_text_reply directly, so both the chunking and retry logic apply
+    everywhere without being duplicated per call site.
+
+    Each chunk that fails is retried once against `fallback_context_token`
+    (the freshest token this process has seen, if different) before being
+    given up on - and *only* that one chunk is retried, not the whole
+    message from the start. A long agentic turn can easily outlive however
+    long a single context_token stays valid partway through sending a
+    multi-chunk reply; the previous behavior (retry the entire message from
+    scratch, see git history) meant a stale token mid-send either duplicated
+    already-delivered chunks (retry succeeds) or, if the retry *also* failed,
+    silently dropped every chunk after the failure point - which from WeChat
+    looked exactly like "Claudian replied but got cut off partway", even
+    though the real content had been generated in full. Retrying in place
+    means a single token blip costs at most one chunk.
+    """
+    sent = 0
+    for chunk in _split_text_chunks(text):
+        try:
+            await _send_text_reply(opts, to, chunk, context_token)
+            sent += 1
+            continue
+        except Exception as e:  # noqa: BLE001
+            if not fallback_context_token or fallback_context_token == context_token:
+                _log(f"发送分段失败，已跳过该段（{len(chunk)} 字符）: {e}")
+                continue
+        try:
+            await _send_text_reply(opts, to, chunk, fallback_context_token)
+            sent += 1
+        except Exception as e:  # noqa: BLE001
+            _log(f"发送分段失败（重试后仍失败），已跳过该段（{len(chunk)} 字符）: {e}")
+    return sent
 
 
 async def _get_typing_ticket(opts: WeixinApiOptions, sender_id: str, context_token: str) -> str | None:
@@ -550,42 +583,26 @@ async def _handle_one_message(
 async def _send_reply_with_retry(
     opts: WeixinApiOptions, sender_id: str, reply: str, context_token: str, target: _LastTarget
 ) -> None:
-    """Sends the final reply, retrying once with whatever context_token is
-    currently freshest if the original one fails.
+    """Sends the final reply. `target.context_token` (whatever the most recent
+    inbound message actually used, kept fresh by every message this loop
+    processes) is passed through to `_send_text_chunks` as the per-chunk
+    fallback token - see that function for why retrying is done chunk-by-
+    chunk rather than by resending the whole reply.
 
-    A long agentic Claudian turn (several tool calls, a slow build, etc.) can
-    easily run past however long WeChat's own context_token stays valid for
-    replying - the turn finishes correctly on the Claudian side, but sending
-    the reply back fails with a now-stale token, and previously that failure
-    was only ever written to a log nobody could see: from WeChat it looked
-    exactly like Claudian silently never replied at all. `target.context_token`
-    is whatever the most recent inbound message actually used (kept fresh by
-    every message this loop processes, including this same one), so retrying
-    with it is a real chance at success instead of repeating the same failure.
+    `chars=`/`chunks=` logged on every send (not just previewed) specifically
+    so a future "reply got cut off" report can be checked against fact
+    instead of guesswork: compare `chunks` sent here to how many messages
+    actually arrived in WeChat. If they match, whatever's missing was never
+    sent by us in the first place (a bug on this side); if WeChat shows fewer
+    messages than `chunks`, the platform itself dropped one after accepting
+    it with a plain 200 OK (see _api_post_fetch in wechat_clawbot, which only
+    raises on HTTP >=400 and never inspects the response body for a partial/
+    truncated indicator) - a case we currently have no way to detect on our
+    own.
     """
-    # `chars=` logged on every send (not just previewed) specifically so a
-    # future "reply got cut off" report can be checked against fact instead
-    # of guesswork: compare this number to what actually arrived in WeChat.
-    # If they match, whatever's missing was never sent by us in the first
-    # place (a bug on this side); if WeChat shows fewer characters than this,
-    # the platform itself truncated it after accepting the request with a
-    # plain 200 OK (see _api_post_fetch in wechat_clawbot, which only raises
-    # on HTTP >=400 and never inspects the response body for a partial/
-    # truncated indicator) - a case we currently have no way to detect on
-    # our own.
-    try:
-        n = await _send_text_chunks(opts, sender_id, reply, context_token)
-        _log(f"已回复: to={sender_id} chars={len(reply)} chunks={n} text={reply[:50]!r}")
-        return
-    except Exception as e:  # noqa: BLE001
-        _log(f"发送回复失败（将用最新 context_token 重试一次）: {e}")
-
-    if target.context_token and target.context_token != context_token:
-        try:
-            n = await _send_text_chunks(opts, sender_id, reply, target.context_token)
-            _log(f"已回复(重试成功): to={sender_id} chars={len(reply)} chunks={n} text={reply[:50]!r}")
-        except Exception as e:  # noqa: BLE001
-            _log(f"重试后仍然发送回复失败，本条回复已丢失: {e}")
+    fallback = target.context_token if target.context_token != context_token else None
+    n = await _send_text_chunks(opts, sender_id, reply, context_token, fallback)
+    _log(f"已回复: to={sender_id} chars={len(reply)} chunks={n} text={reply[:50]!r}")
 
 
 async def _wechat_poll_loop(
@@ -674,7 +691,10 @@ async def _pending_push_loop(opts: WeixinApiOptions, target: _LastTarget, client
                 # long enough on its own to hit WeChat's silent-truncation
                 # limit.
                 n = await _send_text_chunks(opts, target.sender_id, push, target.context_token)
-                _log(f"已推送监听内容: to={target.sender_id} chars={len(push)} chunks={n} text={push[:50]!r}")
+                if n == 0 and push.strip():
+                    _log(f"推送监听内容全部失败: to={target.sender_id} chars={len(push)}")
+                else:
+                    _log(f"已推送监听内容: to={target.sender_id} chars={len(push)} chunks={n} text={push[:50]!r}")
             except Exception as e:  # noqa: BLE001
                 _log(f"推送监听内容失败: {e}")
 

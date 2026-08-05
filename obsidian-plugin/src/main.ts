@@ -1120,7 +1120,11 @@ export default class WeChatBridgePlugin extends Plugin {
     const progressiveWord = this.data.progressiveReply
       ? pick(STRINGS.statusListeningOn, lang)
       : pick(STRINGS.statusListeningOff, lang);
-    return `${base}${providerLine}\n${pick(STRINGS.statusListeningLabel, lang)}${listeningWord}\n${pick(STRINGS.statusProgressiveLabel, lang)}${progressiveWord}`;
+    // Reuses the same usage lookup real turn replies append - /status just
+    // reads it on demand instead of waiting for a turn to trigger it.
+    const ctxLine = await this.contextWindowLine(this.data.conversationId, lang);
+    const ctxSuffix = ctxLine ? `\n${ctxLine}` : '';
+    return `${base}${providerLine}\n${pick(STRINGS.statusListeningLabel, lang)}${listeningWord}\n${pick(STRINGS.statusProgressiveLabel, lang)}${progressiveWord}${ctxSuffix}`;
   }
 
   // ---- /listen on|off: mirror desktop-originated turns to WeChat ----
