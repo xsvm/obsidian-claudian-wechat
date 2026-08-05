@@ -262,260 +262,15 @@ interface ConversationMeta {
 // (e.g. "zh-CN", "en"), not from any setting of this plugin's own.
 type Lang = 'zh' | 'en';
 
-const STRINGS = {
-  emptyText: { zh: '消息内容为空', en: 'Empty text' },
-  bodyMustBeJson: { zh: '请求体必须是 JSON: {"text": "..."}', en: 'Body must be JSON: {"text": "..."}' },
-  tabNotReady: {
-    zh: 'Claudian 会话标签页还没准备好（没有 inputController），请稍后重试。',
-    en: 'Claudian tab is not ready yet (no inputController). Retry shortly.',
-  },
-  noViewOpen: {
-    zh: '没有打开的 Claudian 视图，请先在 Obsidian 里打开一次 Claudian 侧边栏。',
-    en: 'No Claudian view is open. Open the Claudian sidebar once.',
-  },
-  noTabManager: { zh: 'Claudian 的 tab manager 不可用。', en: 'Claudian tab manager not available.' },
-  tabLimitReached: {
-    zh: 'Claudian 标签页已达上限(10个),无法为桥接创建新标签页。请在桌面端关闭一个标签页后重试。',
-    en: 'Claudian has hit its hard tab limit (10) and could not create a tab for the bridge. Close a tab in the desktop UI and try again.',
-  },
-  pluginNotEnabled: {
-    zh: (id: string) => `Claudian 插件（"${id}"）未启用。`,
-    en: (id: string) => `Claudian plugin ("${id}") is not enabled.`,
-  },
-  noConversations: { zh: '没有找到任何会话。', en: 'No conversations found.' },
-  listTruncated: {
-    zh: (n: number) => `... 还有 ${n} 个更早的会话未显示，发送 /list all 或 /ls all 查看全部。`,
-    en: (n: number) => `... ${n} more older conversation(s) not shown; send /list all or /ls all to see everything.`,
-  },
-  untitled: { zh: '(无标题)', en: '(untitled)' },
-  current: { zh: ' (当前)', en: ' (current)' },
-  switchNeedsListFirst: {
-    zh: '请先发送 /list 查看会话列表，再用 /switch 序号 切换。',
-    en: 'Send /list first to see the conversation list, then use /switch <number>.',
-  },
-  switchedTo: { zh: (title: string) => `已切换到: ${title}`, en: (title: string) => `Switched to: ${title}` },
-  newConversationStarted: {
-    zh: '已新建对话，下一条消息将开始一个全新的会话。',
-    en: 'Started a new conversation; the next message will begin fresh.',
-  },
-  noDispatchText: {
-    zh: '(这一轮没有生成文字回复。Claudian 内部可能报错并回滚了这轮对话——请去 Obsidian 里看一下有没有弹出的提示，或直接重试一次。)',
-    en: '(No text reply was generated this turn. Claudian may have errored and rolled the turn back — check Obsidian for a notice, or just retry.)',
-  },
-  compactedNoText: {
-    zh: '已压缩对话上下文（/compact 执行成功，本身就不会有文字回复）。',
-    en: 'Conversation context was compacted successfully (/compact has no text reply by design).',
-  },
-  noClaudeCommands: {
-    zh: '没有发现 Claude 自带的斜杠命令（可能还没打开过一次会话）。',
-    en: 'No Claude slash commands found (a conversation may not have been opened yet).',
-  },
-  claudeCommandsHeader: {
-    zh: 'Claude 自带的斜杠命令（在这里发送即可直接使用，例如 /compact）:',
-    en: "Claude's own slash commands (send them directly, e.g. /compact):",
-  },
-  statusTemplate: {
-    zh: (model: string, effort: string, permission: string) =>
-      `当前设置:\n模型: ${model}\n思考强度: ${effort}\n权限模式: ${permission}`,
-    en: (model: string, effort: string, permission: string) =>
-      `Current settings:\nModel: ${model}\nEffort: ${effort}\nPermission: ${permission}`,
-  },
-  histEmpty: {
-    zh: '当前会话还没有任何消息。',
-    en: 'No messages yet in this conversation.',
-  },
-  histHeader: {
-    zh: '历史消息（发送 /hist 序号 查看对应回复）:',
-    en: 'Message history (send /hist <number> to view its reply):',
-  },
-  outOfRange: {
-    zh: (n: number) => `序号超出范围（1-${n}）。`,
-    en: (n: number) => `Index out of range (1-${n}).`,
-  },
-  listenOn: {
-    zh: '监听已开启（仅对当前对话生效）：在 Claudian 电脑客户端上发的消息也会推送到这里。切换到其他对话后监听不会跟过去。',
-    en: 'Listening enabled (scoped to the current conversation only): messages sent from the Claudian desktop client will also be pushed here. Switching to a different conversation stops it from following.',
-  },
-  listenOff: { zh: '监听已关闭。', en: 'Listening disabled.' },
-  listenUsage: {
-    zh: '用法: /listen on 或 /listen off',
-    en: 'Usage: /listen on or /listen off',
-  },
-  statusListeningLabel: { zh: '监听: ', en: 'Listening: ' },
-  statusListeningOn: { zh: '开启', en: 'on' },
-  statusListeningOff: { zh: '关闭', en: 'off' },
-  contextWindowLine: {
-    zh: (used: string, total: string) => `上下文窗口：${used}/${total}`,
-    en: (used: string, total: string) => `Context window: ${used}/${total}`,
-  },
-  desktopTurnTemplate: {
-    zh: (title: string, prompt: string, reply: string) => `对话: ${title}\nprompt：${prompt}\n\n${reply}`,
-    en: (title: string, prompt: string, reply: string) => `Conversation: ${title}\nprompt: ${prompt}\n\n${reply}`,
-  },
-  providerLabel: { zh: '供应商: ', en: 'Provider: ' },
-  providerUsage: {
-    zh: (enabled: string) => `用法: /provider <名称>\n可用供应商: ${enabled}`,
-    en: (enabled: string) => `Usage: /provider <name>\nAvailable providers: ${enabled}`,
-  },
-  providerUnknown: {
-    zh: (name: string, enabled: string) => `不认识的供应商 "${name}"。可用供应商: ${enabled}`,
-    en: (name: string, enabled: string) => `Unknown provider "${name}". Available providers: ${enabled}`,
-  },
-  providerSwitched: {
-    zh: (name: string) => `已切换到供应商: ${name}。下一条消息将在这个供应商上开始一个全新的对话。`,
-    en: (name: string) => `Switched to provider: ${name}. The next message will start a brand-new conversation on it.`,
-  },
-  // ---- reverse questions (AskUserQuestion) / approval prompts ----
-  askUserQuestionHeader: {
-    zh: 'Claudian 有问题想问你：',
-    en: 'Claudian is asking you something:',
-  },
-  askUserQuestionUsageSingle: {
-    zh: '回复 /answer 序号（如 /answer 2，多选用逗号分隔如 /answer 1,3）或 /answer 你的文字回答；/answer cancel 取消。',
-    en: 'Reply /answer <number> (e.g. /answer 2; comma-separate for multi-select like /answer 1,3), or /answer <free text>. /answer cancel to cancel.',
-  },
-  askUserQuestionUsageMulti: {
-    zh: '回复 /answer 题号 选项（如 /answer 1 2，多选逗号分隔），每题回复一次，答完自动提交；/answer cancel 取消。',
-    en: 'Reply /answer <question#> <option#> (e.g. /answer 1 2; comma-separate for multi-select) once per question - submits automatically once all are answered. /answer cancel to cancel.',
-  },
-  answerUsage: { zh: '用法: /answer <序号|文字>，或 /answer cancel', en: 'Usage: /answer <number|text>, or /answer cancel' },
-  answerUsageMulti: {
-    zh: '有多道题，请用 /answer 题号 选项 的格式，如 /answer 1 2。',
-    en: 'Multiple questions pending - use /answer <question#> <option#>, e.g. /answer 1 2.',
-  },
-  noPendingQuestion: { zh: '当前没有待回答的问题。', en: 'No question is currently pending.' },
-  questionCancelled: { zh: '已取消该问题。', en: 'Question cancelled.' },
-  questionAnswered: { zh: '已提交回答，Claudian 将继续处理。', en: 'Answer submitted; Claudian will continue.' },
-  questionPartial: {
-    zh: (done: number, total: number) => `已记录 (${done}/${total})，请继续回答剩余问题。`,
-    en: (done: number, total: number) => `Recorded (${done}/${total}) - keep answering the remaining questions.`,
-  },
-  approvalHeader: {
-    zh: (title: string, desc: string) => `Claudian 请求权限:\n${title}\n${desc}\n\n回复 /approve accept（仅本次）、/approve always（本次会话内始终允许）、/approve deny（拒绝）或 /approve cancel（取消本轮）。`,
-    en: (title: string, desc: string) => `Claudian is requesting approval:\n${title}\n${desc}\n\nReply /approve accept (just once), /approve always (allow for this session), /approve deny, or /approve cancel.`,
-  },
-  approveUsage: { zh: '用法: /approve accept|always|deny|cancel', en: 'Usage: /approve accept|always|deny|cancel' },
-  noPendingApproval: { zh: '当前没有待处理的权限请求。', en: 'No approval request is currently pending.' },
-  approvalResolved: {
-    zh: (d: string) => `已提交: ${d}`,
-    en: (d: string) => `Submitted: ${d}`,
-  },
-  progressiveOn: {
-    zh: '渐进式回复已开启（全局生效，所有对话）：Claudian 每说完一段就会单独推送一条，不再等整轮结束才一次性回复。',
-    en: 'Progressive replies enabled (global, applies to every conversation): each finished chunk is pushed as its own message instead of waiting for the whole turn.',
-  },
-  progressiveOff: { zh: '渐进式回复已关闭，恢复为整轮结束后一次性回复。', en: 'Progressive replies disabled; back to one reply per turn.' },
-  progressiveUsage: { zh: '用法: /progressive on 或 /progressive off', en: 'Usage: /progressive on or /progressive off' },
-  statusProgressiveLabel: { zh: '渐进式回复: ', en: 'Progressive replies: ' },
-  switchedAwayTag: {
-    zh: (title: string, prompt: string, reply: string) => `[来自其他对话] ${title}\nprompt：${prompt}\n\n${reply}`,
-    en: (title: string, prompt: string, reply: string) => `[From another conversation] ${title}\nprompt: ${prompt}\n\n${reply}`,
-  },
-  escInterrupted: {
-    zh: '已发送中断请求，已生成的内容会照常回复过来。',
-    en: 'Interrupt requested; whatever was already generated will still be sent back as usual.',
-  },
-  escNothingToInterrupt: {
-    zh: '当前没有正在进行的回复可以打断。',
-    en: 'Nothing is currently generating to interrupt.',
-  },
-  // ---- outbound files/images: /files, /getfile, /send ----
-  filesHeader: {
-    zh: '最近一轮回复中涉及的文件:',
-    en: 'Files referenced in the most recent turn:',
-  },
-  filesNone: {
-    zh: '最近一轮回复没有发现可识别的文件（没有双链引用，也没有涉及文件的工具调用）。',
-    en: 'No recognizable files in the most recent turn (no wikilinks, and no tool calls that touched a file).',
-  },
-  getfileUsage: {
-    zh: '发送 /getfile 序号 获取对应文件，多个用逗号分隔，如 /getfile 1,2',
-    en: 'Send /getfile <number> to fetch a file, comma-separate for several, e.g. /getfile 1,2',
-  },
-  getfileNeedsListFirst: {
-    zh: '请先发送 /files 查看这一轮涉及的文件，再用 /getfile 序号 获取。',
-    en: 'Send /files first to see this turn’s files, then use /getfile <number>.',
-  },
-  queuedForSend: {
-    zh: (name: string) => `已加入发送队列: ${name}`,
-    en: (name: string) => `Queued for sending: ${name}`,
-  },
-  fileNotFound: {
-    zh: (p: string) => `文件不存在或不可读: ${p}`,
-    en: (p: string) => `File not found or unreadable: ${p}`,
-  },
-  fileTooLarge: {
-    zh: (name: string, mb: number) => `文件过大（约 ${mb}MB，超过上限），未发送: ${name}`,
-    en: (name: string, mb: number) => `File too large (~${mb}MB, over the limit) - not sent: ${name}`,
-  },
-  sendUsage: {
-    zh: '用法: /send <vault内的相对路径>，如 /send attachments/report.pdf',
-    en: 'Usage: /send <path relative to the vault>, e.g. /send attachments/report.pdf',
-  },
-  pathOutsideVault: {
-    zh: (p: string) => `路径必须在 vault 内: ${p}`,
-    en: (p: string) => `Path must stay inside the vault: ${p}`,
-  },
-} as const;
-
-/** /help text. Only mentions /provider when more than one provider is actually enabled in Claudian. */
-function buildHelpText(lang: Lang, showProviderCommand: boolean): string {
-  const zh = [
-    '本插件命令:',
-    '/help — 显示本帮助',
-    '/list 或 /ls — 列出最近 10 个历史会话（编号、标题、更新时间）',
-    '/list all 或 /ls all — 列出全部历史会话，不限制数量',
-    '/switch N 或 /goto N — 切换到 /list 中第 N 个会话',
-    '/new — 新建一个全新对话（不影响其他历史会话）',
-    '/status — 查看当前模型、思考强度、权限模式、监听状态',
-    '/hist — 按序号列出当前对话你发过的消息',
-    '/hist N — 查看第 N 条消息对应的回复',
-    '/listen on 或 /listen off — 开关监听：开启后，电脑客户端上发的消息也会推送到这里',
-    '/answer — 回答 Claudian 反向提出的问题（AskUserQuestion），收到推送后按提示格式回复',
-    '/approve accept|always|deny|cancel — 回应 Claudian 的权限请求，收到推送后使用',
-    '/progressive on 或 /progressive off — 开关渐进式回复（全局）：开启后每说完一段就单独推送，不等整轮结束',
-    '/esc — 打断 Claudian 正在进行的回复（等同电脑客户端的 Stop），已生成的内容仍会照常回复',
-    '/files — 列出最近一轮回复涉及的文件（双链引用 + 实际操作过的文件），配合 /getfile 使用',
-    '/getfile 序号 — 获取 /files 列出的文件并发送过来，多个用逗号分隔，如 /getfile 1,2',
-    '/send <路径> — 直接发送 vault 内某个文件（相对路径），不需要先 /files',
-    '/model <名称> — 切换模型，如 /model opus、/model sonnet',
-    '/effort <等级> — 切换思考强度，如 /effort low、/effort high',
-    '/permission <模式> — 切换权限模式，如 /permission yolo、/permission default',
-    ...(showProviderCommand ? ['/provider <名称> — 切换供应商（会开始一个新对话），发送 /provider 查看可选项'] : []),
-    '/commands — 查看 Claude 自带的斜杠命令（跟上面这些是两回事）',
-    '其他任何文字 — 作为普通消息发给 Claudian（Claude 自带的斜杠命令也直接这样发送即可）',
-  ];
-  const en = [
-    'Bridge commands:',
-    '/help — show this help',
-    '/list or /ls — list the 10 most recent conversations (number, title, updated time)',
-    '/list all or /ls all — list every conversation, no limit',
-    '/switch N or /goto N — switch to conversation number N from /list',
-    '/new — start a brand-new conversation (existing ones are untouched)',
-    '/status — show the current model, effort level, permission mode, and listening state',
-    '/hist — list your messages in the current conversation, numbered',
-    '/hist N — show the reply to message number N',
-    '/listen on or /listen off — toggle listening: when on, messages sent from the desktop client are pushed here too',
-    '/answer — answer a question Claudian asked back (AskUserQuestion); reply in the format shown in the push notification',
-    '/approve accept|always|deny|cancel — respond to a Claudian approval request; use after a push notification',
-    '/progressive on or /progressive off — toggle progressive replies (global): when on, each finished chunk is pushed separately instead of waiting for the whole turn',
-    '/esc — interrupt whatever Claudian is currently generating (same as Stop on the desktop client); whatever was already generated is still sent back',
-    '/files — list files referenced in the most recent turn (wikilinks + files actually touched by tool calls), use with /getfile',
-    '/getfile <number> — fetch a file listed by /files and send it to you, comma-separate for several, e.g. /getfile 1,2',
-    '/send <path> — send a specific file from the vault directly (relative path), no need to run /files first',
-    '/model <name> — switch model, e.g. /model opus, /model sonnet',
-    '/effort <level> — switch effort level, e.g. /effort low, /effort high',
-    '/permission <mode> — switch permission mode, e.g. /permission yolo, /permission default',
-    ...(showProviderCommand ? ['/provider <name> — switch provider (starts a new conversation); send /provider alone to see options'] : []),
-    "/commands — list Claude's own slash commands (separate from the bridge commands above)",
-    'anything else — sent to Claudian as a normal message (this is also how you use ‘Claude’s own slash commands themselves)',
-  ];
-  return (lang === 'zh' ? zh : en).join('\n');
+// All bilingual user-facing text lives in strings.json (next to main.js in
+// the plugin folder), not here - see loadStrings() below for why, and the
+// file itself for the {0}/{1}/... placeholder convention `t()` substitutes.
+interface StringsData {
+  help: { zh: string[]; en: string[] };
+  [key: string]: { zh: string; en: string } | { zh: string[]; en: string[] };
 }
 
-function pick<T>(entry: { zh: T; en: T }, lang: Lang): T {
-  return entry[lang];
-}
+const STRINGS_FILE_NAME = 'strings.json';
 
 const DEFAULT_DATA: BridgeData = {
   conversationId: null,
@@ -598,6 +353,8 @@ export default class WeChatBridgePlugin extends Plugin {
    * /files again).
    */
   private lastReferencedFiles: { display: string; absolutePath: string }[] = [];
+  /** Loaded once in onload() from strings.json - see loadStrings(). */
+  private strings: StringsData | null = null;
 
   async onload() {
     const saved = await this.loadData();
@@ -607,6 +364,13 @@ export default class WeChatBridgePlugin extends Plugin {
     if (adapter instanceof FileSystemAdapter) {
       this.pluginDir = path.join(adapter.getBasePath(), this.manifest.dir ?? '.obsidian/plugins/wechat-bridge');
     }
+
+    // Must happen before startServer(): handleIncoming() needs `this.strings`
+    // for every reply it produces, including error replies to the very first
+    // request. Kept as a plain JSON file next to main.js (see strings.json)
+    // instead of a TS object literal so wording can be edited without
+    // touching code or triggering a rebuild - a plain reload picks it up.
+    await this.loadStrings();
 
     // Must finish (and, if it had to fall back to a non-default port, write
     // port.txt) before the relay is started, since relay.py reads that file
@@ -636,6 +400,54 @@ export default class WeChatBridgePlugin extends Plugin {
   /** Exposed for the settings tab (connection status, QR reconnect, restart/disconnect). */
   getRelayManager(): RelayManager | null {
     return this.relayManager;
+  }
+
+  // ---- i18n: strings.json loading + lookup ----
+
+  /**
+   * Reads strings.json from the plugin folder (same place as main.js and
+   * manifest.json - `this.pluginDir`). Falls back to an empty table (every
+   * `t()` call then returns a visibly-broken `[[missing: key]]` placeholder
+   * instead of throwing) rather than blocking the whole plugin on a single
+   * malformed or missing file - a bridge that replies with placeholder text
+   * is still debuggable; one that fails onload() entirely is not.
+   */
+  private async loadStrings(): Promise<void> {
+    if (!this.pluginDir) {
+      this.strings = { help: { zh: [], en: [] } };
+      return;
+    }
+    try {
+      const raw = await fs.readFile(path.join(this.pluginDir, STRINGS_FILE_NAME), 'utf-8');
+      this.strings = JSON.parse(raw) as StringsData;
+    } catch (e) {
+      new Notice(`WeChat Bridge: failed to load ${STRINGS_FILE_NAME} (${e instanceof Error ? e.message : e})`);
+      this.strings = { help: { zh: [], en: [] } };
+    }
+  }
+
+  /**
+   * Looks up `key` in strings.json for `lang` and substitutes `{0}`, `{1}`,
+   * ... with `args` in order - the single call site every reply string in
+   * this file goes through (replaces the old `pick(STRINGS.x, lang)(...)`
+   * pattern; wording itself now lives entirely in strings.json, not here).
+   */
+  private t(key: string, lang: Lang, ...args: (string | number)[]): string {
+    const entry = this.strings?.[key];
+    if (!entry || Array.isArray(entry.zh)) return `[[missing string: ${key}]]`;
+    const template = (entry as { zh: string; en: string })[lang];
+    return args.length === 0 ? template : template.replace(/\{(\d+)\}/g, (_, i) => String(args[Number(i)] ?? ''));
+  }
+
+  /** /help text. Only mentions /provider when more than one provider is actually enabled in Claudian.
+   * The optional `?`-prefixed line in strings.json's help.zh/help.en is that /provider line; stripped
+   * (and un-prefixed) here based on `showProviderCommand` instead of duplicating the whole list twice. */
+  private buildHelpText(lang: Lang, showProviderCommand: boolean): string {
+    const lines = this.strings?.help[lang] ?? [];
+    return lines
+      .filter((line) => !line.startsWith('?') || showProviderCommand)
+      .map((line) => (line.startsWith('?') ? line.slice(1) : line))
+      .join('\n');
   }
 
   /**
@@ -763,116 +575,87 @@ export default class WeChatBridgePlugin extends Plugin {
         image = { data: parsed.image.data, mediaType: parsed.image.mediaType };
       }
     } catch {
-      throw new Error(pick(STRINGS.bodyMustBeJson, this.getLangSafe()));
+      throw new Error(this.t('bodyMustBeJson', this.getLangSafe()));
     }
     const lang = this.getLangSafe();
     // A pure image message (no caption) has empty text - only reject the
     // request if there's neither text nor an image to act on.
-    if (!text && !image) throw new Error(pick(STRINGS.emptyText, lang));
+    if (!text && !image) throw new Error(this.t('emptyText', lang));
 
-    // /answer and /approve must never wait behind an in-flight chat turn -
-    // they exist specifically to unblock one (Claudian is paused mid-turn
-    // waiting on exactly this). Handled first, synchronously, against
-    // in-memory state only.
-    if (/^\/answer\b/i.test(text)) {
-      return await this.handleAnswerCommand(text, lang);
-    }
-    if (/^\/approve\b/i.test(text)) {
-      return await this.handleApproveCommand(text, lang);
-    }
-    // Same reasoning as /answer and /approve: interrupting a turn must not
-    // wait behind that same turn's own send finishing first.
-    if (/^\/esc\b/i.test(text)) {
-      return await this.handleEscCommand(lang);
-    }
-    // /files, /getfile and /send never touch Claudian at all (they read
-    // already-generated messages / the vault filesystem directly) - no
-    // reason to wait behind an in-flight chat turn either.
-    if (/^\/files\b/i.test(text)) {
-      return await this.listReferencedFiles(lang);
-    }
-    if (/^\/getfile\b/i.test(text)) {
-      return await this.handleGetFileCommand(text, lang);
-    }
-    const sendMatch = text.match(/^\/send\s+(\S.*)$/i);
-    if (sendMatch) {
-      return await this.handleSendCommand(sendMatch[1].trim(), lang);
-    }
-    if (/^\/send\b/i.test(text)) {
-      return pick(STRINGS.sendUsage, lang);
+    // Every bridge command is tried, in order, against `text`; the first
+    // whose `match` succeeds runs and its result is the reply. None of these
+    // touch sendChatMessageQueued - every one of them either reads in-memory
+    // state directly or is explicitly meant to run immediately rather than
+    // wait behind an in-flight chat turn (most importantly /answer, /approve
+    // and /esc, which exist specifically to unblock or interrupt one).
+    // Anything matching none of them (including Claude's own slash commands
+    // like /compact, vault commands, and skills) falls through to the
+    // regular queued chat send at the bottom - Claudian's own InputController
+    // already detects and expands those, so this bridge does not special-
+    // case them.
+    for (const route of this.commandRoutes()) {
+      const m = text.match(route.pattern);
+      if (m) return await route.run(m, lang, image);
     }
 
-    if (/^\/help\b/i.test(text)) {
-      return buildHelpText(lang, this.getEnabledProviders().length > 1);
-    }
-
-    if (/^\/commands\b/i.test(text)) {
-      return await this.listClaudeCommands(lang);
-    }
-
-    const settingsCmd = this.parseSettingsCommand(text);
-    if (settingsCmd) {
-      return await this.applySettingsCommand(settingsCmd.key, settingsCmd.value, lang);
-    }
-
-    const providerMatch = text.match(/^\/provider\s+(\S+)/i);
-    if (providerMatch) {
-      return await this.switchProvider(providerMatch[1].toLowerCase(), lang);
-    }
-    if (/^\/provider\b/i.test(text)) {
-      return pick(STRINGS.providerUsage, lang)(this.getEnabledProviders().join(', '));
-    }
-
-    const listMatch = text.match(/^\/(?:list|ls)(?:\s+(all))?\b/i);
-    if (listMatch) {
-      return this.listConversations(lang, Boolean(listMatch[1]));
-    }
-
-    const switchMatch = text.match(/^\/(switch|goto)\s+(\d+)/i);
-    if (switchMatch) {
-      return await this.switchConversation(Number(switchMatch[2]), lang);
-    }
-
-    if (/^\/status\b/i.test(text)) {
-      return this.statusText(lang);
-    }
-
-    const histMatch = text.match(/^\/hist(?:\s+(\d+))?\b/i);
-    if (histMatch) {
-      return histMatch[1]
-        ? await this.showHistory(Number(histMatch[1]), lang)
-        : await this.listHistory(lang);
-    }
-
-    const listenMatch = text.match(/^\/listen\s+(on|off)\b/i);
-    if (listenMatch) {
-      return await this.setListening(listenMatch[1].toLowerCase() === 'on', lang);
-    }
-    if (/^\/listen\b/i.test(text)) {
-      return pick(STRINGS.listenUsage, lang);
-    }
-
-    const progressiveMatch = text.match(/^\/progressive\s+(on|off)\b/i);
-    if (progressiveMatch) {
-      this.data.progressiveReply = progressiveMatch[1].toLowerCase() === 'on';
-      await this.saveData(this.data);
-      return pick(this.data.progressiveReply ? STRINGS.progressiveOn : STRINGS.progressiveOff, lang);
-    }
-    if (/^\/progressive\b/i.test(text)) {
-      return pick(STRINGS.progressiveUsage, lang);
-    }
-
-    if (/^\/new\b/i.test(text)) {
-      this.data.conversationId = null;
-      await this.saveData(this.data);
-      return pick(STRINGS.newConversationStarted, lang);
-    }
-
-    // Everything else - including Claude's own slash commands like /compact,
-    // vault commands, and skills - is sent through as-is. Claudian's own
-    // InputController already detects and expands those; this bridge does
-    // not need to special-case them.
     return await this.sendChatMessageQueued(text, lang, image);
+  }
+
+  /**
+   * Declarative table backing handleIncoming(): one entry per bridge slash
+   * command, tried top-to-bottom against the inbound text. Built fresh per
+   * call (cheap - a few dozen closures) rather than cached, so every `run`
+   * can close over `this` without a separate bind step.
+   */
+  private commandRoutes(): { pattern: RegExp; run: (m: RegExpMatchArray, lang: Lang, image?: IncomingImage) => Promise<string> | string }[] {
+    return [
+      { pattern: /^\/answer\b/i, run: (m, lang) => this.handleAnswerCommand(m.input as string, lang) },
+      { pattern: /^\/approve\b/i, run: (m, lang) => this.handleApproveCommand(m.input as string, lang) },
+      { pattern: /^\/esc\b/i, run: (_m, lang) => this.handleEscCommand(lang) },
+      { pattern: /^\/files\b/i, run: (_m, lang) => this.listReferencedFiles(lang) },
+      { pattern: /^\/getfile\b/i, run: (m, lang) => this.handleGetFileCommand(m.input as string, lang) },
+      { pattern: /^\/send\s+(\S.*)$/i, run: (m, lang) => this.handleSendCommand(m[1].trim(), lang) },
+      { pattern: /^\/send\b/i, run: (_m, lang) => this.t('sendUsage', lang) },
+      { pattern: /^\/help\b/i, run: (_m, lang) => this.buildHelpText(lang, this.getEnabledProviders().length > 1) },
+      { pattern: /^\/commands\b/i, run: (_m, lang) => this.listClaudeCommands(lang) },
+      {
+        pattern: /^\/(model|effort|permission)\s+(\S+)/i,
+        run: (_m, lang) => {
+          const settingsCmd = this.parseSettingsCommand(_m.input as string);
+          // Always non-null here - the route's own pattern is a superset of
+          // parseSettingsCommand's, so a match on one implies a match on the
+          // other. Re-parsing (rather than duplicating its key-mapping logic
+          // inline) keeps that mapping defined in exactly one place.
+          return this.applySettingsCommand(settingsCmd!.key, settingsCmd!.value, lang);
+        },
+      },
+      { pattern: /^\/provider\s+(\S+)/i, run: (m, lang) => this.switchProvider(m[1].toLowerCase(), lang) },
+      { pattern: /^\/provider\b/i, run: (_m, lang) => this.t('providerUsage', lang, this.getEnabledProviders().join(', ')) },
+      { pattern: /^\/(?:list|ls)(?:\s+(all))?\b/i, run: (m, lang) => this.listConversations(lang, Boolean(m[1])) },
+      { pattern: /^\/(?:switch|goto)\s+(\d+)/i, run: (m, lang) => this.switchConversation(Number(m[1]), lang) },
+      { pattern: /^\/status\b/i, run: (_m, lang) => this.statusText(lang) },
+      { pattern: /^\/hist\s+(\d+)\b/i, run: (m, lang) => this.showHistory(Number(m[1]), lang) },
+      { pattern: /^\/hist\b/i, run: (_m, lang) => this.listHistory(lang) },
+      { pattern: /^\/listen\s+(on|off)\b/i, run: (m, lang) => this.setListening(m[1].toLowerCase() === 'on', lang) },
+      { pattern: /^\/listen\b/i, run: (_m, lang) => this.t('listenUsage', lang) },
+      {
+        pattern: /^\/progressive\s+(on|off)\b/i,
+        run: async (m, lang) => {
+          this.data.progressiveReply = m[1].toLowerCase() === 'on';
+          await this.saveData(this.data);
+          return this.t(this.data.progressiveReply ? 'progressiveOn' : 'progressiveOff', lang);
+        },
+      },
+      { pattern: /^\/progressive\b/i, run: (_m, lang) => this.t('progressiveUsage', lang) },
+      {
+        pattern: /^\/new\b/i,
+        run: async (_m, lang) => {
+          this.data.conversationId = null;
+          await this.saveData(this.data);
+          return this.t('newConversationStarted', lang);
+        },
+      },
+    ];
   }
 
   // ---- locale ----
@@ -892,12 +675,12 @@ export default class WeChatBridgePlugin extends Plugin {
     const tab = await this.getOrCreateWeChatTab();
     const view = (this.getClaudianPlugin().getAllViews?.() ?? [])[0] ?? this.findClaudianViewViaWorkspace();
     const tabManager = view?.getTabManager?.();
-    if (!tabManager) throw new Error(pick(STRINGS.noTabManager, lang));
+    if (!tabManager) throw new Error(this.t('noTabManager', lang));
 
     const commands = await tabManager.getSdkCommands(tab.id);
-    if (commands.length === 0) return pick(STRINGS.noClaudeCommands, lang);
+    if (commands.length === 0) return this.t('noClaudeCommands', lang);
 
-    const lines: string[] = [pick(STRINGS.claudeCommandsHeader, lang)];
+    const lines: string[] = [this.t('claudeCommandsHeader', lang)];
     for (const cmd of commands) {
       const hint = cmd.argumentHint ? ` ${cmd.argumentHint}` : '';
       const desc = cmd.description ? ` — ${cmd.description}` : '';
@@ -958,7 +741,7 @@ export default class WeChatBridgePlugin extends Plugin {
 
     const label = lang === 'zh' ? '已设置' : 'OK';
     const providerSuffix = this.getEnabledProviders().length > 1
-      ? `${pick(STRINGS.providerLabel, lang)}${providerId}, `
+      ? `${this.t('providerLabel', lang)}${providerId}, `
       : '';
     return `${label}: ${providerSuffix}${key} -> ${value}`;
   }
@@ -991,7 +774,7 @@ export default class WeChatBridgePlugin extends Plugin {
   private async switchProvider(name: string, lang: Lang): Promise<string> {
     const enabled = this.getEnabledProviders();
     if (!(enabled as string[]).includes(name)) {
-      return pick(STRINGS.providerUnknown, lang)(name, enabled.join(', '));
+      return this.t('providerUnknown', lang, name, enabled.join(', '));
     }
     this.data.providerId = name as ProviderId;
     // A bound conversation's provider can't be changed after the fact
@@ -999,7 +782,7 @@ export default class WeChatBridgePlugin extends Plugin {
     // here always means "start fresh", same as /new.
     this.data.conversationId = null;
     await this.saveData(this.data);
-    return pick(STRINGS.providerSwitched, lang)(name);
+    return this.t('providerSwitched', lang, name);
   }
 
   // ---- conversation list / switch / new ----
@@ -1059,26 +842,26 @@ export default class WeChatBridgePlugin extends Plugin {
     this.data.lastListedIds = metas.map((m) => m.id);
     void this.saveData(this.data);
 
-    if (metas.length === 0) return pick(STRINGS.noConversations, lang);
+    if (metas.length === 0) return this.t('noConversations', lang);
 
     const shown = showAll ? metas : metas.slice(0, LIST_DEFAULT_LIMIT);
     const localeTag = lang === 'zh' ? 'zh-CN' : 'en-US';
     const lines = shown.map((m, i) => {
-      const marker = m.id === this.data.conversationId ? pick(STRINGS.current, lang) : '';
+      const marker = m.id === this.data.conversationId ? this.t('current', lang) : '';
       const when = m.updatedAt ? new Date(m.updatedAt).toLocaleString(localeTag) : '';
-      return `${i + 1}. ${m.title || pick(STRINGS.untitled, lang)}${marker} — ${when}`;
+      return `${i + 1}. ${m.title || this.t('untitled', lang)}${marker} — ${when}`;
     });
     if (!showAll && metas.length > LIST_DEFAULT_LIMIT) {
-      lines.push(pick(STRINGS.listTruncated, lang)(metas.length - LIST_DEFAULT_LIMIT));
+      lines.push(this.t('listTruncated', lang, metas.length - LIST_DEFAULT_LIMIT));
     }
     return lines.join('\n');
   }
 
   private async switchConversation(index: number, lang: Lang): Promise<string> {
     const ids = this.data.lastListedIds;
-    if (ids.length === 0) return pick(STRINGS.switchNeedsListFirst, lang);
+    if (ids.length === 0) return this.t('switchNeedsListFirst', lang);
     const id = ids[index - 1];
-    if (!id) return pick(STRINGS.outOfRange, lang)(ids.length);
+    if (!id) return this.t('outOfRange', lang, ids.length);
 
     this.data.conversationId = id;
     await this.saveData(this.data);
@@ -1088,7 +871,7 @@ export default class WeChatBridgePlugin extends Plugin {
     const tab = await this.getOrCreateWeChatTab();
     const metas = await this.readAllConversationMeta();
     const title = this.titleFor(tab.conversationId, metas);
-    return pick(STRINGS.switchedTo, lang)(title);
+    return this.t('switchedTo', lang, title);
   }
 
   // ---- status: current model / effort / permission / listening ----
@@ -1106,25 +889,25 @@ export default class WeChatBridgePlugin extends Plugin {
     const effort = isActiveInUi ? settings.effortLevel : settings.savedProviderEffort?.[providerId];
     const permission = isActiveInUi ? settings.permissionMode : settings.savedProviderPermissionMode?.[providerId];
 
-    const base = pick(STRINGS.statusTemplate, lang)(
+    const base = this.t('statusTemplate', lang, 
       String(model ?? '?'),
       String(effort ?? '?'),
       String(permission ?? '?'),
     );
     const providerLine = this.getEnabledProviders().length > 1
-      ? `\n${pick(STRINGS.providerLabel, lang)}${providerId}`
+      ? `\n${this.t('providerLabel', lang)}${providerId}`
       : '';
     const listeningWord = this.data.listening
-      ? pick(STRINGS.statusListeningOn, lang)
-      : pick(STRINGS.statusListeningOff, lang);
+      ? this.t('statusListeningOn', lang)
+      : this.t('statusListeningOff', lang);
     const progressiveWord = this.data.progressiveReply
-      ? pick(STRINGS.statusListeningOn, lang)
-      : pick(STRINGS.statusListeningOff, lang);
+      ? this.t('statusListeningOn', lang)
+      : this.t('statusListeningOff', lang);
     // Reuses the same usage lookup real turn replies append - /status just
     // reads it on demand instead of waiting for a turn to trigger it.
     const ctxLine = await this.contextWindowLine(this.data.conversationId, lang);
     const ctxSuffix = ctxLine ? `\n${ctxLine}` : '';
-    return `${base}${providerLine}\n${pick(STRINGS.statusListeningLabel, lang)}${listeningWord}\n${pick(STRINGS.statusProgressiveLabel, lang)}${progressiveWord}${ctxSuffix}`;
+    return `${base}${providerLine}\n${this.t('statusListeningLabel', lang)}${listeningWord}\n${this.t('statusProgressiveLabel', lang)}${progressiveWord}${ctxSuffix}`;
   }
 
   // ---- /listen on|off: mirror desktop-originated turns to WeChat ----
@@ -1157,7 +940,7 @@ export default class WeChatBridgePlugin extends Plugin {
       }
     }
     await this.saveData(this.data);
-    return pick(on ? STRINGS.listenOn : STRINGS.listenOff, lang);
+    return this.t(on ? 'listenOn' : 'listenOff', lang);
   }
 
   /**
@@ -1244,7 +1027,7 @@ export default class WeChatBridgePlugin extends Plugin {
     const title = this.titleFor(tab.conversationId, metas);
     const ctxLine = await this.contextWindowLine(tab.conversationId, lang);
     const body = ctxLine ? `${reply}\n\n${ctxLine}` : reply;
-    this.pendingPushes.push(pick(STRINGS.desktopTurnTemplate, lang)(title, promptMsg.content.trim(), body));
+    this.pendingPushes.push(this.t('desktopTurnTemplate', lang, title, promptMsg.content.trim(), body));
   }
 
   // ---- history: list past turns in the current conversation, and view one reply ----
@@ -1283,7 +1066,7 @@ export default class WeChatBridgePlugin extends Plugin {
     const metas = await this.readAllConversationMeta();
     const usage = metas.find((m) => m.id === conversationId)?.usage;
     if (!usage?.contextTokens || !usage?.contextWindow) return null;
-    return pick(STRINGS.contextWindowLine, lang)(
+    return this.t('contextWindowLine', lang, 
       this.formatK(usage.contextTokens),
       this.formatK(usage.contextWindow),
     );
@@ -1296,9 +1079,9 @@ export default class WeChatBridgePlugin extends Plugin {
     // reuse the local reference instead of re-invoking the getter per index.
     const messages = tab.state.messages;
     const userIndices = this.getUserMessageIndices(messages);
-    if (userIndices.length === 0) return pick(STRINGS.histEmpty, lang);
+    if (userIndices.length === 0) return this.t('histEmpty', lang);
 
-    const lines: string[] = [pick(STRINGS.histHeader, lang)];
+    const lines: string[] = [this.t('histHeader', lang)];
     userIndices.forEach((msgIndex, i) => {
       lines.push(`${i + 1}. ${this.truncate(messages[msgIndex].content, 40)}`);
     });
@@ -1309,10 +1092,10 @@ export default class WeChatBridgePlugin extends Plugin {
     const tab = await this.getOrCreateWeChatTab();
     const messages = tab.state.messages;
     const userIndices = this.getUserMessageIndices(messages);
-    if (userIndices.length === 0) return pick(STRINGS.histEmpty, lang);
+    if (userIndices.length === 0) return this.t('histEmpty', lang);
 
     const msgIndex = userIndices[index - 1];
-    if (msgIndex === undefined) return pick(STRINGS.outOfRange, lang)(userIndices.length);
+    if (msgIndex === undefined) return this.t('outOfRange', lang, userIndices.length);
 
     // Same reply-filtering rule as a live turn: only the assistant's final
     // text is shown, from just after this user message up to the next one.
@@ -1358,7 +1141,7 @@ export default class WeChatBridgePlugin extends Plugin {
     conversationIdAtQueueTime: string | null,
   ): Promise<string> {
     if (!tab.controllers.inputController) {
-      throw new Error(pick(STRINGS.tabNotReady, lang));
+      throw new Error(this.t('tabNotReady', lang));
     }
 
     this.sendingViaBridgeTabIds.add(tab.id);
@@ -1474,7 +1257,7 @@ export default class WeChatBridgePlugin extends Plugin {
       // by the time it arrives it's no longer obvious from context.
       const metas = await this.readAllConversationMeta();
       const title = this.titleFor(tab.conversationId, metas);
-      return pick(STRINGS.switchedAwayTag, lang)(title, text, body);
+      return this.t('switchedAwayTag', lang, title, text, body);
     } finally {
       this.sendingViaBridgeTabIds.delete(tab.id);
     }
@@ -1501,6 +1284,19 @@ export default class WeChatBridgePlugin extends Plugin {
    * user switched away mid-turn), same intent as switchedAwayTag but applied
    * per-chunk since chunks go out individually rather than as one reply.
    */
+  /**
+   * A message's content blocks, or - for providers/messages that never
+   * populate `contentBlocks` - its plain `content` wrapped as a single
+   * synthetic text block. Shared by flushProgressive() and
+   * extractDispatchText(), which both need to walk "whatever blocks this
+   * message actually has" and previously each reimplemented this same
+   * fallback slightly differently.
+   */
+  private blocksOf(msg: ClaudianChatMessage): ContentBlock[] {
+    if (msg.contentBlocks && msg.contentBlocks.length > 0) return msg.contentBlocks;
+    return msg.content.trim() ? [{ type: 'text', content: msg.content }] : [];
+  }
+
   private flushProgressive(tab: ClaudianTab, beforeCount: number, final: boolean, appendSuffix?: string): boolean {
     const cursor = this.progressiveCursors.get(tab.id);
     if (!cursor) return false;
@@ -1527,9 +1323,7 @@ export default class WeChatBridgePlugin extends Plugin {
         cursor.pushedBlocksInCurrent = 0;
         continue;
       }
-      const blocks: ContentBlock[] = msg.contentBlocks && msg.contentBlocks.length > 0
-        ? msg.contentBlocks
-        : (msg.content.trim() ? [{ type: 'text', content: msg.content }] : []);
+      const blocks = this.blocksOf(msg);
       const settledCount = (isLastMessage && !final) ? Math.max(0, blocks.length - 1) : blocks.length;
 
       for (let bi = cursor.pushedBlocksInCurrent; bi < settledCount; bi++) {
@@ -1578,19 +1372,13 @@ export default class WeChatBridgePlugin extends Plugin {
     let sawCompactBoundary = false;
     for (const msg of messages) {
       if (msg.role !== 'assistant') continue;
-      if (msg.contentBlocks && msg.contentBlocks.length > 0) {
-        for (const block of msg.contentBlocks) {
-          if (block.type === 'context_compacted') {
-            sawCompactBoundary = true;
-            continue;
-          }
-          if (block.type !== 'text') continue;
-          const trimmed = block.content.trim();
-          if (trimmed) parts.push(trimmed);
+      for (const block of this.blocksOf(msg)) {
+        if (block.type === 'context_compacted') {
+          sawCompactBoundary = true;
+          continue;
         }
-      } else {
-        // Fallback for providers/messages without structured content blocks.
-        const trimmed = msg.content.trim();
+        if (block.type !== 'text') continue;
+        const trimmed = block.content.trim();
         if (trimmed) parts.push(trimmed);
       }
     }
@@ -1600,8 +1388,8 @@ export default class WeChatBridgePlugin extends Plugin {
     // context_compacted boundary block. Without this check that success case
     // was indistinguishable from a genuinely empty/errored turn, and got the
     // scary "did this fail?" message below even though nothing went wrong.
-    if (sawCompactBoundary) return pick(STRINGS.compactedNoText, lang);
-    return pick(STRINGS.noDispatchText, lang);
+    if (sawCompactBoundary) return this.t('compactedNoText', lang);
+    return this.t('noDispatchText', lang);
   }
 
   // ---- outbound files/images: /files, /getfile, /send ----
@@ -1673,27 +1461,27 @@ export default class WeChatBridgePlugin extends Plugin {
     const tab = await this.getOrCreateWeChatTab();
     const messages = tab.state.messages;
     const userIndices = this.getUserMessageIndices(messages);
-    if (userIndices.length === 0) return pick(STRINGS.histEmpty, lang);
+    if (userIndices.length === 0) return this.t('histEmpty', lang);
 
     const lastTurn = messages.slice(userIndices[userIndices.length - 1] + 1);
     const candidates = this.extractReferencedFiles(lastTurn);
     this.lastReferencedFiles = candidates;
-    if (candidates.length === 0) return pick(STRINGS.filesNone, lang);
+    if (candidates.length === 0) return this.t('filesNone', lang);
 
-    const lines: string[] = [pick(STRINGS.filesHeader, lang)];
+    const lines: string[] = [this.t('filesHeader', lang)];
     candidates.forEach((c, i) => lines.push(`${i + 1}. ${c.display}`));
-    lines.push(pick(STRINGS.getfileUsage, lang));
+    lines.push(this.t('getfileUsage', lang));
     return lines.join('\n');
   }
 
   /** `/getfile <n[,n...]>`: queues one or more files from the last /files list. */
   private async handleGetFileCommand(text: string, lang: Lang): Promise<string> {
     const rest = text.replace(/^\/getfile\s*/i, '').trim();
-    if (!rest) return pick(STRINGS.getfileUsage, lang);
-    if (this.lastReferencedFiles.length === 0) return pick(STRINGS.getfileNeedsListFirst, lang);
+    if (!rest) return this.t('getfileUsage', lang);
+    if (this.lastReferencedFiles.length === 0) return this.t('getfileNeedsListFirst', lang);
 
     const indices = rest.split(',').map((s) => Number(s.trim())).filter((n) => Number.isInteger(n));
-    if (indices.length === 0) return pick(STRINGS.getfileUsage, lang);
+    if (indices.length === 0) return this.t('getfileUsage', lang);
 
     const results: string[] = [];
     for (const idx of indices) {
@@ -1701,7 +1489,7 @@ export default class WeChatBridgePlugin extends Plugin {
       results.push(
         item
           ? await this.queueFileForSend(item.absolutePath, lang)
-          : pick(STRINGS.outOfRange, lang)(this.lastReferencedFiles.length),
+          : this.t('outOfRange', lang, this.lastReferencedFiles.length),
       );
     }
     return results.join('\n');
@@ -1710,12 +1498,12 @@ export default class WeChatBridgePlugin extends Plugin {
   /** `/send <path>`: queues one explicit vault-relative path, no /files list involved. */
   private async handleSendCommand(relativePath: string, lang: Lang): Promise<string> {
     const adapter = this.app.vault.adapter;
-    if (!(adapter instanceof FileSystemAdapter)) throw new Error(pick(STRINGS.noTabManager, lang));
+    if (!(adapter instanceof FileSystemAdapter)) throw new Error(this.t('noTabManager', lang));
     const base = adapter.getBasePath();
     const resolved = path.resolve(base, relativePath);
     const normalizedBase = path.resolve(base);
     if (resolved !== normalizedBase && !resolved.startsWith(normalizedBase + path.sep)) {
-      return pick(STRINGS.pathOutsideVault, lang)(relativePath);
+      return this.t('pathOutsideVault', lang, relativePath);
     }
     return this.queueFileForSend(resolved, lang);
   }
@@ -1733,24 +1521,24 @@ export default class WeChatBridgePlugin extends Plugin {
     try {
       stat = await fs.stat(absolutePath);
     } catch {
-      return pick(STRINGS.fileNotFound, lang)(absolutePath);
+      return this.t('fileNotFound', lang, absolutePath);
     }
-    if (!stat.isFile()) return pick(STRINGS.fileNotFound, lang)(absolutePath);
+    if (!stat.isFile()) return this.t('fileNotFound', lang, absolutePath);
     const fileName = path.basename(absolutePath);
     if (stat.size > FILE_SEND_MAX_BYTES) {
-      return pick(STRINGS.fileTooLarge, lang)(fileName, Math.round(stat.size / (1024 * 1024)));
+      return this.t('fileTooLarge', lang, fileName, Math.round(stat.size / (1024 * 1024)));
     }
     this.pendingFiles.push({ absolutePath, fileName, category: this.classifyFileCategory(fileName) });
-    return pick(STRINGS.queuedForSend, lang)(fileName);
+    return this.t('queuedForSend', lang, fileName);
   }
 
   private async getOrCreateWeChatTab(): Promise<ClaudianTab> {
     const claudian = this.getClaudianPlugin();
     const view = (claudian.getAllViews?.() ?? [])[0] ?? this.findClaudianViewViaWorkspace();
-    if (!view) throw new Error(pick(STRINGS.noViewOpen, this.getLangSafe()));
+    if (!view) throw new Error(this.t('noViewOpen', this.getLangSafe()));
 
     const tabManager = view.getTabManager?.();
-    if (!tabManager) throw new Error(pick(STRINGS.noTabManager, this.getLangSafe()));
+    if (!tabManager) throw new Error(this.t('noTabManager', this.getLangSafe()));
 
     if (this.data.conversationId) {
       const existing = tabManager.getAllTabs().find((t) => t.conversationId === this.data.conversationId);
@@ -1761,7 +1549,7 @@ export default class WeChatBridgePlugin extends Plugin {
       // Tab was closed or conversation was never opened in a tab yet; (re)open it.
       await this.ensureTabCapacity(claudian, tabManager);
       const tab = await tabManager.createTab(this.data.conversationId);
-      if (!tab) throw new Error(pick(STRINGS.tabLimitReached, this.getLangSafe()));
+      if (!tab) throw new Error(this.t('tabLimitReached', this.getLangSafe()));
       this.installInteractiveHooks(tab);
       return tab;
     }
@@ -1776,7 +1564,7 @@ export default class WeChatBridgePlugin extends Plugin {
       undefined,
       this.data.providerId ? { defaultProviderId: this.data.providerId } : undefined,
     );
-    if (!tab) throw new Error(pick(STRINGS.tabLimitReached, this.getLangSafe()));
+    if (!tab) throw new Error(this.t('tabLimitReached', this.getLangSafe()));
     this.installInteractiveHooks(tab);
     return tab;
   }
@@ -1832,12 +1620,12 @@ export default class WeChatBridgePlugin extends Plugin {
     if (questions.length === 0) return null;
 
     const lang = this.getLangSafe();
-    const lines: string[] = [pick(STRINGS.askUserQuestionHeader, lang)];
+    const lines: string[] = [this.t('askUserQuestionHeader', lang)];
     questions.forEach((q, qi) => {
       lines.push(`\n${questions.length > 1 ? `[${qi + 1}] ` : ''}${q.question}`);
       q.options.forEach((o, oi) => lines.push(`  ${oi + 1}. ${o.label}`));
     });
-    lines.push('\n' + pick(questions.length > 1 ? STRINGS.askUserQuestionUsageMulti : STRINGS.askUserQuestionUsageSingle, lang));
+    lines.push('\n' + this.t(questions.length > 1 ? 'askUserQuestionUsageMulti' : 'askUserQuestionUsageSingle', lang));
 
     return new Promise((resolve) => {
       this.pendingInteractive = { kind: 'question', tabId: tab.id, questions, selections: new Map(), resolve };
@@ -1859,28 +1647,28 @@ export default class WeChatBridgePlugin extends Plugin {
       : String(details?.reason ?? title ?? kind);
     return new Promise((resolve) => {
       this.pendingInteractive = { kind: 'approval', tabId: tab.id, title, resolve };
-      this.pendingPushes.push(pick(STRINGS.approvalHeader, lang)(title, desc));
+      this.pendingPushes.push(this.t('approvalHeader', lang, title, desc));
     });
   }
 
   /** Handles `/answer ...`, resolving whatever handleAskUserQuestionHeadless() is currently waiting on. */
   private async handleAnswerCommand(text: string, lang: Lang): Promise<string> {
     const pending = this.pendingInteractive;
-    if (!pending || pending.kind !== 'question') return pick(STRINGS.noPendingQuestion, lang);
+    if (!pending || pending.kind !== 'question') return this.t('noPendingQuestion', lang);
 
     const rest = text.replace(/^\/answer\s*/i, '').trim();
     if (/^cancel$/i.test(rest)) {
       pending.resolve(null);
       this.pendingInteractive = null;
-      return pick(STRINGS.questionCancelled, lang);
+      return this.t('questionCancelled', lang);
     }
-    if (!rest) return pick(STRINGS.answerUsage, lang);
+    if (!rest) return this.t('answerUsage', lang);
 
     let qIndex: number;
     let selectionText: string;
     if (pending.questions.length > 1) {
       const m = rest.match(/^(\d+)\s+(.+)$/);
-      if (!m) return pick(STRINGS.answerUsageMulti, lang);
+      if (!m) return this.t('answerUsageMulti', lang);
       qIndex = Number(m[1]) - 1;
       selectionText = m[2];
     } else {
@@ -1888,7 +1676,7 @@ export default class WeChatBridgePlugin extends Plugin {
       selectionText = rest;
     }
     const q = pending.questions[qIndex];
-    if (!q) return pick(STRINGS.outOfRange, lang)(pending.questions.length);
+    if (!q) return this.t('outOfRange', lang, pending.questions.length);
 
     const set = pending.selections.get(qIndex) ?? new Set<string>();
     const parts = selectionText.split(',').map((s) => s.trim()).filter(Boolean);
@@ -1917,9 +1705,9 @@ export default class WeChatBridgePlugin extends Plugin {
       });
       pending.resolve(result);
       this.pendingInteractive = null;
-      return pick(STRINGS.questionAnswered, lang);
+      return this.t('questionAnswered', lang);
     }
-    return pick(STRINGS.questionPartial, lang)(pending.selections.size, pending.questions.length);
+    return this.t('questionPartial', lang, pending.selections.size, pending.questions.length);
   }
 
   /**
@@ -1935,11 +1723,11 @@ export default class WeChatBridgePlugin extends Plugin {
    */
   private async handleEscCommand(lang: Lang): Promise<string> {
     if (this.sendingViaBridgeTabIds.size === 0) {
-      return pick(STRINGS.escNothingToInterrupt, lang);
+      return this.t('escNothingToInterrupt', lang);
     }
     const view = (this.getClaudianPlugin().getAllViews?.() ?? [])[0] ?? this.findClaudianViewViaWorkspace();
     const tabManager = view?.getTabManager?.();
-    if (!tabManager) throw new Error(pick(STRINGS.noTabManager, lang));
+    if (!tabManager) throw new Error(this.t('noTabManager', lang));
 
     const allTabs = tabManager.getAllTabs();
     let interrupted = false;
@@ -1950,20 +1738,20 @@ export default class WeChatBridgePlugin extends Plugin {
         interrupted = true;
       }
     }
-    return pick(interrupted ? STRINGS.escInterrupted : STRINGS.escNothingToInterrupt, lang);
+    return this.t(interrupted ? 'escInterrupted' : 'escNothingToInterrupt', lang);
   }
 
   /** Handles `/approve accept|always|deny|cancel`, resolving handleApprovalRequestHeadless(). */
   private async handleApproveCommand(text: string, lang: Lang): Promise<string> {
     const pending = this.pendingInteractive;
-    if (!pending || pending.kind !== 'approval') return pick(STRINGS.noPendingApproval, lang);
+    if (!pending || pending.kind !== 'approval') return this.t('noPendingApproval', lang);
     const m = text.match(/^\/approve\s+(accept|always|deny|cancel)\b/i);
-    if (!m) return pick(STRINGS.approveUsage, lang);
+    if (!m) return this.t('approveUsage', lang);
     const word = m[1].toLowerCase();
     const decision = word === 'accept' ? 'accept' : word === 'always' ? 'acceptForSession' : word === 'deny' ? 'decline' : 'cancel';
     pending.resolve(decision as 'accept' | 'acceptForSession' | 'decline' | 'cancel');
     this.pendingInteractive = null;
-    return pick(STRINGS.approvalResolved, lang)(decision);
+    return this.t('approvalResolved', lang, decision);
   }
 
   /**
@@ -1999,7 +1787,7 @@ export default class WeChatBridgePlugin extends Plugin {
 
   private getClaudianPlugin(): ClaudianPluginInstance {
     const plugin = (this.app as any).plugins?.plugins?.[CLAUDIAN_PLUGIN_ID];
-    if (!plugin) throw new Error(pick(STRINGS.pluginNotEnabled, 'en')(CLAUDIAN_PLUGIN_ID));
+    if (!plugin) throw new Error(this.t('pluginNotEnabled', 'en', CLAUDIAN_PLUGIN_ID));
     return plugin as ClaudianPluginInstance;
   }
 }

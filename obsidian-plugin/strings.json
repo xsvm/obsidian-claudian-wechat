@@ -1,0 +1,246 @@
+{
+  "_comment": "Bilingual user-facing text for wechat-bridge, kept out of main.ts so wording can be edited without touching code. Loaded once at plugin startup (see loadStrings() in main.ts). {0}, {1}, ... are positional placeholders substituted by t(key, lang, ...args) in the same order the call site passes them - check main.ts before reordering a template's placeholders.",
+
+  "emptyText": { "zh": "消息内容为空", "en": "Empty text" },
+  "bodyMustBeJson": { "zh": "请求体必须是 JSON: {\"text\": \"...\"}", "en": "Body must be JSON: {\"text\": \"...\"}" },
+  "tabNotReady": {
+    "zh": "Claudian 会话标签页还没准备好（没有 inputController），请稍后重试。",
+    "en": "Claudian tab is not ready yet (no inputController). Retry shortly."
+  },
+  "noViewOpen": {
+    "zh": "没有打开的 Claudian 视图，请先在 Obsidian 里打开一次 Claudian 侧边栏。",
+    "en": "No Claudian view is open. Open the Claudian sidebar once."
+  },
+  "noTabManager": { "zh": "Claudian 的 tab manager 不可用。", "en": "Claudian tab manager not available." },
+  "tabLimitReached": {
+    "zh": "Claudian 标签页已达上限(10个),无法为桥接创建新标签页。请在桌面端关闭一个标签页后重试。",
+    "en": "Claudian has hit its hard tab limit (10) and could not create a tab for the bridge. Close a tab in the desktop UI and try again."
+  },
+  "pluginNotEnabled": {
+    "zh": "Claudian 插件（\"{0}\"）未启用。",
+    "en": "Claudian plugin (\"{0}\") is not enabled."
+  },
+  "noConversations": { "zh": "没有找到任何会话。", "en": "No conversations found." },
+  "listTruncated": {
+    "zh": "... 还有 {0} 个更早的会话未显示，发送 /list all 或 /ls all 查看全部。",
+    "en": "... {0} more older conversation(s) not shown; send /list all or /ls all to see everything."
+  },
+  "untitled": { "zh": "(无标题)", "en": "(untitled)" },
+  "current": { "zh": " (当前)", "en": " (current)" },
+  "switchNeedsListFirst": {
+    "zh": "请先发送 /list 查看会话列表，再用 /switch 序号 切换。",
+    "en": "Send /list first to see the conversation list, then use /switch <number>."
+  },
+  "switchedTo": { "zh": "已切换到: {0}", "en": "Switched to: {0}" },
+  "newConversationStarted": {
+    "zh": "已新建对话，下一条消息将开始一个全新的会话。",
+    "en": "Started a new conversation; the next message will begin fresh."
+  },
+  "noDispatchText": {
+    "zh": "(这一轮没有生成文字回复。Claudian 内部可能报错并回滚了这轮对话——请去 Obsidian 里看一下有没有弹出的提示，或直接重试一次。)",
+    "en": "(No text reply was generated this turn. Claudian may have errored and rolled the turn back — check Obsidian for a notice, or just retry.)"
+  },
+  "compactedNoText": {
+    "zh": "已压缩对话上下文（/compact 执行成功，本身就不会有文字回复）。",
+    "en": "Conversation context was compacted successfully (/compact has no text reply by design)."
+  },
+  "noClaudeCommands": {
+    "zh": "没有发现 Claude 自带的斜杠命令（可能还没打开过一次会话）。",
+    "en": "No Claude slash commands found (a conversation may not have been opened yet)."
+  },
+  "claudeCommandsHeader": {
+    "zh": "Claude 自带的斜杠命令（在这里发送即可直接使用，例如 /compact）:",
+    "en": "Claude's own slash commands (send them directly, e.g. /compact):"
+  },
+  "statusTemplate": {
+    "zh": "当前设置:\n模型: {0}\n思考强度: {1}\n权限模式: {2}",
+    "en": "Current settings:\nModel: {0}\nEffort: {1}\nPermission: {2}"
+  },
+  "histEmpty": {
+    "zh": "当前会话还没有任何消息。",
+    "en": "No messages yet in this conversation."
+  },
+  "histHeader": {
+    "zh": "历史消息（发送 /hist 序号 查看对应回复）:",
+    "en": "Message history (send /hist <number> to view its reply):"
+  },
+  "outOfRange": {
+    "zh": "序号超出范围（1-{0}）。",
+    "en": "Index out of range (1-{0})."
+  },
+  "listenOn": {
+    "zh": "监听已开启（仅对当前对话生效）：在 Claudian 电脑客户端上发的消息也会推送到这里。切换到其他对话后监听不会跟过去。",
+    "en": "Listening enabled (scoped to the current conversation only): messages sent from the Claudian desktop client will also be pushed here. Switching to a different conversation stops it from following."
+  },
+  "listenOff": { "zh": "监听已关闭。", "en": "Listening disabled." },
+  "listenUsage": {
+    "zh": "用法: /listen on 或 /listen off",
+    "en": "Usage: /listen on or /listen off"
+  },
+  "statusListeningLabel": { "zh": "监听: ", "en": "Listening: " },
+  "statusListeningOn": { "zh": "开启", "en": "on" },
+  "statusListeningOff": { "zh": "关闭", "en": "off" },
+  "contextWindowLine": {
+    "zh": "上下文窗口：{0}/{1}",
+    "en": "Context window: {0}/{1}"
+  },
+  "desktopTurnTemplate": {
+    "zh": "对话: {0}\nprompt：{1}\n\n{2}",
+    "en": "Conversation: {0}\nprompt: {1}\n\n{2}"
+  },
+  "providerLabel": { "zh": "供应商: ", "en": "Provider: " },
+  "providerUsage": {
+    "zh": "用法: /provider <名称>\n可用供应商: {0}",
+    "en": "Usage: /provider <name>\nAvailable providers: {0}"
+  },
+  "providerUnknown": {
+    "zh": "不认识的供应商 \"{0}\"。可用供应商: {1}",
+    "en": "Unknown provider \"{0}\". Available providers: {1}"
+  },
+  "providerSwitched": {
+    "zh": "已切换到供应商: {0}。下一条消息将在这个供应商上开始一个全新的对话。",
+    "en": "Switched to provider: {0}. The next message will start a brand-new conversation on it."
+  },
+  "askUserQuestionHeader": {
+    "zh": "Claudian 有问题想问你：",
+    "en": "Claudian is asking you something:"
+  },
+  "askUserQuestionUsageSingle": {
+    "zh": "回复 /answer 序号（如 /answer 2，多选用逗号分隔如 /answer 1,3）或 /answer 你的文字回答；/answer cancel 取消。",
+    "en": "Reply /answer <number> (e.g. /answer 2; comma-separate for multi-select like /answer 1,3), or /answer <free text>. /answer cancel to cancel."
+  },
+  "askUserQuestionUsageMulti": {
+    "zh": "回复 /answer 题号 选项（如 /answer 1 2，多选逗号分隔），每题回复一次，答完自动提交；/answer cancel 取消。",
+    "en": "Reply /answer <question#> <option#> (e.g. /answer 1 2; comma-separate for multi-select) once per question - submits automatically once all are answered. /answer cancel to cancel."
+  },
+  "answerUsage": { "zh": "用法: /answer <序号|文字>，或 /answer cancel", "en": "Usage: /answer <number|text>, or /answer cancel" },
+  "answerUsageMulti": {
+    "zh": "有多道题，请用 /answer 题号 选项 的格式，如 /answer 1 2。",
+    "en": "Multiple questions pending - use /answer <question#> <option#>, e.g. /answer 1 2."
+  },
+  "noPendingQuestion": { "zh": "当前没有待回答的问题。", "en": "No question is currently pending." },
+  "questionCancelled": { "zh": "已取消该问题。", "en": "Question cancelled." },
+  "questionAnswered": { "zh": "已提交回答，Claudian 将继续处理。", "en": "Answer submitted; Claudian will continue." },
+  "questionPartial": {
+    "zh": "已记录 ({0}/{1})，请继续回答剩余问题。",
+    "en": "Recorded ({0}/{1}) - keep answering the remaining questions."
+  },
+  "approvalHeader": {
+    "zh": "Claudian 请求权限:\n{0}\n{1}\n\n回复 /approve accept（仅本次）、/approve always（本次会话内始终允许）、/approve deny（拒绝）或 /approve cancel（取消本轮）。",
+    "en": "Claudian is requesting approval:\n{0}\n{1}\n\nReply /approve accept (just once), /approve always (allow for this session), /approve deny, or /approve cancel."
+  },
+  "approveUsage": { "zh": "用法: /approve accept|always|deny|cancel", "en": "Usage: /approve accept|always|deny|cancel" },
+  "noPendingApproval": { "zh": "当前没有待处理的权限请求。", "en": "No approval request is currently pending." },
+  "approvalResolved": {
+    "zh": "已提交: {0}",
+    "en": "Submitted: {0}"
+  },
+  "progressiveOn": {
+    "zh": "渐进式回复已开启（全局生效，所有对话）：Claudian 每说完一段就会单独推送一条，不再等整轮结束才一次性回复。",
+    "en": "Progressive replies enabled (global, applies to every conversation): each finished chunk is pushed as its own message instead of waiting for the whole turn."
+  },
+  "progressiveOff": { "zh": "渐进式回复已关闭，恢复为整轮结束后一次性回复。", "en": "Progressive replies disabled; back to one reply per turn." },
+  "progressiveUsage": { "zh": "用法: /progressive on 或 /progressive off", "en": "Usage: /progressive on or /progressive off" },
+  "statusProgressiveLabel": { "zh": "渐进式回复: ", "en": "Progressive replies: " },
+  "switchedAwayTag": {
+    "zh": "[来自其他对话] {0}\nprompt：{1}\n\n{2}",
+    "en": "[From another conversation] {0}\nprompt: {1}\n\n{2}"
+  },
+  "escInterrupted": {
+    "zh": "已发送中断请求，已生成的内容会照常回复过来。",
+    "en": "Interrupt requested; whatever was already generated will still be sent back as usual."
+  },
+  "escNothingToInterrupt": {
+    "zh": "当前没有正在进行的回复可以打断。",
+    "en": "Nothing is currently generating to interrupt."
+  },
+  "filesHeader": {
+    "zh": "最近一轮回复中涉及的文件:",
+    "en": "Files referenced in the most recent turn:"
+  },
+  "filesNone": {
+    "zh": "最近一轮回复没有发现可识别的文件（没有双链引用，也没有涉及文件的工具调用）。",
+    "en": "No recognizable files in the most recent turn (no wikilinks, and no tool calls that touched a file)."
+  },
+  "getfileUsage": {
+    "zh": "发送 /getfile 序号 获取对应文件，多个用逗号分隔，如 /getfile 1,2",
+    "en": "Send /getfile <number> to fetch a file, comma-separate for several, e.g. /getfile 1,2"
+  },
+  "getfileNeedsListFirst": {
+    "zh": "请先发送 /files 查看这一轮涉及的文件，再用 /getfile 序号 获取。",
+    "en": "Send /files first to see this turn's files, then use /getfile <number>."
+  },
+  "queuedForSend": {
+    "zh": "已加入发送队列: {0}",
+    "en": "Queued for sending: {0}"
+  },
+  "fileNotFound": {
+    "zh": "文件不存在或不可读: {0}",
+    "en": "File not found or unreadable: {0}"
+  },
+  "fileTooLarge": {
+    "zh": "文件过大（约 {1}MB，超过上限），未发送: {0}",
+    "en": "File too large (~{1}MB, over the limit) - not sent: {0}"
+  },
+  "sendUsage": {
+    "zh": "用法: /send <vault内的相对路径>，如 /send attachments/report.pdf",
+    "en": "Usage: /send <path relative to the vault>, e.g. /send attachments/report.pdf"
+  },
+  "pathOutsideVault": {
+    "zh": "路径必须在 vault 内: {0}",
+    "en": "Path must stay inside the vault: {0}"
+  },
+
+  "help": {
+    "zh": [
+      "本插件命令:",
+      "/help — 显示本帮助",
+      "/list 或 /ls — 列出最近 10 个历史会话（编号、标题、更新时间）",
+      "/list all 或 /ls all — 列出全部历史会话，不限制数量",
+      "/switch N 或 /goto N — 切换到 /list 中第 N 个会话",
+      "/new — 新建一个全新对话（不影响其他历史会话）",
+      "/status — 查看当前模型、思考强度、权限模式、监听状态",
+      "/hist — 按序号列出当前对话你发过的消息",
+      "/hist N — 查看第 N 条消息对应的回复",
+      "/listen on 或 /listen off — 开关监听：开启后，电脑客户端上发的消息也会推送到这里",
+      "/answer — 回答 Claudian 反向提出的问题（AskUserQuestion），收到推送后按提示格式回复",
+      "/approve accept|always|deny|cancel — 回应 Claudian 的权限请求，收到推送后使用",
+      "/progressive on 或 /progressive off — 开关渐进式回复（全局）：开启后每说完一段就单独推送，不等整轮结束",
+      "/esc — 打断 Claudian 正在进行的回复（等同电脑客户端的 Stop），已生成的内容仍会照常回复",
+      "/files — 列出最近一轮回复涉及的文件（双链引用 + 实际操作过的文件），配合 /getfile 使用",
+      "/getfile 序号 — 获取 /files 列出的文件并发送过来，多个用逗号分隔，如 /getfile 1,2",
+      "/send <路径> — 直接发送 vault 内某个文件（相对路径），不需要先 /files",
+      "/model <名称> — 切换模型，如 /model opus、/model sonnet",
+      "/effort <等级> — 切换思考强度，如 /effort low、/effort high",
+      "/permission <模式> — 切换权限模式，如 /permission yolo、/permission default",
+      "?/provider <名称> — 切换供应商（会开始一个新对话），发送 /provider 查看可选项",
+      "/commands — 查看 Claude 自带的斜杠命令（跟上面这些是两回事）",
+      "其他任何文字 — 作为普通消息发给 Claudian（Claude 自带的斜杠命令也直接这样发送即可）"
+    ],
+    "en": [
+      "Bridge commands:",
+      "/help — show this help",
+      "/list or /ls — list the 10 most recent conversations (number, title, updated time)",
+      "/list all or /ls all — list every conversation, no limit",
+      "/switch N or /goto N — switch to conversation number N from /list",
+      "/new — start a brand-new conversation (existing ones are untouched)",
+      "/status — show the current model, effort level, permission mode, and listening state",
+      "/hist — list your messages in the current conversation, numbered",
+      "/hist N — show the reply to message number N",
+      "/listen on or /listen off — toggle listening: when on, messages sent from the desktop client are pushed here too",
+      "/answer — answer a question Claudian asked back (AskUserQuestion); reply in the format shown in the push notification",
+      "/approve accept|always|deny|cancel — respond to a Claudian approval request; use after a push notification",
+      "/progressive on or /progressive off — toggle progressive replies (global): when on, each finished chunk is pushed separately instead of waiting for the whole turn",
+      "/esc — interrupt whatever Claudian is currently generating (same as Stop on the desktop client); whatever was already generated is still sent back",
+      "/files — list files referenced in the most recent turn (wikilinks + files actually touched by tool calls), use with /getfile",
+      "/getfile <number> — fetch a file listed by /files and send it to you, comma-separate for several, e.g. /getfile 1,2",
+      "/send <path> — send a specific file from the vault directly (relative path), no need to run /files first",
+      "/model <name> — switch model, e.g. /model opus, /model sonnet",
+      "/effort <level> — switch effort level, e.g. /effort low, /effort high",
+      "/permission <mode> — switch permission mode, e.g. /permission yolo, /permission default",
+      "?/provider <name> — switch provider (starts a new conversation); send /provider alone to see options",
+      "/commands — list Claude's own slash commands (separate from the bridge commands above)",
+      "anything else — sent to Claudian as a normal message (this is also how you use Claude's own slash commands themselves)"
+    ]
+  }
+}
