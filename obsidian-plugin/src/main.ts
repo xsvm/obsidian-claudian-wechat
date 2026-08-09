@@ -198,6 +198,7 @@ interface ClaudianTab {
 
 interface ClaudianTabManager {
   getAllTabs(): ClaudianTab[];
+  getTab?(tabId: string): ClaudianTab | null;
   /**
    * `options.defaultProviderId`, for a brand-new blank tab (no conversationId),
    * makes Claudian pick that provider's own saved default model
@@ -219,6 +220,19 @@ interface ClaudianPluginInstance {
   settings: Record<string, any>;
   mutateSettings(mutation: (settings: Record<string, any>) => void): Promise<void>;
   getAllViews?(): ClaudianView[];
+  /**
+   * Added in Claudian's dual-pane release (2.1.0+): `getAllViews()` can now
+   * return more than one view (one per pane), each with its own independent
+   * tab manager/tab set. Before dual-pane, `getOrCreateWeChatTab` picking
+   * `getAllViews()[0]` and searching only its tab manager was safe because
+   * there was only ever one view. Now, if the bridge's bound conversation's
+   * tab happens to live in a *different* pane's view, that search would miss
+   * it and spawn a duplicate tab instead of reusing the real one. Claudian
+   * itself ships this helper to search every view's tab manager in one call
+   * - prefer it over reimplementing the same loop, and fall back to the old
+   * single-view behavior only if an older Claudian build doesn't have it.
+   */
+  findConversationAcrossViews?(conversationId: string): { view: ClaudianView; tabId: string } | null;
 }
 
 /** One question from an AskUserQuestion tool_use, normalized from the raw
@@ -683,7 +697,14 @@ export default class WeChatBridgePlugin extends Plugin {
 
   private async listClaudeCommands(lang: Lang): Promise<string> {
     const tab = await this.getOrCreateWeChatTab();
-    const view = (this.getClaudianPlugin().getAllViews?.() ?? [])[0] ?? this.findClaudianViewViaWorkspace();
+    // Must resolve the tab manager that actually owns `tab` - with dual-pane
+    // (2.1.0+) that isn't necessarily getAllViews()[0] (see the same concern
+    // in getOrCreateWeChatTab). getSdkCommands(tab.id) against the wrong
+    // pane's tab manager would look up an id it's never seen.
+    const found = this.data.conversationId
+      ? this.getClaudianPlugin().findConversationAcrossViews?.(this.data.conversationId)
+      : null;
+    const view = found?.view ?? (this.getClaudianPlugin().getAllViews?.() ?? [])[0] ?? this.findClaudianViewViaWorkspace();
     const tabManager = view?.getTabManager?.();
     if (!tabManager) throw new Error(this.t('noTabManager', lang));
 
@@ -1552,7 +1573,16 @@ export default class WeChatBridgePlugin extends Plugin {
     if (!tabManager) throw new Error(this.t('noTabManager', this.getLangSafe()));
 
     if (this.data.conversationId) {
-      const existing = tabManager.getAllTabs().find((t) => t.conversationId === this.data.conversationId);
+      // Dual-pane (Claudian 2.1.0+) can open more than one view (one per
+      // pane), each with its own tab manager - the bound conversation's tab
+      // may live in a pane other than the first one. Search across every
+      // view via Claudian's own findConversationAcrossViews when available;
+      // only fall back to the single-view lookup below on older builds that
+      // predate dual-pane (and thus never have more than one view anyway).
+      const found = claudian.findConversationAcrossViews?.(this.data.conversationId);
+      const foundTabManager = found ? found.view.getTabManager?.() : null;
+      const existing = foundTabManager?.getTab?.(found!.tabId)
+        ?? tabManager.getAllTabs().find((t) => t.conversationId === this.data.conversationId);
       if (existing) {
         this.installInteractiveHooks(existing);
         return existing;
@@ -1736,11 +1766,17 @@ export default class WeChatBridgePlugin extends Plugin {
     if (this.sendingViaBridgeTabIds.size === 0) {
       return this.t('escNothingToInterrupt', lang);
     }
-    const view = (this.getClaudianPlugin().getAllViews?.() ?? [])[0] ?? this.findClaudianViewViaWorkspace();
-    const tabManager = view?.getTabManager?.();
-    if (!tabManager) throw new Error(this.t('noTabManager', lang));
+    // The tab this command needs to interrupt can live in any pane's tab
+    // manager (dual-pane, 2.1.0+) - collect all views' tabs, not just
+    // getAllViews()[0]'s, or a genuinely in-flight turn in another pane gets
+    // silently reported as "nothing to interrupt".
+    const views = this.getClaudianPlugin().getAllViews?.() ?? [];
+    const fallbackView = views[0] ?? this.findClaudianViewViaWorkspace();
+    if (views.length === 0 && !fallbackView) throw new Error(this.t('noTabManager', lang));
+    const tabManagers = (views.length > 0 ? views : [fallbackView!]).map((v) => v.getTabManager?.()).filter((tm): tm is ClaudianTabManager => !!tm);
+    if (tabManagers.length === 0) throw new Error(this.t('noTabManager', lang));
 
-    const allTabs = tabManager.getAllTabs();
+    const allTabs = tabManagers.flatMap((tm) => tm.getAllTabs());
     let interrupted = false;
     for (const tabId of this.sendingViaBridgeTabIds) {
       const tab = allTabs.find((t) => t.id === tabId);
