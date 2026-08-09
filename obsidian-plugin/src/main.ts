@@ -252,9 +252,19 @@ type PendingInteractive =
 interface ConversationMeta {
   id: string;
   title?: string;
-  updatedAt?: number;
+  // Claudian 2.0.x writes `lastActivityAt` (and `createdAt`), not
+  // `updatedAt` - there is no `updatedAt` field in real meta.json files.
+  // Kept both here so a future Claudian rename doesn't silently break
+  // sorting again: sortKey() below tries each in order and falls back to 0
+  // (never throws on an unfamiliar shape).
+  lastActivityAt?: number;
+  createdAt?: number;
   providerId?: string;
   usage?: { contextTokens?: number; contextWindow?: number };
+}
+
+function conversationSortKey(m: ConversationMeta): number {
+  return m.lastActivityAt ?? m.createdAt ?? 0;
 }
 
 // ---- i18n ----
@@ -829,7 +839,7 @@ export default class WeChatBridgePlugin extends Plugin {
         // skip unreadable/corrupt meta file
       }
     }
-    metas.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
+    metas.sort((a, b) => conversationSortKey(b) - conversationSortKey(a));
     this.metaCache = { at: Date.now(), metas };
     return metas;
   }
@@ -848,7 +858,8 @@ export default class WeChatBridgePlugin extends Plugin {
     const localeTag = lang === 'zh' ? 'zh-CN' : 'en-US';
     const lines = shown.map((m, i) => {
       const marker = m.id === this.data.conversationId ? this.t('current', lang) : '';
-      const when = m.updatedAt ? new Date(m.updatedAt).toLocaleString(localeTag) : '';
+      const key = conversationSortKey(m);
+      const when = key ? new Date(key).toLocaleString(localeTag) : '';
       return `${i + 1}. ${m.title || this.t('untitled', lang)}${marker} — ${when}`;
     });
     if (!showAll && metas.length > LIST_DEFAULT_LIMIT) {
