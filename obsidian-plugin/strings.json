@@ -88,6 +88,10 @@
     "zh": "对话: {0}\nprompt：{1}\n\n{2}",
     "en": "Conversation: {0}\nprompt: {1}\n\n{2}"
   },
+  "desktopAutoTurnTemplate": {
+    "zh": "对话: {0}\n（自动触发，无用户消息，如定时唤醒/后台继续）\n\n{1}",
+    "en": "Conversation: {0}\n(auto-triggered, no user message - e.g. a scheduled wakeup or background continuation)\n\n{1}"
+  },
   "providerLabel": { "zh": "供应商: ", "en": "Provider: " },
   "providerUsage": {
     "zh": "用法: /provider <名称>\n可用供应商: {0}",

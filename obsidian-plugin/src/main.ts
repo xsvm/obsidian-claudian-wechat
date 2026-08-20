@@ -1123,16 +1123,40 @@ export default class WeChatBridgePlugin extends Plugin {
     this.data.lastSeenMessageCount = messages.length;
     void this.saveData(this.data);
 
+    // A typed-in-desktop turn always has a `user` message in the growth; a
+    // turn Claudian ran on its own initiative (a scheduled/cron wakeup
+    // resuming this same conversation, an autonomous continuation, etc.)
+    // does not - it's pure assistant output appended without anything the
+    // bridge would recognize as a prompt. This used to be treated as "no new
+    // turn, discard" (comment: "Pure assistant-only growth (e.g. a resumed
+    // stream); nothing new to report"), which was really working around a
+    // *different* bug: before onunload() flushed data.json on every plugin
+    // reload (see that fix), a reload could leave lastSeenMessageCount stale
+    // on disk, and Claudian reloading/re-populating its own message array
+    // afterward would look exactly like "assistant-only growth" even though
+    // nothing new had actually happened - discarding it was the safe
+    // default. Now that staleness is fixed at the source, the only thing
+    // still reaching this branch in practice is a genuine no-prompt turn,
+    // and silently dropping it is a real gap, not a safety net: a scheduled
+    // wakeup that fires a reply is exactly the kind of thing /listen exists
+    // to mirror, and confirmed via user report as arriving in Claudian but
+    // never reaching WeChat. Gate on whether there's real text to report
+    // instead of on the presence of a prompt.
     const promptMsg = newMessages.find((m) => m.role === 'user');
-    if (!promptMsg) return; // Pure assistant-only growth (e.g. a resumed stream); nothing new to report.
 
     const lang = this.getLangSafe();
     const reply = this.extractDispatchText(newMessages, lang);
+    if (!reply.trim()) return; // Genuinely nothing new (e.g. a compact boundary with no narrative text) - see extractDispatchText.
+
     const metas = await this.readAllConversationMeta();
     const title = this.titleFor(tab.conversationId, metas);
     const ctxLine = await this.contextWindowLine(tab.conversationId, lang);
     const body = ctxLine ? `${reply}\n\n${ctxLine}` : reply;
-    this.pendingPushes.push(this.t('desktopTurnTemplate', lang, title, promptMsg.content.trim(), body));
+    this.pendingPushes.push(
+      promptMsg
+        ? this.t('desktopTurnTemplate', lang, title, promptMsg.content.trim(), body)
+        : this.t('desktopAutoTurnTemplate', lang, title, body),
+    );
   }
 
   // ---- history: list past turns in the current conversation, and view one reply ----
