@@ -65,6 +65,22 @@ interface PendingFileItem {
   category: 'image' | 'video' | 'file';
 }
 
+/**
+ * A /schedule entry: a plain text reminder pushed straight to WeChat via
+ * pendingPushes (same drain path as /listen mirrors and progressive-reply
+ * chunks) when it comes due - it never touches Claudian/sendChatMessageQueued,
+ * it's a local alarm clock, not an AI turn. `nextFireAt` is always the next
+ * (or only, for one-shot) fire time in epoch ms; `repeat` describes how to
+ * recompute it after firing, or is null for a one-shot entry that gets
+ * removed from `scheduledSends` once it fires.
+ */
+interface ScheduledSend {
+  id: string;
+  text: string;
+  nextFireAt: number;
+  repeat: null | { type: 'daily'; hour: number; minute: number };
+}
+
 interface BridgeData {
   conversationId: string | null;
   /** conversation ids in the order shown by the last /list, for /switch N to index into. */
@@ -99,6 +115,8 @@ interface BridgeData {
    * instead of buffering the whole turn and replying once at the end.
    */
   progressiveReply: boolean;
+  /** /schedule entries, checked once per LISTEN_POLL_INTERVAL_MS tick (see checkScheduledSends). */
+  scheduledSends: ScheduledSend[];
 }
 
 // ---- Minimal shape of the parts of Claudian we reach into at runtime. ----
@@ -304,6 +322,7 @@ const DEFAULT_DATA: BridgeData = {
   lastSeenMessageCount: 0,
   providerId: null,
   progressiveReply: false,
+  scheduledSends: [],
 };
 
 const LISTEN_POLL_INTERVAL_MS = 3000;
@@ -402,6 +421,7 @@ export default class WeChatBridgePlugin extends Plugin {
     await this.startServer();
 
     this.registerInterval(window.setInterval(() => this.checkForDesktopActivity(), LISTEN_POLL_INTERVAL_MS));
+    this.registerInterval(window.setInterval(() => this.checkScheduledSends(), LISTEN_POLL_INTERVAL_MS));
 
     // Owns the whole "get connected" path so installing this plugin is enough
     // on its own: private Python env, one-time QR login, and the relay
@@ -640,6 +660,8 @@ export default class WeChatBridgePlugin extends Plugin {
       { pattern: /^\/getfile\b/i, run: (m, lang) => this.handleGetFileCommand(m.input as string, lang) },
       { pattern: /^\/send\s+(\S.*)$/i, run: (m, lang) => this.handleSendCommand(m[1].trim(), lang) },
       { pattern: /^\/send\b/i, run: (_m, lang) => this.t('sendUsage', lang) },
+      { pattern: /^\/schedule\s+(\S.*)$/i, run: (m, lang) => this.handleScheduleCommand(m[1].trim(), lang) },
+      { pattern: /^\/schedule\b/i, run: (_m, lang) => this.t('scheduleUsage', lang) },
       { pattern: /^\/help\b/i, run: (_m, lang) => this.buildHelpText(lang, this.getEnabledProviders().length > 1) },
       { pattern: /^\/commands\b/i, run: (_m, lang) => this.listClaudeCommands(lang) },
       {
@@ -973,6 +995,39 @@ export default class WeChatBridgePlugin extends Plugin {
     }
     await this.saveData(this.data);
     return this.t(on ? 'listenOn' : 'listenOff', lang);
+  }
+
+  /**
+   * Runs on a timer (same cadence as checkForDesktopActivity). Fires any
+   * /schedule entry whose nextFireAt has passed: pushes its text straight to
+   * pendingPushes (drained by relay.py's next /pending poll, same as every
+   * other proactive push in this file) and either removes it (one-shot) or
+   * rolls nextFireAt forward by its repeat rule (recurring) so it fires again
+   * next time around. Deliberately does not touch Claudian/sendChatMessage at
+   * all - a scheduled send is a local alarm, not an AI turn.
+   */
+  private async checkScheduledSends(): Promise<void> {
+    if (this.data.scheduledSends.length === 0) return;
+    const now = Date.now();
+    const due = this.data.scheduledSends.filter((s) => s.nextFireAt <= now);
+    if (due.length === 0) return;
+
+    let changed = false;
+    for (const entry of due) {
+      this.pendingPushes.push(entry.text);
+      if (entry.repeat?.type === 'daily') {
+        // Roll forward a whole number of days from the missed slot (not just
+        // "+1 day from now") so a brief Obsidian outage across the fire time
+        // doesn't drift the daily time of day.
+        let next = entry.nextFireAt;
+        while (next <= now) next += 24 * 60 * 60 * 1000;
+        entry.nextFireAt = next;
+      } else {
+        this.data.scheduledSends = this.data.scheduledSends.filter((s) => s.id !== entry.id);
+      }
+      changed = true;
+    }
+    if (changed) await this.saveData(this.data);
   }
 
   /**
@@ -1538,6 +1593,96 @@ export default class WeChatBridgePlugin extends Plugin {
       return this.t('pathOutsideVault', lang, relativePath);
     }
     return this.queueFileForSend(resolved, lang);
+  }
+
+  // ---- /schedule: local reminders pushed straight to WeChat, no Claudian turn involved ----
+
+  /**
+   * `/schedule` dispatcher. Recognized forms:
+   *   /schedule list
+   *   /schedule cancel <n>                     - n is the 1-based index from /schedule list
+   *   /schedule daily HH:MM <text>              - recurring, fires every day at HH:MM local time
+   *   /schedule HH:MM <text>                    - one-shot, next HH:MM (today if not passed yet, else tomorrow)
+   *   /schedule YYYY-MM-DD HH:MM <text>          - one-shot, a specific date/time
+   */
+  private async handleScheduleCommand(rest: string, lang: Lang): Promise<string> {
+    if (/^list\b/i.test(rest)) return this.listScheduledSends(lang);
+
+    const cancelMatch = rest.match(/^cancel\s+(\d+)\b/i);
+    if (cancelMatch) return this.cancelScheduledSend(Number(cancelMatch[1]), lang);
+
+    const dailyMatch = rest.match(/^daily\s+(\d{1,2}):(\d{2})\s+(\S.*)$/i);
+    if (dailyMatch) {
+      const hour = Number(dailyMatch[1]);
+      const minute = Number(dailyMatch[2]);
+      const text = dailyMatch[3].trim();
+      if (hour > 23 || minute > 59) return this.t('scheduleBadTime', lang);
+      const nextFireAt = this.nextDailyFireAt(hour, minute);
+      return this.addScheduledSend({ id: this.newScheduleId(), text, nextFireAt, repeat: { type: 'daily', hour, minute } }, lang);
+    }
+
+    const dateMatch = rest.match(/^(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2})\s+(\S.*)$/);
+    if (dateMatch) {
+      const [, dateStr, hStr, mStr, text] = dateMatch;
+      const [y, mo, d] = dateStr.split('-').map(Number);
+      const hour = Number(hStr);
+      const minute = Number(mStr);
+      if (hour > 23 || minute > 59) return this.t('scheduleBadTime', lang);
+      const fireAt = new Date(y, mo - 1, d, hour, minute, 0, 0).getTime();
+      if (!Number.isFinite(fireAt) || fireAt <= Date.now()) return this.t('scheduleInPast', lang);
+      return this.addScheduledSend({ id: this.newScheduleId(), text: text.trim(), nextFireAt: fireAt, repeat: null }, lang);
+    }
+
+    const onceMatch = rest.match(/^(\d{1,2}):(\d{2})\s+(\S.*)$/);
+    if (onceMatch) {
+      const hour = Number(onceMatch[1]);
+      const minute = Number(onceMatch[2]);
+      const text = onceMatch[3].trim();
+      if (hour > 23 || minute > 59) return this.t('scheduleBadTime', lang);
+      return this.addScheduledSend({ id: this.newScheduleId(), text, nextFireAt: this.nextDailyFireAt(hour, minute), repeat: null }, lang);
+    }
+
+    return this.t('scheduleUsage', lang);
+  }
+
+  /** Next occurrence of HH:MM local time - today if it hasn't passed yet this tick, otherwise tomorrow. */
+  private nextDailyFireAt(hour: number, minute: number): number {
+    const now = new Date();
+    const candidate = new Date(now.getFullYear(), now.getMonth(), now.getDate(), hour, minute, 0, 0);
+    if (candidate.getTime() <= now.getTime()) candidate.setDate(candidate.getDate() + 1);
+    return candidate.getTime();
+  }
+
+  private newScheduleId(): string {
+    return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+  }
+
+  private async addScheduledSend(entry: ScheduledSend, lang: Lang): Promise<string> {
+    this.data.scheduledSends.push(entry);
+    this.data.scheduledSends.sort((a, b) => a.nextFireAt - b.nextFireAt);
+    await this.saveData(this.data);
+    const when = new Date(entry.nextFireAt).toLocaleString(lang === 'zh' ? 'zh-CN' : 'en-US');
+    return this.t(entry.repeat ? 'scheduleAddedDaily' : 'scheduleAddedOnce', lang, when, entry.text);
+  }
+
+  private listScheduledSends(lang: Lang): string {
+    if (this.data.scheduledSends.length === 0) return this.t('scheduleNone', lang);
+    const localeTag = lang === 'zh' ? 'zh-CN' : 'en-US';
+    const lines: string[] = [this.t('scheduleListHeader', lang)];
+    this.data.scheduledSends.forEach((s, i) => {
+      const when = new Date(s.nextFireAt).toLocaleString(localeTag);
+      const tag = s.repeat ? this.t('scheduleDailyTag', lang) : '';
+      lines.push(`${i + 1}. [${when}]${tag} ${s.text}`);
+    });
+    return lines.join('\n');
+  }
+
+  private async cancelScheduledSend(index: number, lang: Lang): Promise<string> {
+    const entry = this.data.scheduledSends[index - 1];
+    if (!entry) return this.t('outOfRange', lang, this.data.scheduledSends.length);
+    this.data.scheduledSends = this.data.scheduledSends.filter((s) => s.id !== entry.id);
+    await this.saveData(this.data);
+    return this.t('scheduleCancelled', lang, entry.text);
   }
 
   private classifyFileCategory(fileName: string): PendingFileItem['category'] {

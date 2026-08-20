@@ -190,6 +190,42 @@
     "zh": "路径必须在 vault 内: {0}",
     "en": "Path must stay inside the vault: {0}"
   },
+  "scheduleUsage": {
+    "zh": "用法:\n/schedule HH:MM 内容 — 一次性，今天没过就今天，过了就明天\n/schedule YYYY-MM-DD HH:MM 内容 — 一次性，指定日期\n/schedule daily HH:MM 内容 — 每天重复\n/schedule list — 查看所有定时\n/schedule cancel 序号 — 取消",
+    "en": "Usage:\n/schedule HH:MM text — one-shot, today if not passed yet, else tomorrow\n/schedule YYYY-MM-DD HH:MM text — one-shot, specific date\n/schedule daily HH:MM text — repeats every day\n/schedule list — show all scheduled sends\n/schedule cancel N — cancel one"
+  },
+  "scheduleBadTime": {
+    "zh": "时间格式不对，小时 0-23，分钟 0-59。",
+    "en": "Bad time - hour must be 0-23, minute 0-59."
+  },
+  "scheduleInPast": {
+    "zh": "这个时间已经过去了，请换一个将来的时间。",
+    "en": "That time is already in the past - pick a future one."
+  },
+  "scheduleAddedOnce": {
+    "zh": "已设置定时提醒（{0}）：{1}",
+    "en": "Scheduled a one-time reminder for {0}: {1}"
+  },
+  "scheduleAddedDaily": {
+    "zh": "已设置每日定时提醒（每天 {0} 起）：{1}",
+    "en": "Scheduled a daily reminder starting {0}: {1}"
+  },
+  "scheduleNone": {
+    "zh": "目前没有任何定时提醒。",
+    "en": "No scheduled reminders right now."
+  },
+  "scheduleListHeader": {
+    "zh": "定时提醒列表:",
+    "en": "Scheduled reminders:"
+  },
+  "scheduleDailyTag": {
+    "zh": "（每天）",
+    "en": " (daily)"
+  },
+  "scheduleCancelled": {
+    "zh": "已取消定时提醒：{0}",
+    "en": "Cancelled reminder: {0}"
+  },
 
   "help": {
     "zh": [
@@ -210,6 +246,7 @@
       "/files — 列出最近一轮回复涉及的文件（双链引用 + 实际操作过的文件），配合 /getfile 使用",
       "/getfile 序号 — 获取 /files 列出的文件并发送过来，多个用逗号分隔，如 /getfile 1,2",
       "/send <路径> — 直接发送 vault 内某个文件（相对路径），不需要先 /files",
+      "/schedule HH:MM 内容 / daily HH:MM 内容 / YYYY-MM-DD HH:MM 内容 — 定时推送一条提醒文字到微信（不经过 Claudian 对话），/schedule list 查看、/schedule cancel 序号 取消",
       "/model <名称> — 切换模型，如 /model opus、/model sonnet",
       "/effort <等级> — 切换思考强度，如 /effort low、/effort high",
       "/permission <模式> — 切换权限模式，如 /permission yolo、/permission default",
@@ -235,6 +272,7 @@
       "/files — list files referenced in the most recent turn (wikilinks + files actually touched by tool calls), use with /getfile",
       "/getfile <number> — fetch a file listed by /files and send it to you, comma-separate for several, e.g. /getfile 1,2",
       "/send <path> — send a specific file from the vault directly (relative path), no need to run /files first",
+      "/schedule HH:MM text / daily HH:MM text / YYYY-MM-DD HH:MM text — push a reminder to WeChat at a future time (doesn't touch the Claudian conversation); /schedule list to view, /schedule cancel N to cancel",
       "/model <name> — switch model, e.g. /model opus, /model sonnet",
       "/effort <level> — switch effort level, e.g. /effort low, /effort high",
       "/permission <mode> — switch permission mode, e.g. /permission yolo, /permission default",
