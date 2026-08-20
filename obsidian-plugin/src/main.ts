@@ -436,6 +436,24 @@ export default class WeChatBridgePlugin extends Plugin {
   }
 
   async onunload() {
+    // Flush whatever's in memory before the writes-in-flight it's built on
+    // top of get cancelled by the unload itself. Most updates to `this.data`
+    // (see checkForDesktopActivity, the /listen poller) call `void
+    // this.saveData(this.data)` fire-and-forget on every tick rather than
+    // awaiting it, since nothing in that hot loop can usefully block on a
+    // disk write. That's fine as long as the plugin keeps running - the next
+    // tick's write eventually lands - but a reload (disable+enable, or the
+    // "Reload plugin" command) tears the plugin down immediately afterward;
+    // if the in-flight write hadn't landed yet, data.json on disk is left
+    // holding a stale, smaller `lastSeenMessageCount` than what was actually
+    // already mirrored to WeChat. On the next load that stale count makes
+    // checkForDesktopActivity think everything since it is still unseen and
+    // re-push content the user already received - confirmed as the actual
+    // cause of a real "为啥消息自动重发了" report, matching reload timestamps
+    // in relay.log exactly to bursts of already-seen text reappearing. This
+    // await guarantees the freshest in-memory state is the one actually on
+    // disk by the time onload() runs again.
+    await this.saveData(this.data);
     this.server?.close();
     this.server = null;
     this.relayManager?.stop();
