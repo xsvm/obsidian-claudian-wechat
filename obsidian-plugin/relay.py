@@ -293,7 +293,33 @@ async def _forward_to_bridge(client: httpx.AsyncClient, text: str, image: dict[s
     return f"[桥接连接失败，已重试 {BRIDGE_RETRY_ATTEMPTS} 次] {last_error}"
 
 
+# Guards `_last_send_monotonic` below - _handle_one_message runs each inbound
+# WeChat message as its own background task (see its docstring) and
+# _pending_push_loop is a separate long-lived loop, so sends can legitimately
+# race each other; without a lock two concurrent callers could both read the
+# same stale timestamp and both decide no throttling delay was needed.
+_send_gate = anyio.Lock()
+_last_send_monotonic = 0.0
+
+
 async def _send_text_reply(opts: WeixinApiOptions, to: str, text: str, context_token: str) -> None:
+    # Enforce WECHAT_SEND_MIN_GAP_S between this and the *previous* send to
+    # WeChat, from any caller (chunk-to-chunk within one reply, push-to-push
+    # across /listen or /progressive, or a reply racing a push) - see
+    # WECHAT_SEND_MIN_GAP_S for why this exists. Held for the whole
+    # sleep+send so a burst of callers queues up strictly spaced out, instead
+    # of all waking up at once and racing each other again.
+    global _last_send_monotonic
+    async with _send_gate:
+        now = anyio.current_time()
+        wait = WECHAT_SEND_MIN_GAP_S - (now - _last_send_monotonic)
+        if wait > 0:
+            await anyio.sleep(wait)
+        _last_send_monotonic = anyio.current_time()
+        await _send_text_reply_now(opts, to, text, context_token)
+
+
+async def _send_text_reply_now(opts: WeixinApiOptions, to: str, text: str, context_token: str) -> None:
     req = SendMessageReq(
         msg=WeixinMessage(
             from_user_id="",
@@ -321,6 +347,21 @@ async def _send_text_reply(opts: WeixinApiOptions, to: str, text: str, context_t
 # WeChat enforces. Conservative (WeChat's actual cap is unconfirmed, and CJK
 # text runs ~3 bytes/char in UTF-8, so this stays safely under a 4KB body).
 WECHAT_TEXT_CHUNK_LIMIT = 1200
+
+# Minimum gap between two consecutive sendmessage calls to the *same* user,
+# across every chunk/push in this process - not just within one
+# _send_text_chunks call. Root cause behind "只看到第一段就没了" reports:
+# sendmessage returns a plain 200 OK even when WeChat silently drops a
+# message sent too soon after the previous one to the same recipient (same
+# blind spot as the single-long-message case above - _api_post_fetch never
+# inspects the body for a rejection). Previously nothing throttled the loop
+# in _send_text_chunks, so a long reply that split into many chunks (or
+# several /progressive pushes arriving close together) fired them back to
+# back with no gap at all, and only the first one or two survived. This is a
+# floor enforced right before every send (see _throttled_send_text_reply),
+# not a fixed sleep - a naturally slower gap (a chunk that took a while to
+# build, or one send that itself took time) never adds extra delay on top.
+WECHAT_SEND_MIN_GAP_S = 0.6
 
 
 def _split_text_chunks(text: str, limit: int = WECHAT_TEXT_CHUNK_LIMIT) -> list[str]:
