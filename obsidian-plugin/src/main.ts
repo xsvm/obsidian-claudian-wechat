@@ -1837,30 +1837,49 @@ export default class WeChatBridgePlugin extends Plugin {
     });
   }
 
-  /** Handles `/answer ...`, resolving whatever handleAskUserQuestionHeadless() is currently waiting on. */
-  private async handleAnswerCommand(text: string, lang: Lang): Promise<string> {
-    const pending = this.pendingInteractive;
-    if (!pending || pending.kind !== 'question') return this.t('noPendingQuestion', lang);
-
-    const rest = text.replace(/^\/answer\s*/i, '').trim();
-    if (/^cancel$/i.test(rest)) {
-      pending.resolve(null);
-      this.pendingInteractive = null;
-      return this.t('questionCancelled', lang);
+  /**
+   * Splits a multi-question /answer's argument text into one {qIndex,
+   * selectionText} pair per question it addresses.
+   *
+   * Motivated by a real ClawBot report: a user meaning "question 1 -> option
+   * 2, question 2 -> option 2" typed `/answer 1 2，2 2` (note the full-width
+   * "，" - easy to end up with from a phone IME, and previously invisible to
+   * this parser, which only split on ASCII ","). The old single-match
+   * `^(\d+)\s+(.+)$` treated everything after the first number as one
+   * question's freeform answer, silently swallowing the second question
+   * entirely.
+   *
+   * Splits on any of `,` `，` `;` `；` (ASCII/full-width comma or semicolon),
+   * then only starts a *new* pair when a chunk begins with `<digits><space>`
+   * - a chunk that doesn't (e.g. the "3" in a multi-select answer like
+   * `1 2,3`) is folded back into the previous pair's selection text instead,
+   * so a single question's comma-separated option list (`/answer 1 2,3`)
+   * still works exactly as before. A leading chunk that never matches (no
+   * pair open yet) is dropped rather than throwing - the caller reports
+   * "usage" if nothing parsed at all.
+   */
+  private splitAnswerPairs(rest: string): { qIndex: number; selectionText: string }[] {
+    const pairs: { qIndex: number; selectionText: string }[] = [];
+    for (const raw of rest.split(/[,，;；]/)) {
+      const chunk = raw.trim();
+      if (!chunk) continue;
+      const m = chunk.match(/^(\d+)\s+(\S.*)$/);
+      if (m) {
+        pairs.push({ qIndex: Number(m[1]) - 1, selectionText: m[2] });
+      } else if (pairs.length > 0) {
+        pairs[pairs.length - 1].selectionText += `,${chunk}`;
+      }
     }
-    if (!rest) return this.t('answerUsage', lang);
+    return pairs;
+  }
 
-    let qIndex: number;
-    let selectionText: string;
-    if (pending.questions.length > 1) {
-      const m = rest.match(/^(\d+)\s+(.+)$/);
-      if (!m) return this.t('answerUsageMulti', lang);
-      qIndex = Number(m[1]) - 1;
-      selectionText = m[2];
-    } else {
-      qIndex = 0;
-      selectionText = rest;
-    }
+  /** Applies one {qIndex, selectionText} pair to `pending`'s in-progress selections. Returns an error string, or null on success. */
+  private applyAnswerPair(
+    pending: Extract<PendingInteractive, { kind: 'question' }>,
+    qIndex: number,
+    selectionText: string,
+    lang: Lang,
+  ): string | null {
     const q = pending.questions[qIndex];
     if (!q) return this.t('outOfRange', lang, pending.questions.length);
 
@@ -1881,6 +1900,35 @@ export default class WeChatBridgePlugin extends Plugin {
       set.add(matched ? matched.value : selectionText.trim());
     }
     pending.selections.set(qIndex, set);
+    return null;
+  }
+
+  /** Handles `/answer ...`, resolving whatever handleAskUserQuestionHeadless() is currently waiting on. */
+  private async handleAnswerCommand(text: string, lang: Lang): Promise<string> {
+    const pending = this.pendingInteractive;
+    if (!pending || pending.kind !== 'question') return this.t('noPendingQuestion', lang);
+
+    const rest = text.replace(/^\/answer\s*/i, '').trim();
+    if (/^cancel$/i.test(rest)) {
+      pending.resolve(null);
+      this.pendingInteractive = null;
+      return this.t('questionCancelled', lang);
+    }
+    if (!rest) return this.t('answerUsage', lang);
+
+    if (pending.questions.length > 1) {
+      // Accepts either one "N answer" pair, or several separated by a comma/
+      // semicolon (ASCII or full-width) - see splitAnswerPairs() for why.
+      const pairs = this.splitAnswerPairs(rest);
+      if (pairs.length === 0) return this.t('answerUsageMulti', lang);
+      for (const { qIndex, selectionText } of pairs) {
+        const err = this.applyAnswerPair(pending, qIndex, selectionText, lang);
+        if (err) return err;
+      }
+    } else {
+      const err = this.applyAnswerPair(pending, 0, rest, lang);
+      if (err) return err;
+    }
 
     if (pending.selections.size >= pending.questions.length) {
       const result: Record<string, string | string[]> = {};

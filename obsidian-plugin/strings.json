@@ -110,13 +110,13 @@
     "en": "Reply /answer <number> (e.g. /answer 2; comma-separate for multi-select like /answer 1,3), or /answer <free text>. /answer cancel to cancel."
   },
   "askUserQuestionUsageMulti": {
-    "zh": "回复 /answer 题号 选项（如 /answer 1 2，多选逗号分隔），每题回复一次，答完自动提交；/answer cancel 取消。",
-    "en": "Reply /answer <question#> <option#> (e.g. /answer 1 2; comma-separate for multi-select) once per question - submits automatically once all are answered. /answer cancel to cancel."
+    "zh": "回复 /answer 题号 选项（如 /answer 1 2），可以每题分开回复，也可以一条消息用逗号或分号隔开一次答完（如 /answer 1 2, 2 3），答完自动提交；/answer cancel 取消。",
+    "en": "Reply /answer <question#> <option#> (e.g. /answer 1 2) - either one question per message, or several at once in one message separated by commas/semicolons (e.g. /answer 1 2, 2 3). Submits automatically once all are answered. /answer cancel to cancel."
   },
   "answerUsage": { "zh": "用法: /answer <序号|文字>，或 /answer cancel", "en": "Usage: /answer <number|text>, or /answer cancel" },
   "answerUsageMulti": {
-    "zh": "有多道题，请用 /answer 题号 选项 的格式，如 /answer 1 2。",
-    "en": "Multiple questions pending - use /answer <question#> <option#>, e.g. /answer 1 2."
+    "zh": "有多道题，请用 /answer 题号 选项 的格式，如 /answer 1 2；也可以一次回答多道题，用逗号或分号隔开，如 /answer 1 2, 2 2。",
+    "en": "Multiple questions pending - use /answer <question#> <option#>, e.g. /answer 1 2. You can also answer several at once, comma/semicolon-separated, e.g. /answer 1 2, 2 2."
   },
   "noPendingQuestion": { "zh": "当前没有待回答的问题。", "en": "No question is currently pending." },
   "questionCancelled": { "zh": "已取消该问题。", "en": "Question cancelled." },
