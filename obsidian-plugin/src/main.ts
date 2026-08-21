@@ -100,6 +100,17 @@ interface BridgeData {
   /** Message count already seen in the bound tab, so the /listen poller only reports new turns. */
   lastSeenMessageCount: number;
   /**
+   * Which conversation lastSeenMessageCount was counted against. Autonomous-
+   * turn mirroring (see checkForDesktopActivity) tracks the *currently
+   * WeChat-bound* conversation (data.conversationId) regardless of /listen,
+   * so unlike listeningConversationId this is not an opt-in scope - it's just
+   * bookkeeping to detect "the bound conversation changed under us" (via
+   * /switch, /new, or a fresh tab picking up an id) and resync instead of
+   * either replaying the new conversation's entire history or comparing
+   * against a stale count from a different conversation.
+   */
+  lastSeenConversationId: string | null;
+  /**
    * Provider to use for the *next* new conversation (set via /provider).
    * Irrelevant once bound to a conversation - that conversation's own
    * providerId (from its session metadata) always wins; Claudian doesn't
@@ -320,6 +331,7 @@ const DEFAULT_DATA: BridgeData = {
   listening: false,
   listeningConversationId: null,
   lastSeenMessageCount: 0,
+  lastSeenConversationId: null,
   providerId: null,
   progressiveReply: false,
   scheduledSends: [],
@@ -1004,11 +1016,14 @@ export default class WeChatBridgePlugin extends Plugin {
         try {
           const tab = await this.getOrCreateWeChatTab();
           this.data.lastSeenMessageCount = tab.state.messages.length;
+          this.data.lastSeenConversationId = tab.conversationId;
         } catch {
           this.data.lastSeenMessageCount = 0;
+          this.data.lastSeenConversationId = this.data.conversationId;
         }
       } else {
         this.data.lastSeenMessageCount = 0;
+        this.data.lastSeenConversationId = null;
       }
     }
     await this.saveData(this.data);
@@ -1049,28 +1064,40 @@ export default class WeChatBridgePlugin extends Plugin {
   }
 
   /**
-   * Runs on a timer. While listening is on, detects new turns that appeared
-   * in the bound tab without going through this plugin's own sendChatMessage()
-   * (i.e. typed directly into Claudian's desktop UI) and queues them for the
-   * relay to push to WeChat.
+   * Runs on a timer. Two independent things happen here, both driven off the
+   * same message-count-growth detection:
+   *
+   *  1. Autonomous continuations of the currently WeChat-bound conversation
+   *     (a scheduled/cron wakeup resuming it, a background task finishing,
+   *     etc.) - these are mirrored unconditionally, regardless of /listen.
+   *     This conversation *is* the WeChat conversation; if Claudian says
+   *     something new in it, WeChat should hear it no matter what triggered
+   *     that turn. Gating this behind /listen (as an earlier version of this
+   *     function did) was the actual bug behind a real user report: such
+   *     replies showed up in Claudian's desktop UI but never reached WeChat,
+   *     because /listen is normally left off (it's a separate opt-in for
+   *     mirroring desktop-*typed* prompts, and most WeChat-only usage never
+   *     turns it on).
+   *  2. Desktop-typed prompts (a message with a `role: 'user'` entry in the
+   *     growth) - mirroring *these* is the actual /listen feature described
+   *     in listenOn's string, and stays gated on it plus its own
+   *     conversation scoping (listeningConversationId), so toggling /listen
+   *     on in one conversation doesn't silently start following a different
+   *     one later just because it happens to be the bound one by then.
    */
   private async checkForDesktopActivity(): Promise<void> {
-    if (!this.data.listening) return;
     if (!this.data.conversationId) return;
 
-    // Scoped to the conversation /listen was turned on for - switching to a
-    // different one (via /switch or /new) afterward must not carry this
-    // along, or turning listening on in conversation A would silently start
-    // mirroring conversation B just because it happens to be the bound one
-    // later. `null` means /listen was turned on before any conversation
-    // existed yet; bind it to whichever one shows up first (this only fires
-    // once, since it's non-null on every subsequent tick).
-    if (this.data.listeningConversationId === null) {
-      this.data.listeningConversationId = this.data.conversationId;
-      void this.saveData(this.data);
-    } else if (this.data.listeningConversationId !== this.data.conversationId) {
-      return;
+    // /listen's own scope tracking (opt-in, feature #2 above) - independent
+    // of the resync logic below, which tracks whichever conversation is
+    // *currently* bound for feature #1 regardless of /listen.
+    if (this.data.listening) {
+      if (this.data.listeningConversationId === null) {
+        this.data.listeningConversationId = this.data.conversationId;
+        void this.saveData(this.data);
+      }
     }
+    const listenScopeOk = this.data.listening && this.data.listeningConversationId === this.data.conversationId;
 
     let tab: ClaudianTab;
     try {
@@ -1083,6 +1110,21 @@ export default class WeChatBridgePlugin extends Plugin {
     if (this.sendingViaBridgeTabIds.has(tab.id)) return;
 
     const messages = tab.state.messages;
+
+    // lastSeenMessageCount is only meaningful against the conversation it was
+    // counted for. If the bound conversation changed since the last tick
+    // (via /switch, /new, or a blank tab just getting assigned its first real
+    // id), resync to the current end instead of comparing counts across two
+    // unrelated conversations - that would either replay the "new" one's
+    // entire history as if it just happened, or (if it happens to be longer)
+    // silently swallow real growth because the stale count is already past
+    // it.
+    if (this.data.lastSeenConversationId !== tab.conversationId) {
+      this.data.lastSeenConversationId = tab.conversationId;
+      this.data.lastSeenMessageCount = messages.length;
+      void this.saveData(this.data);
+      return;
+    }
 
     // `messages.length` is used as a growth counter, but it isn't guaranteed
     // to only grow: /compact and rewind can replace the array with a shorter
@@ -1138,19 +1180,27 @@ export default class WeChatBridgePlugin extends Plugin {
     // default. Now that staleness is fixed at the source, the only thing
     // still reaching this branch in practice is a genuine no-prompt turn,
     // and silently dropping it is a real gap, not a safety net: a scheduled
-    // wakeup that fires a reply is exactly the kind of thing /listen exists
-    // to mirror, and confirmed via user report as arriving in Claudian but
-    // never reaching WeChat. Gate on whether there's real text to report
-    // instead of on the presence of a prompt.
+    // wakeup that fires a reply is exactly the kind of thing worth mirroring,
+    // and confirmed via user report as arriving in Claudian but never
+    // reaching WeChat. A prompted turn, on the other hand, only gets mirrored
+    // when /listen is explicitly on and scoped to this conversation (see
+    // listenScopeOk above) - see feature #2 in this function's doc comment.
     const promptMsg = newMessages.find((m) => m.role === 'user');
+    if (promptMsg && !listenScopeOk) return;
 
     const lang = this.getLangSafe();
-    const reply = this.extractDispatchText(newMessages, lang);
+    const { text: reply, compacted } = this.extractDispatchText(newMessages, lang);
     if (!reply.trim()) return; // Genuinely nothing new (e.g. a compact boundary with no narrative text) - see extractDispatchText.
 
     const metas = await this.readAllConversationMeta();
     const title = this.titleFor(tab.conversationId, metas);
-    const ctxLine = await this.contextWindowLine(tab.conversationId, lang);
+    // Right after a /compact, Claudian's own conversation-meta usage numbers
+    // haven't necessarily caught up yet, so appending them here would show
+    // the *pre-compact* context size right next to a "context was compacted"
+    // message - confusing, and the opposite of what that line is for. Skip it
+    // for compact turns; the point of this reply is just "compaction
+    // succeeded", not a token count.
+    const ctxLine = compacted ? null : await this.contextWindowLine(tab.conversationId, lang);
     const body = ctxLine ? `${reply}\n\n${ctxLine}` : reply;
     this.pendingPushes.push(
       promptMsg
@@ -1230,7 +1280,7 @@ export default class WeChatBridgePlugin extends Plugin {
     // text is shown, from just after this user message up to the next one.
     const nextUserIndex = userIndices[index] ?? messages.length;
     const turnMessages = messages.slice(msgIndex + 1, nextUserIndex);
-    return this.extractDispatchText(turnMessages, lang);
+    return this.extractDispatchText(turnMessages, lang).text;
   }
 
   // ---- chat message injection ----
@@ -1329,7 +1379,12 @@ export default class WeChatBridgePlugin extends Plugin {
           // settled too (it can no longer still be growing - the turn is
           // over), so nothing produced right at the tail end between the
           // last poll tick and completion gets missed.
-          const ctxLineForFlush = await this.contextWindowLine(tab.conversationId, lang);
+          // Same staleness concern as the non-progressive path below: right
+          // after a /compact the meta usage numbers may not have caught up
+          // yet, so skip the context-window line for a compact turn here too.
+          const turnSoFar = tab.state.messages.length >= beforeCount ? tab.state.messages.slice(beforeCount) : tab.state.messages;
+          const compactedSoFar = this.extractDispatchText(turnSoFar, lang).compacted;
+          const ctxLineForFlush = compactedSoFar ? null : await this.contextWindowLine(tab.conversationId, lang);
           pushedAnything = this.flushProgressive(tab, beforeCount, true, ctxLineForFlush ?? undefined);
           this.progressiveCursors.delete(tab.id);
         }
@@ -1345,9 +1400,10 @@ export default class WeChatBridgePlugin extends Plugin {
         if (tab.conversationId && tab.conversationId !== this.data.conversationId) {
           this.data.conversationId = tab.conversationId;
         }
-        // Keep the /listen poller's baseline in sync so it doesn't re-report
-        // the turn this call itself just produced.
+        // Keep checkForDesktopActivity's baseline in sync so it doesn't
+        // re-report the turn this call itself just produced.
         this.data.lastSeenMessageCount = tab.state.messages.length;
+        this.data.lastSeenConversationId = tab.conversationId;
         await this.saveData(this.data);
       }
 
@@ -1365,8 +1421,12 @@ export default class WeChatBridgePlugin extends Plugin {
       const newMessages = tab.state.messages.length >= beforeCount
         ? tab.state.messages.slice(beforeCount)
         : tab.state.messages;
-      const reply = this.extractDispatchText(newMessages, lang);
-      const ctxLine = await this.contextWindowLine(tab.conversationId, lang);
+      const { text: reply, compacted } = this.extractDispatchText(newMessages, lang);
+      // See the matching comment in checkForDesktopActivity: right after a
+      // /compact, Claudian's conversation-meta usage numbers can still be the
+      // pre-compact ones, so skip the context-window line rather than show a
+      // stale/misleading size next to a "compaction succeeded" message.
+      const ctxLine = compacted ? null : await this.contextWindowLine(tab.conversationId, lang);
       const body = ctxLine ? `${reply}\n\n${ctxLine}` : reply;
 
       if (progressive && pushedAnything) {
@@ -1496,7 +1556,7 @@ export default class WeChatBridgePlugin extends Plugin {
    * round-trip); only the `text` content blocks across all of them are
    * user-facing, so those are concatenated in order.
    */
-  private extractDispatchText(messages: ClaudianChatMessage[], lang: Lang): string {
+  private extractDispatchText(messages: ClaudianChatMessage[], lang: Lang): { text: string; compacted: boolean } {
     const parts: string[] = [];
     let sawCompactBoundary = false;
     for (const msg of messages) {
@@ -1511,14 +1571,14 @@ export default class WeChatBridgePlugin extends Plugin {
         if (trimmed) parts.push(trimmed);
       }
     }
-    if (parts.length > 0) return parts.join('\n\n');
+    if (parts.length > 0) return { text: parts.join('\n\n'), compacted: sawCompactBoundary };
     // /compact (and equivalents on other providers) legitimately produce no
     // narrative text on success - the only sign it happened is a
     // context_compacted boundary block. Without this check that success case
     // was indistinguishable from a genuinely empty/errored turn, and got the
     // scary "did this fail?" message below even though nothing went wrong.
-    if (sawCompactBoundary) return this.t('compactedNoText', lang);
-    return this.t('noDispatchText', lang);
+    if (sawCompactBoundary) return { text: this.t('compactedNoText', lang), compacted: true };
+    return { text: this.t('noDispatchText', lang), compacted: false };
   }
 
   // ---- outbound files/images: /files, /getfile, /send ----
