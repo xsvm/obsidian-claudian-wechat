@@ -268,7 +268,13 @@ async def _forward_to_bridge(client: httpx.AsyncClient, text: str, image: dict[s
     Obsidian/the plugin can be briefly unreachable (still loading after a
     restart, a plugin reload in progress, etc.) - that's what gets retried.
     A slow-but-working reply is not a failure and must not be retried (see
-    BRIDGE_TIMEOUT above for why).
+    BRIDGE_TIMEOUT above for why): by the time a *post-connect* failure
+    happens here (the connection dropped mid-response, the body came back
+    truncated/unparseable, etc.), the POST body already reached the plugin -
+    Claudian may well have already run the turn. Retrying would risk running
+    it a *second* time; the safe move is to report the failure plainly and
+    point at /hist, which reads Claudian's own message history directly and
+    doesn't depend on this HTTP round-trip at all.
     """
     last_error: Exception | None = None
     body: dict[str, object] = {"text": text}
@@ -277,11 +283,8 @@ async def _forward_to_bridge(client: httpx.AsyncClient, text: str, image: dict[s
     for attempt in range(BRIDGE_RETRY_ATTEMPTS):
         try:
             resp = await client.post(BRIDGE_URL, json=body, timeout=BRIDGE_TIMEOUT)
-            data = resp.json()
-            if not data.get("ok"):
-                return f"[桥接出错] {data.get('error', 'unknown error')}"
-            return data.get("reply", "(no reply)")
         except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+            # Nothing was sent yet - safe to retry as many times as configured.
             last_error = e
             if attempt < len(BRIDGE_RETRY_DELAYS):
                 _log(
@@ -289,6 +292,24 @@ async def _forward_to_bridge(client: httpx.AsyncClient, text: str, image: dict[s
                     f"{BRIDGE_RETRY_DELAYS[attempt]}秒后重试: {e}"
                 )
                 await anyio.sleep(BRIDGE_RETRY_DELAYS[attempt])
+            continue
+        except Exception as e:  # noqa: BLE001
+            # Post-connect failure (connection reset mid-transfer, etc.) - do
+            # NOT retry (see docstring), and report it clearly instead of
+            # letting a generic caller-side catch mislabel it as a connection
+            # failure.
+            _log(f"桥接请求发送后失败（未重试，避免重复触发这一轮）: {e}")
+            return f"[桥接请求发送后失败，回复可能已生成但没能传回] 请发送 /hist 查看最新一轮的实际结果。({e})"
+
+        try:
+            data = resp.json()
+        except Exception as e:  # noqa: BLE001
+            _log(f"桥接响应解析失败: {e}")
+            return f"[桥接响应解析失败，回复可能已生成但没能传回] 请发送 /hist 查看最新一轮的实际结果。({e})"
+
+        if not data.get("ok"):
+            return f"[桥接出错] {data.get('error', 'unknown error')}"
+        return data.get("reply", "(no reply)")
 
     return f"[桥接连接失败，已重试 {BRIDGE_RETRY_ATTEMPTS} 次] {last_error}"
 
@@ -423,8 +444,9 @@ async def _send_text_chunks(
     though the real content had been generated in full. Retrying in place
     means a single token blip costs at most one chunk.
     """
+    parts = _split_text_chunks(text)
     sent = 0
-    for chunk in _split_text_chunks(text):
+    for chunk in parts:
         try:
             await _send_text_reply(opts, to, chunk, context_token)
             sent += 1
@@ -438,6 +460,21 @@ async def _send_text_chunks(
             sent += 1
         except Exception as e:  # noqa: BLE001
             _log(f"发送分段失败（重试后仍失败），已跳过该段（{len(chunk)} 字符）: {e}")
+
+    if sent < len(parts):
+        # At least one chunk never made it out. This used to be silent past
+        # the log line above - from the user's side that's indistinguishable
+        # from Claudian having generated less text than it actually did,
+        # exactly the "最后几段漏发" report this whole pass is about. A
+        # best-effort trailing notice at least turns it into something
+        # visible with a concrete recovery step, instead of a gap nobody
+        # can even tell is there. Wrapped in suppress(): if WeChat is broken
+        # enough that this notice itself can't get out either, there is
+        # nothing more this function can do about it.
+        missing = len(parts) - sent
+        notice = f"[有 {missing} 段内容发送失败，已跳过。发送 /hist 查看完整内容]"
+        with contextlib.suppress(Exception):
+            await _send_text_reply(opts, to, notice, context_token)
     return sent
 
 
@@ -619,6 +656,19 @@ async def _handle_one_message(
         await _send_reply_with_retry(opts, sender_id, reply, context_token, target)
     except Exception as e:  # noqa: BLE001
         _log(f"处理消息时发生未预期的异常（已忽略，不影响后续消息）: {e}")
+        # Everything below `_log(f"收到: ...")` above already reports its own
+        # failures to the user (see _forward_to_bridge/_reply_with_typing_
+        # indicator/_send_text_chunks) - this branch is specifically for
+        # failures *before* that point (e.g. image download), where the user
+        # would otherwise just see their message go completely unanswered
+        # with nothing in WeChat to explain why. Best-effort, using the raw
+        # inbound message's own sender/context_token rather than `target`
+        # (which this message may have failed before ever setting).
+        raw_sender = msg.from_user_id
+        raw_token = msg.context_token
+        if raw_sender and raw_token:
+            with contextlib.suppress(Exception):
+                await _send_text_chunks(opts, raw_sender, f"[处理这条消息时出错，已跳过] {e}", raw_token)
 
 
 async def _send_reply_with_retry(
