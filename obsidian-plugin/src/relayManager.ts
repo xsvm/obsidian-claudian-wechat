@@ -55,6 +55,7 @@ export class RelayManager {
   constructor(private readonly app: App, private readonly pluginDir: string) {}
 
   async ensureRunning(): Promise<void> {
+    this.stopped = false;
     try {
       const venvPython = await this.ensurePythonReady();
       if (!venvPython) return;
@@ -116,8 +117,19 @@ export class RelayManager {
     return this.relayProcess !== null;
   }
 
-  /** Forgets the saved WeChat session and stops the relay. A fresh `startInteractiveLogin` is needed afterward. */
+  /**
+   * Forgets the saved WeChat session and stops the relay. A fresh
+   * `startInteractiveLogin` is needed afterward.
+   *
+   * Sets `stopped` so that an `ensureRunning()` call already in flight (e.g.
+   * still installing the venv, or awaiting a QR scan) doesn't reach
+   * `startRelayProcess()` and spawn a relay process right after the user
+   * explicitly asked to disconnect. `restartRelay()` and `ensureRunning()`
+   * both clear it again on their own next explicit start, so this doesn't
+   * permanently wedge reconnecting afterward.
+   */
   async disconnect(): Promise<void> {
+    this.stopped = true;
     this.relayProcess?.kill();
     this.relayProcess = null;
     await fs.rm(this.credentialsPath(), { force: true });
@@ -125,6 +137,7 @@ export class RelayManager {
 
   /** Kills and restarts the relay process (same venv, same script). For manual troubleshooting from the settings tab. */
   async restartRelay(): Promise<void> {
+    this.stopped = false;
     this.relayProcess?.kill();
     this.relayProcess = null;
     const venvPython = await this.ensurePythonReady();

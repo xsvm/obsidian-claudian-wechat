@@ -487,11 +487,22 @@ export default class WeChatBridgePlugin extends Plugin {
    */
   private sendQueues: Map<string, Promise<unknown>> = new Map();
   /**
+   * Serializes getOrCreateWeChatTab() itself, not just sends against an
+   * already-resolved tab. Needed specifically for the "no conversation bound
+   * yet" (`this.data.conversationId === null`) branch: two /message calls
+   * arriving close together (e.g. the WeChat user fires off two messages
+   * before the first one's turn has created a conversation) would otherwise
+   * each independently see "no tab yet" and call tabManager.createTab(),
+   * spawning two separate conversations for what was meant to be one thread
+   * - only the second call's tab ends up bound in data.conversationId, and
+   * the first turn's reply is silently stranded on the discarded tab.
+   */
+  private getTabMutex: Promise<unknown> = Promise.resolve();
+  /**
    * A single outstanding AskUserQuestion or approval request, surfaced via
-   * pendingPushes and resolved by /answer or /approve. Not persisted across
-   * reloads (a reload mid-question loses it; Claudian's own turn would then
-   * just hang - rare enough, and safer than trying to serialize a live
-   * Promise resolver to disk).
+   * pendingPushes and resolved by /answer or /approve. Adopted back from a
+   * stale plugin instance across a reload via `__wechatPendingInteractive`
+   * on the owning inputController - see installInteractiveHooks.
    */
   private pendingInteractive: PendingInteractive | null = null;
   /**
@@ -1370,7 +1381,11 @@ export default class WeChatBridgePlugin extends Plugin {
     this.metaCache = null;
     const metas = await this.readAllConversationMeta();
     const usage = metas.find((m) => m.id === conversationId)?.usage;
-    if (!usage?.contextTokens || !usage?.contextWindow) return null;
+    // Explicit null/undefined checks, not `!usage.contextTokens` - a
+    // conversation that has genuinely used 0 tokens so far (e.g. right after
+    // /new, before the first reply's usage lands in meta) has
+    // contextTokens === 0, which is falsy but not "no data yet".
+    if (usage?.contextTokens == null || !usage?.contextWindow) return null;
     return this.t('contextWindowLine', lang, 
       this.formatK(usage.contextTokens),
       this.formatK(usage.contextWindow),
@@ -1937,7 +1952,20 @@ export default class WeChatBridgePlugin extends Plugin {
     return this.t('queuedForSend', lang, fileName);
   }
 
+  /**
+   * Serializes against getTabMutex - see that field's doc comment for why.
+   * Chains onto the tail regardless of whether the previous call threw, and
+   * always returns/propagates its *own* result independent of that tail
+   * (same settle-agnostic-tail pattern as sendQueues in sendChatMessageQueued).
+   */
   private async getOrCreateWeChatTab(): Promise<ClaudianTab> {
+    const previous = this.getTabMutex.catch(() => {});
+    const run = previous.then(() => this.getOrCreateWeChatTabImpl());
+    this.getTabMutex = run.catch(() => {});
+    return run;
+  }
+
+  private async getOrCreateWeChatTabImpl(): Promise<ClaudianTab> {
     const claudian = this.getClaudianPlugin();
     const view = (claudian.getAllViews?.() ?? [])[0] ?? this.findClaudianViewViaWorkspace();
     if (!view) throw new Error(this.t('noViewOpen', this.getLangSafe()));

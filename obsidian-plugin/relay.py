@@ -812,9 +812,16 @@ async def _pending_push_loop(opts: WeixinApiOptions, target: _LastTarget, client
                 # limit.
                 n = await _send_text_chunks(opts, target.sender_id, push, target.context_token)
                 if n == 0 and push.strip():
+                    # Every chunk failed - nothing actually reached WeChat, so
+                    # this must NOT be acked (unlike the raise-based failures
+                    # below, _send_text_chunks swallows its own per-chunk
+                    # errors and just returns 0, so there's no exception here
+                    # to fall into the `except` branch and stay unacked on
+                    # its own - do it explicitly instead). Stop this batch
+                    # here so it retries next poll, same as a raised error.
                     _log(f"推送监听内容全部失败: to={target.sender_id} chars={len(push)}")
-                else:
-                    _log(f"已推送监听内容: to={target.sender_id} chars={len(push)} chunks={n} text={push[:50]!r}")
+                    break
+                _log(f"已推送监听内容: to={target.sender_id} chars={len(push)} chunks={n} text={push[:50]!r}")
                 # Only ack what we actually got through send_text_chunks
                 # without raising - a mid-batch exception below leaves this
                 # (and everything after it) unacked, so it's retried next
