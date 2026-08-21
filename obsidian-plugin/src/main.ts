@@ -12,8 +12,8 @@ import { WeChatBridgeSettingTab } from './settingsTab';
  * (id: "realclaudian") the same way its own UI does:
  *   - chat text                -> InputController.sendMessage({ content }) on a dedicated tab
  *   - /model X /effort X /permission X -> plugin.mutateSettings() + UI refresh
- *   - /list                    -> list known conversations (from .claudian/sessions/*.meta.json)
- *   - /switch N                -> point the bridge's tab at conversation #N from the last /list
+ *   - /ls                      -> list known conversations (from .claudian/sessions/*.meta.json)
+ *   - /goto N                  -> point the bridge's tab at conversation #N from the last /ls
  *   - /new                     -> detach from the current conversation; next message starts a fresh one
  *   - /commands                -> list Claude's own slash commands (TabManager.getSdkCommands)
  *   - anything else starting with "/" that isn't one of the above is passed through
@@ -146,7 +146,7 @@ class AckQueue<T> {
 
 interface BridgeData {
   conversationId: string | null;
-  /** conversation ids in the order shown by the last /list, for /switch N to index into. */
+  /** conversation ids in the order shown by the last /ls, for /goto N to index into. */
   lastListedIds: string[];
   /** /listen on|off: mirror turns sent from the desktop Claudian UI to WeChat too. */
   listening: boolean;
@@ -412,7 +412,7 @@ const DEFAULT_DATA: BridgeData = {
 };
 
 const LISTEN_POLL_INTERVAL_MS = 3000;
-/** /list and /ls default to the most recent conversations only; /list all or /ls all shows everything. */
+/** /ls defaults to the most recent conversations only; /ls all shows everything. */
 const LIST_DEFAULT_LIMIT = 10;
 /** How often an in-flight bridge-driven send is checked for newly-settled text chunks while /progressive is on. */
 const PROGRESSIVE_POLL_INTERVAL_MS = 1200;
@@ -807,8 +807,8 @@ export default class WeChatBridgePlugin extends Plugin {
       },
       { pattern: /^\/provider\s+(\S+)/i, run: (m, lang) => this.switchProvider(m[1].toLowerCase(), lang) },
       { pattern: /^\/provider\b/i, run: (_m, lang) => this.t('providerUsage', lang, this.getEnabledProviders().join(', ')) },
-      { pattern: /^\/(?:list|ls)(?:\s+(all))?\b/i, run: (m, lang) => this.listConversations(lang, Boolean(m[1])) },
-      { pattern: /^\/(?:switch|goto)\s+(\d+)/i, run: (m, lang) => this.switchConversation(Number(m[1]), lang) },
+      { pattern: /^\/ls(?:\s+(all))?\b/i, run: (m, lang) => this.listConversations(lang, Boolean(m[1])) },
+      { pattern: /^\/goto\s+(\d+)/i, run: (m, lang) => this.switchConversation(Number(m[1]), lang) },
       { pattern: /^\/status\b/i, run: (_m, lang) => this.statusText(lang) },
       { pattern: /^\/hist\s+(\d+)\b/i, run: (m, lang) => this.showHistory(Number(m[1]), lang) },
       { pattern: /^\/hist\b/i, run: (_m, lang) => this.listHistory(lang) },
