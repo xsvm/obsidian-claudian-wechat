@@ -348,6 +348,20 @@ interface ParsedQuestion {
   options: { label: string; value: string }[];
 }
 
+/**
+ * Claudian's inputController object, as patched by installInteractiveHooks.
+ * `__wechatBridgeOwner` records which plugin instance last patched it (so a
+ * post-reload instance knows to re-patch rather than trust a stale one's
+ * handlers); `__wechatPendingInteractive` records a still-unresolved
+ * question/approval so a fresh instance can adopt it after reload instead of
+ * losing all contact with the resolve closure Claudian's own turn is still
+ * awaiting.
+ */
+type WeChatPatchedInputController = NonNullable<ClaudianTab['controllers']['inputController']> & {
+  __wechatBridgeOwner?: unknown;
+  __wechatPendingInteractive?: PendingInteractive;
+};
+
 type PendingInteractive =
   | {
       kind: 'question';
@@ -356,12 +370,24 @@ type PendingInteractive =
       /** question index -> set of selected option *values* (or a single freeform string for isOther-style answers). */
       selections: Map<number, Set<string>>;
       resolve: (value: Record<string, string | string[]> | null) => void;
+      /** The exact text already pushed to WeChat for this question - see the
+       * `__wechatPendingInteractive` adoption path in installInteractiveHooks
+       * for why this needs to be re-sendable after a plugin reload. */
+      promptText: string;
+      /** The inputController this request's `resolve` closure is bound to
+       * (survives a wechat-bridge plugin reload, since Claudian itself isn't
+       * reloaded) - stashed here so the resolving code can clear the
+       * matching `__wechatPendingInteractive` marker off of it once this
+       * request is actually settled. */
+      sourceIc: WeChatPatchedInputController;
     }
   | {
       kind: 'approval';
       tabId: string;
       title: string;
       resolve: (value: 'accept' | 'acceptForSession' | 'decline' | 'cancel') => void;
+      promptText: string;
+      sourceIc: WeChatPatchedInputController;
     };
 
 interface ConversationMeta {
@@ -1962,18 +1988,40 @@ export default class WeChatBridgePlugin extends Plugin {
    * handleApprovalRequest with headless versions that push a WeChat
    * notification and resolve from /answer or /approve, instead of rendering
    * Claudian's inline DOM widgets (OA / the approval-inline widget) that
-   * nobody is looking at for a bridge-driven tab. Idempotent per
-   * inputController instance (guarded by a marker property) since
-   * getOrCreateWeChatTab() runs this on every call.
+   * nobody is looking at for a bridge-driven tab.
+   *
+   * Re-patches (rather than a one-time idempotent no-op) on every call whose
+   * `__wechatBridgeOwner` isn't *this* plugin instance. That matters because
+   * `ic` (Claudian's own inputController) outlives a wechat-bridge plugin
+   * reload - Claudian itself doesn't reload with it - so after a reload the
+   * marker left by the previous instance is still sitting on the same live
+   * object. Without re-patching, `ic.handleAskUserQuestion` would keep
+   * calling the *old* instance's handler forever: it would still resolve
+   * fine, but push into the old instance's (now-disconnected) AckQueue that
+   * nothing reads anymore.
+   *
+   * Also adopts any request that's already in flight from that old instance
+   * (see the `__wechatPendingInteractive` doc comment on PendingInteractive)
+   * so a question/approval that fired right before a reload doesn't strand
+   * Claudian's turn forever with no way to answer it and nothing visible in
+   * either UI.
    *
    * Trade-off: once installed, this tab's native desktop UI no longer shows
    * its own inline question/approval widgets either - acceptable since this
    * tab exists specifically to be driven remotely from WeChat.
    */
   private installInteractiveHooks(tab: ClaudianTab): void {
-    const ic = tab.controllers.inputController as (ClaudianTab['controllers']['inputController'] & { __wechatBridgePatched?: boolean }) | null;
-    if (!ic || ic.__wechatBridgePatched) return;
-    ic.__wechatBridgePatched = true;
+    const ic = tab.controllers.inputController as WeChatPatchedInputController | null;
+    if (!ic) return;
+
+    if (ic.__wechatPendingInteractive && ic.__wechatPendingInteractive !== this.pendingInteractive) {
+      this.pendingInteractive = ic.__wechatPendingInteractive;
+      const lang = this.getLangSafe();
+      this.pendingPushes.push(`${this.t('reconnectedPendingPrefix', lang)}\n${ic.__wechatPendingInteractive.promptText}`);
+    }
+
+    if (ic.__wechatBridgeOwner === this) return;
+    ic.__wechatBridgeOwner = this;
     ic.handleAskUserQuestion = async (input: any) => this.handleAskUserQuestionHeadless(tab, input);
     ic.handleApprovalRequest = async (kind: string, details: any, title: string, opts: any) =>
       this.handleApprovalRequestHeadless(tab, kind, details, title, opts);
@@ -2014,10 +2062,14 @@ export default class WeChatBridgePlugin extends Plugin {
       q.options.forEach((o, oi) => lines.push(`  ${oi + 1}. ${o.label}`));
     });
     lines.push('\n' + this.t(questions.length > 1 ? 'askUserQuestionUsageMulti' : 'askUserQuestionUsageSingle', lang));
+    const promptText = lines.join('\n');
 
     return new Promise((resolve) => {
-      this.pendingInteractive = { kind: 'question', tabId: tab.id, questions, selections: new Map(), resolve };
-      this.pendingPushes.push(lines.join('\n'));
+      const ic = tab.controllers.inputController as WeChatPatchedInputController;
+      const pending: PendingInteractive = { kind: 'question', tabId: tab.id, questions, selections: new Map(), resolve, promptText, sourceIc: ic };
+      this.pendingInteractive = pending;
+      ic.__wechatPendingInteractive = pending;
+      this.pendingPushes.push(promptText);
     });
   }
 
@@ -2033,9 +2085,13 @@ export default class WeChatBridgePlugin extends Plugin {
     const desc = kind === 'command_execution' && typeof details?.command === 'string'
       ? details.command
       : String(details?.reason ?? title ?? kind);
+    const promptText = this.t('approvalHeader', lang, title, desc);
     return new Promise((resolve) => {
-      this.pendingInteractive = { kind: 'approval', tabId: tab.id, title, resolve };
-      this.pendingPushes.push(this.t('approvalHeader', lang, title, desc));
+      const ic = tab.controllers.inputController as WeChatPatchedInputController;
+      const pending: PendingInteractive = { kind: 'approval', tabId: tab.id, title, resolve, promptText, sourceIc: ic };
+      this.pendingInteractive = pending;
+      ic.__wechatPendingInteractive = pending;
+      this.pendingPushes.push(promptText);
     });
   }
 
@@ -2105,6 +2161,19 @@ export default class WeChatBridgePlugin extends Plugin {
     return null;
   }
 
+  /**
+   * Clears `this.pendingInteractive` and, if it's still the same request,
+   * the matching `__wechatPendingInteractive` marker on its source
+   * inputController too - otherwise that marker would look like an
+   * orphaned-by-reload request forever and installInteractiveHooks would
+   * keep re-adopting (and re-pushing to WeChat) a request that's actually
+   * already been resolved.
+   */
+  private clearPendingInteractive(pending: PendingInteractive): void {
+    if (this.pendingInteractive === pending) this.pendingInteractive = null;
+    if (pending.sourceIc.__wechatPendingInteractive === pending) pending.sourceIc.__wechatPendingInteractive = undefined;
+  }
+
   /** Handles `/answer ...`, resolving whatever handleAskUserQuestionHeadless() is currently waiting on. */
   private async handleAnswerCommand(text: string, lang: Lang): Promise<string> {
     const pending = this.pendingInteractive;
@@ -2113,7 +2182,7 @@ export default class WeChatBridgePlugin extends Plugin {
     const rest = text.replace(/^\/answer\s*/i, '').trim();
     if (/^cancel$/i.test(rest)) {
       pending.resolve(null);
-      this.pendingInteractive = null;
+      this.clearPendingInteractive(pending);
       return this.t('questionCancelled', lang);
     }
     if (!rest) return this.t('answerUsage', lang);
@@ -2140,7 +2209,7 @@ export default class WeChatBridgePlugin extends Plugin {
         result[qq.key] = qq.multiSelect ? Array.from(sel) : Array.from(sel)[0];
       });
       pending.resolve(result);
-      this.pendingInteractive = null;
+      this.clearPendingInteractive(pending);
       return this.t('questionAnswered', lang);
     }
     return this.t('questionPartial', lang, pending.selections.size, pending.questions.length);
@@ -2192,7 +2261,7 @@ export default class WeChatBridgePlugin extends Plugin {
     const word = m[1].toLowerCase();
     const decision = word === 'accept' ? 'accept' : word === 'always' ? 'acceptForSession' : word === 'deny' ? 'decline' : 'cancel';
     pending.resolve(decision as 'accept' | 'acceptForSession' | 'decline' | 'cancel');
-    this.pendingInteractive = null;
+    this.clearPendingInteractive(pending);
     return this.t('approvalResolved', lang, decision);
   }
 

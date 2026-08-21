@@ -105,6 +105,10 @@
     "zh": "已切换到供应商: {0}。下一条消息将在这个供应商上开始一个全新的对话。",
     "en": "Switched to provider: {0}. The next message will start a brand-new conversation on it."
   },
+  "reconnectedPendingPrefix": {
+    "zh": "（插件刚重新连接，补发一条你还没回答的问题/请求）",
+    "en": "(Plugin just reconnected - resending a question/request you haven't answered yet)"
+  },
   "askUserQuestionHeader": {
     "zh": "Claudian 有问题想问你：",
     "en": "Claudian is asking you something:"
