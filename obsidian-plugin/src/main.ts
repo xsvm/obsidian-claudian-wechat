@@ -81,6 +81,56 @@ interface ScheduledSend {
   repeat: null | { type: 'daily'; hour: number; minute: number };
 }
 
+/**
+ * Backs pendingPushes/pendingFiles. The naive version of this (a plain array,
+ * cleared the instant /pending's GET handler reads it) is at-most-once
+ * delivery: if the HTTP response never actually reaches relay.py - a
+ * localhost hiccup, or relay.py's own client timing out because Obsidian's
+ * event loop was busy with something else for a few seconds - the array is
+ * already empty server-side by then, so that batch of text is gone for good,
+ * with nothing logged on either side (relay.py's poll loop swallows that
+ * exception silently and just retries next tick). Confirmed as the cause of
+ * a real "最后一段/几段漏发" report: relay.log showed no error at all for the
+ * affected turn, which only makes sense if the loss happened on a request
+ * relay.py never even logged as failed - a response that departed the
+ * request but never reached it.
+ *
+ * Fix: don't clear on read. Every item gets a monotonically increasing id
+ * when queued; a GET only removes items once the client explicitly says
+ * "I successfully processed up through id N" on its *next* call (via the
+ * `ack` query param - see /pending). If a response is lost in transit, the
+ * client never learns those ids exist, never acks them, and they simply come
+ * back (still unacked) on the next poll - a duplicate send in the rare case
+ * where the response secretly *did* arrive but the ack for it later got
+ * lost, but never a silent loss.
+ */
+class AckQueue<T> {
+  private items: T[] = [];
+  private baseSeq = 0;
+
+  push(...newItems: T[]): void {
+    this.items.push(...newItems);
+  }
+
+  get length(): number {
+    return this.items.length;
+  }
+
+  /** Current contents tagged with the ids a client should echo back via ack(). Does not remove anything. */
+  snapshot(): { id: number; item: T }[] {
+    return this.items.map((item, i) => ({ id: this.baseSeq + i, item }));
+  }
+
+  /** Removes every item whose id is <= ackId. Ignores stale/out-of-range acks instead of throwing. */
+  ack(ackId: number): void {
+    if (!Number.isFinite(ackId) || ackId < this.baseSeq) return;
+    const removeCount = Math.min(this.items.length, ackId - this.baseSeq + 1);
+    if (removeCount <= 0) return;
+    this.items.splice(0, removeCount);
+    this.baseSeq += removeCount;
+  }
+}
+
 interface BridgeData {
   conversationId: string | null;
   /** conversation ids in the order shown by the last /list, for /switch N to index into. */
@@ -361,8 +411,8 @@ const TOOL_INPUT_PATH_KEYS = ['file_path', 'filePath', 'path', 'notebook_path', 
 export default class WeChatBridgePlugin extends Plugin {
   private server: http.Server | null = null;
   private data: BridgeData = { ...DEFAULT_DATA };
-  /** Pushes queued by the /listen poller, drained by the relay's /pending polling. */
-  private pendingPushes: string[] = [];
+  /** Pushes queued by the /listen poller, drained (ack-based, see AckQueue) by the relay's /pending polling. */
+  private pendingPushes = new AckQueue<string>();
   /** tab.id's currently being driven by this plugin's own sendChatMessage(), so
    * the /listen poller does not mistake a WeChat-originated turn for a desktop
    * one. A set, not a single flag, because sends to different tabs can now be
@@ -399,8 +449,8 @@ export default class WeChatBridgePlugin extends Plugin {
    * chunk once.
    */
   private progressiveCursors: Map<string, { pushedMessageCount: number; pushedBlocksInCurrent: number; everPushed: boolean }> = new Map();
-  /** Files queued by /send or /getfile, drained by relay.py through /pending (same shape as pendingPushes for text). */
-  private pendingFiles: PendingFileItem[] = [];
+  /** Files queued by /send or /getfile, drained (ack-based, see AckQueue) by relay.py through /pending (same shape as pendingPushes for text). */
+  private pendingFiles = new AckQueue<PendingFileItem>();
   /**
    * The candidate list built by the most recent /files call, for /getfile N
    * to index into - same pattern as lastListedIds for /switch. Not
@@ -534,11 +584,22 @@ export default class WeChatBridgePlugin extends Plugin {
    */
   private async startServer(): Promise<void> {
     const server = http.createServer((req, res) => {
-      if (req.method === 'GET' && req.url === '/pending') {
-        const pushes = this.pendingPushes;
-        this.pendingPushes = [];
-        const files = this.pendingFiles;
-        this.pendingFiles = [];
+      if (req.method === 'GET' && req.url?.startsWith('/pending')) {
+        // See AckQueue's doc comment: this used to clear both queues
+        // unconditionally on every GET, which silently lost content whenever
+        // the response didn't actually make it back to relay.py. Ack query
+        // params let the client confirm what it actually finished
+        // processing from the *previous* response before anything is
+        // removed - anything unacked simply comes back in `pushes`/`files`
+        // again below.
+        const query = new URL(req.url, 'http://localhost').searchParams;
+        const ackPush = query.get('ackPush');
+        const ackFiles = query.get('ackFiles');
+        if (ackPush !== null) this.pendingPushes.ack(Number(ackPush));
+        if (ackFiles !== null) this.pendingFiles.ack(Number(ackFiles));
+
+        const pushes = this.pendingPushes.snapshot().map(({ id, item }) => ({ id, text: item }));
+        const files = this.pendingFiles.snapshot().map(({ id, item }) => ({ id, ...item }));
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         // `listening` lets the relay back off its poll rate while /listen is
         // off, instead of hitting this endpoint at a fixed interval forever

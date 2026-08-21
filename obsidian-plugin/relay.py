@@ -702,17 +702,44 @@ async def _pending_push_loop(opts: WeixinApiOptions, target: _LastTarget, client
     /listen is on (so desktop-originated turns show up in WeChat quickly),
     slow while it's off (so this loop isn't making a request every few
     seconds for a feature nobody has enabled).
+
+    Ack-based, not clear-on-read: the plugin's /pending keeps everything it's
+    ever queued until this loop explicitly confirms (via ackPush/ackFiles
+    query params on the *next* call) that it finished processing a given
+    batch. This matters because the naive "GET clears the queue" version was
+    at-most-once delivery - if the response never actually made it back here
+    (an httpx timeout, Obsidian's event loop stalling for a few seconds under
+    load, anything), the plugin had already emptied its queue and that text
+    was gone for good, with nothing logged anywhere since the failure landed
+    in a bare `except: continue`. Confirmed as the cause of a real "最后一段/
+    几段漏发" report where relay.log showed no error at all for the affected
+    turn. Now: only ack ids we actually finish sending this tick; anything
+    that fails (see the per-push try/except below) or never arrives at all
+    stays unacked and comes right back next poll instead of vanishing.
     """
     interval = PENDING_POLL_INTERVAL_IDLE_S
+    ack_push: int | None = None
+    ack_files: int | None = None
     while True:
         await anyio.sleep(interval)
         if not target.sender_id or not target.context_token:
             continue  # No WeChat user has said anything yet; nothing to push to.
         try:
-            resp = await client.get(PENDING_URL, timeout=10.0)
+            params = {}
+            if ack_push is not None:
+                params["ackPush"] = str(ack_push)
+            if ack_files is not None:
+                params["ackFiles"] = str(ack_files)
+            resp = await client.get(PENDING_URL, params=params, timeout=10.0)
             data = resp.json()
-        except Exception:
-            continue  # Obsidian/plugin unreachable; quietly retry next tick.
+        except Exception as e:  # noqa: BLE001
+            # Deliberately do NOT clear ack_push/ack_files here - whatever we
+            # last confirmed is still valid to re-send on the next successful
+            # call. Logged (unlike the old silent `continue`) so a string of
+            # these actually shows up as a diagnosable pattern instead of an
+            # invisible gap in relay.log.
+            _log(f"pending 轮询异常: {e}")
+            continue
 
         if data.get("progressive"):
             interval = PENDING_POLL_INTERVAL_PROGRESSIVE_S
@@ -721,7 +748,9 @@ async def _pending_push_loop(opts: WeixinApiOptions, target: _LastTarget, client
         else:
             interval = PENDING_POLL_INTERVAL_IDLE_S
 
-        for push in data.get("pushes") or []:
+        for entry in data.get("pushes") or []:
+            push_id = entry.get("id")
+            push = entry.get("text") or ""
             try:
                 # This is the path /progressive chunks actually go out
                 # through (not _send_reply_with_retry, whose reply is empty
@@ -736,11 +765,25 @@ async def _pending_push_loop(opts: WeixinApiOptions, target: _LastTarget, client
                     _log(f"推送监听内容全部失败: to={target.sender_id} chars={len(push)}")
                 else:
                     _log(f"已推送监听内容: to={target.sender_id} chars={len(push)} chunks={n} text={push[:50]!r}")
+                # Only ack what we actually got through send_text_chunks
+                # without raising - a mid-batch exception below leaves this
+                # (and everything after it) unacked, so it's retried next
+                # poll instead of silently dropped.
+                if push_id is not None:
+                    ack_push = push_id
             except Exception as e:  # noqa: BLE001
                 _log(f"推送监听内容失败: {e}")
+                break  # Stop here; unacked items (this one included) retry next tick, in order.
 
-        for item in data.get("files") or []:
-            await _send_file_push(opts, target, item)
+        for entry in data.get("files") or []:
+            file_id = entry.get("id")
+            try:
+                await _send_file_push(opts, target, entry)
+                if file_id is not None:
+                    ack_files = file_id
+            except Exception as e:  # noqa: BLE001
+                _log(f"推送文件失败: {e}")
+                break
 
 
 async def serve() -> None:
