@@ -108,8 +108,20 @@ class AckQueue<T> {
   private items: T[] = [];
   private baseSeq = 0;
 
+  /**
+   * Fired after every push()/ack() with the current contents, so the plugin
+   * can mirror them into BridgeData and persist. Without this, an unacked
+   * item only ever lived in this in-memory array - surviving the relay.py
+   * transit problem this class was built to fix, but still lost outright if
+   * the *plugin itself* reloads/crashes before relay.py ever fetched it (a
+   * real, non-theoretical case: every fix this bridge ships requires exactly
+   * that reload). Persisting closes the same class of gap one layer up.
+   */
+  constructor(private onChange?: (items: T[]) => void) {}
+
   push(...newItems: T[]): void {
     this.items.push(...newItems);
+    this.onChange?.(this.items);
   }
 
   get length(): number {
@@ -128,6 +140,7 @@ class AckQueue<T> {
     if (removeCount <= 0) return;
     this.items.splice(0, removeCount);
     this.baseSeq += removeCount;
+    this.onChange?.(this.items);
   }
 }
 
@@ -160,6 +173,15 @@ interface BridgeData {
    * against a stale count from a different conversation.
    */
   lastSeenConversationId: string | null;
+  /**
+   * Mirror of pendingPushes'/pendingFiles' current (unacked) contents - see
+   * AckQueue's onChange. Rehydrated into the live AckQueues in onload() so a
+   * plugin reload/crash with content still queued but not yet fetched by
+   * relay.py doesn't lose it; onunload's flush (see that comment) makes sure
+   * whatever's here on disk is current at the moment of a reload.
+   */
+  pendingPushQueue: string[];
+  pendingFileQueue: PendingFileItem[];
   /**
    * Provider to use for the *next* new conversation (set via /provider).
    * Irrelevant once bound to a conversation - that conversation's own
@@ -382,6 +404,8 @@ const DEFAULT_DATA: BridgeData = {
   listeningConversationId: null,
   lastSeenMessageCount: 0,
   lastSeenConversationId: null,
+  pendingPushQueue: [],
+  pendingFileQueue: [],
   providerId: null,
   progressiveReply: false,
   scheduledSends: [],
@@ -412,7 +436,10 @@ export default class WeChatBridgePlugin extends Plugin {
   private server: http.Server | null = null;
   private data: BridgeData = { ...DEFAULT_DATA };
   /** Pushes queued by the /listen poller, drained (ack-based, see AckQueue) by the relay's /pending polling. */
-  private pendingPushes = new AckQueue<string>();
+  private pendingPushes = new AckQueue<string>((items) => {
+    this.data.pendingPushQueue = items;
+    void this.saveData(this.data);
+  });
   /** tab.id's currently being driven by this plugin's own sendChatMessage(), so
    * the /listen poller does not mistake a WeChat-originated turn for a desktop
    * one. A set, not a single flag, because sends to different tabs can now be
@@ -450,7 +477,10 @@ export default class WeChatBridgePlugin extends Plugin {
    */
   private progressiveCursors: Map<string, { pushedMessageCount: number; pushedBlocksInCurrent: number; everPushed: boolean }> = new Map();
   /** Files queued by /send or /getfile, drained (ack-based, see AckQueue) by relay.py through /pending (same shape as pendingPushes for text). */
-  private pendingFiles = new AckQueue<PendingFileItem>();
+  private pendingFiles = new AckQueue<PendingFileItem>((items) => {
+    this.data.pendingFileQueue = items;
+    void this.saveData(this.data);
+  });
   /**
    * The candidate list built by the most recent /files call, for /getfile N
    * to index into - same pattern as lastListedIds for /switch. Not
@@ -464,6 +494,15 @@ export default class WeChatBridgePlugin extends Plugin {
   async onload() {
     const saved = await this.loadData();
     this.data = { ...DEFAULT_DATA, ...(saved ?? {}) };
+
+    // Rehydrate anything that was still queued-but-unacked when this plugin
+    // last unloaded (see onunload's flush and AckQueue's onChange) - a
+    // reload must not silently drop content relay.py hadn't fetched yet.
+    // relay.py itself restarts alongside this plugin (RelayManager, below),
+    // so its own ack bookkeeping restarts at the same point too; nothing on
+    // its side needs to "catch up" past that.
+    if (this.data.pendingPushQueue.length > 0) this.pendingPushes.push(...this.data.pendingPushQueue);
+    if (this.data.pendingFileQueue.length > 0) this.pendingFiles.push(...this.data.pendingFileQueue);
 
     const adapter = this.app.vault.adapter;
     if (adapter instanceof FileSystemAdapter) {
