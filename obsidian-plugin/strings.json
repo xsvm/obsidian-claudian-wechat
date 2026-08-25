@@ -109,6 +109,10 @@
     "zh": "（插件刚重新连接，补发一条你还没回答的问题/请求）",
     "en": "(Plugin just reconnected - resending a question/request you haven't answered yet)"
   },
+  "answeredOnDesktop": {
+    "zh": "（上一条问题/请求已经在 Claudian 桌面端回答，这里不用再回复了）",
+    "en": "(The previous question/request was already answered on the Claudian desktop app - no need to reply here)"
+  },
   "askUserQuestionHeader": {
     "zh": "Claudian 有问题想问你：",
     "en": "Claudian is asking you something:"

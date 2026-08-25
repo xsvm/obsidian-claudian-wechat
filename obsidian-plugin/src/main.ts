@@ -360,6 +360,23 @@ interface ParsedQuestion {
 type WeChatPatchedInputController = NonNullable<ClaudianTab['controllers']['inputController']> & {
   __wechatBridgeOwner?: unknown;
   __wechatPendingInteractive?: PendingInteractive;
+  /**
+   * Claudian's genuinely-native handleAskUserQuestion/handleApprovalRequest,
+   * captured once (ever, across all reloads) the first time
+   * installInteractiveHooks sees this inputController - i.e. before anyone
+   * has patched it. Kept around so the headless path can call the native
+   * handler *alongside* the WeChat push instead of *instead of* it, so a
+   * user sitting at the desktop still sees Claudian's own inline widget and
+   * isn't left staring at nothing just because this tab also happens to be
+   * WeChat-bound.
+   */
+  __wechatOriginalHandleAskUserQuestion?: (input: any) => Promise<Record<string, string | string[]> | null>;
+  __wechatOriginalHandleApprovalRequest?: (
+    kind: string,
+    details: any,
+    title: string,
+    opts: any,
+  ) => Promise<'accept' | 'acceptForSession' | 'decline' | 'cancel'>;
 };
 
 type PendingInteractive =
@@ -2048,6 +2065,16 @@ export default class WeChatBridgePlugin extends Plugin {
       this.pendingPushes.push(`${this.t('reconnectedPendingPrefix', lang)}\n${ic.__wechatPendingInteractive.promptText}`);
     }
 
+    // Capture the true native handlers exactly once, ever, the first time we
+    // ever see this inputController - i.e. before it's been patched by any
+    // instance. Must happen before the owner check below (which short-circuits
+    // on every call after the first patch), otherwise a post-reload re-patch
+    // would capture the *previous* instance's headless wrapper as "native".
+    if (!ic.__wechatOriginalHandleAskUserQuestion && ic.handleAskUserQuestion) {
+      ic.__wechatOriginalHandleAskUserQuestion = ic.handleAskUserQuestion.bind(ic);
+      ic.__wechatOriginalHandleApprovalRequest = ic.handleApprovalRequest?.bind(ic);
+    }
+
     if (ic.__wechatBridgeOwner === this) return;
     ic.__wechatBridgeOwner = this;
     ic.handleAskUserQuestion = async (input: any) => this.handleAskUserQuestionHeadless(tab, input);
@@ -2092,13 +2119,38 @@ export default class WeChatBridgePlugin extends Plugin {
     lines.push('\n' + this.t(questions.length > 1 ? 'askUserQuestionUsageMulti' : 'askUserQuestionUsageSingle', lang));
     const promptText = lines.join('\n');
 
-    return new Promise((resolve) => {
-      const ic = tab.controllers.inputController as WeChatPatchedInputController;
-      const pending: PendingInteractive = { kind: 'question', tabId: tab.id, questions, selections: new Map(), resolve, promptText, sourceIc: ic };
+    const ic = tab.controllers.inputController as WeChatPatchedInputController;
+    let pending: Extract<PendingInteractive, { kind: 'question' }> | null = null;
+    let settled = false;
+
+    const wechatPromise = new Promise<Record<string, string | string[]> | null>((resolve) => {
+      pending = {
+        kind: 'question', tabId: tab.id, questions, selections: new Map(), promptText, sourceIc: ic,
+        resolve: (value) => { settled = true; resolve(value); },
+      };
       this.pendingInteractive = pending;
       ic.__wechatPendingInteractive = pending;
       this.pendingPushes.push(promptText);
     });
+
+    // Also drive Claudian's own native inline widget in parallel: a user
+    // sitting at the desktop right now should still see and be able to
+    // answer the question there, instead of finding the UI apparently
+    // frozen just because this tab is also WeChat-bound. Whichever side
+    // answers first wins; the other is cleaned up.
+    const nativeHandler = ic.__wechatOriginalHandleAskUserQuestion;
+    const nativePromise: Promise<Record<string, string | string[]> | null> = nativeHandler
+      ? Promise.resolve(nativeHandler(input)).then((value) => {
+          if (!settled && pending) {
+            settled = true;
+            this.clearPendingInteractive(pending);
+            this.pendingPushes.push(this.t('answeredOnDesktop', lang));
+          }
+          return value;
+        }).catch(() => null)
+      : new Promise<Record<string, string | string[]> | null>(() => {}); // no native handler available - never resolves, WeChat side is the only path
+
+    return Promise.race([wechatPromise, nativePromise]);
   }
 
   /** Headless stand-in for Claudian's inline command/file/permission approval widget. */
@@ -2114,13 +2166,35 @@ export default class WeChatBridgePlugin extends Plugin {
       ? details.command
       : String(details?.reason ?? title ?? kind);
     const promptText = this.t('approvalHeader', lang, title, desc);
-    return new Promise((resolve) => {
-      const ic = tab.controllers.inputController as WeChatPatchedInputController;
-      const pending: PendingInteractive = { kind: 'approval', tabId: tab.id, title, resolve, promptText, sourceIc: ic };
+    const ic = tab.controllers.inputController as WeChatPatchedInputController;
+    let pending: Extract<PendingInteractive, { kind: 'approval' }> | null = null;
+    let settled = false;
+
+    const wechatPromise = new Promise<'accept' | 'acceptForSession' | 'decline' | 'cancel'>((resolve) => {
+      pending = {
+        kind: 'approval', tabId: tab.id, title, promptText, sourceIc: ic,
+        resolve: (value) => { settled = true; resolve(value); },
+      };
       this.pendingInteractive = pending;
       ic.__wechatPendingInteractive = pending;
       this.pendingPushes.push(promptText);
     });
+
+    // See handleAskUserQuestionHeadless: also drive the native approval
+    // widget in parallel so a desktop user isn't stuck looking at nothing.
+    const nativeHandler = ic.__wechatOriginalHandleApprovalRequest;
+    const nativePromise: Promise<'accept' | 'acceptForSession' | 'decline' | 'cancel'> = nativeHandler
+      ? Promise.resolve(nativeHandler(kind, details, title, _opts)).then((value) => {
+          if (!settled && pending) {
+            settled = true;
+            this.clearPendingInteractive(pending);
+            this.pendingPushes.push(this.t('answeredOnDesktop', lang));
+          }
+          return value;
+        }).catch(() => 'cancel' as const)
+      : new Promise<'accept' | 'acceptForSession' | 'decline' | 'cancel'>(() => {});
+
+    return Promise.race([wechatPromise, nativePromise]);
   }
 
   /**
