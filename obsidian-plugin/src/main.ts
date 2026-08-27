@@ -1488,7 +1488,16 @@ export default class WeChatBridgePlugin extends Plugin {
       // along as `<linked_note>` context on this send (see ClaudianTab.ui's
       // fileContextManager doc comment for why). WeChat has no way to see or
       // veto that, so pre-empt it before every bridge-driven send.
-      tab.ui.fileContextManager?.markCurrentNoteSent();
+      //
+      // Guarded with a typeof check (not just `?.`) because this was
+      // reverse-engineered from Claudian's internals: if a Claudian update
+      // renames/removes/changes the shape of fileContextManager, `?.` alone
+      // would still throw "markCurrentNoteSent is not a function" and abort
+      // the whole send - best-effort here, a missed pre-empt is much less
+      // bad than silently failing to deliver the user's message at all.
+      if (typeof tab.ui.fileContextManager?.markCurrentNoteSent === 'function') {
+        tab.ui.fileContextManager.markCurrentNoteSent();
+      }
 
       const beforeCount = tab.state.messages.length;
       // Reconstruct the same shape Claudian's own paste/drop handler builds
