@@ -1,4 +1,4 @@
-# obsidian-claudian-wechat
+# Claudian WeChat Bridge
 
 中文 | [English](README.md)
 

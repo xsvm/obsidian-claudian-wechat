@@ -21,7 +21,7 @@ export class WeChatBridgeSettingTab extends PluginSettingTab {
   private async render(): Promise<void> {
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.createEl('h2', { text: 'WeChat Bridge' });
+    new Setting(containerEl).setName('Claudian WeChat Bridge').setHeading();
 
     const relayManager = this.plugin.getRelayManager();
     if (!relayManager) {
@@ -49,7 +49,7 @@ export class WeChatBridgeSettingTab extends PluginSettingTab {
       this.renderConnectedActions(containerEl, relayManager);
     }
 
-    containerEl.createEl('h3', { text: 'About' });
+    new Setting(containerEl).setName('About').setHeading();
     containerEl.createEl('p', {
       text:
         'This tab only manages the WeChat connection itself. Conversation switching, model/effort/' +
@@ -77,9 +77,11 @@ export class WeChatBridgeSettingTab extends PluginSettingTab {
         onQrCode: (url) => {
           status.setText('Scan with WeChat:');
           const qrDiv = section.createDiv();
-          qrDiv.style.display = 'flex';
-          qrDiv.style.justifyContent = 'center';
-          qrDiv.style.padding = '12px 0';
+          qrDiv.setCssStyles({
+            display: 'flex',
+            justifyContent: 'center',
+            padding: '12px 0',
+          });
           renderQrSvg(qrDiv, url);
         },
         onSuccess: () => {

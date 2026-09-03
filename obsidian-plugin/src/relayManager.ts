@@ -205,7 +205,7 @@ export class RelayManager {
         child.on('error', (err) => {
           if (!settled) {
             callbacks.onFailed(err.message);
-            reject(err);
+            reject(err instanceof Error ? err : new Error(String(err)));
           }
         });
         child.on('exit', (code) => {

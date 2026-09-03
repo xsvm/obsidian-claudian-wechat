@@ -10,11 +10,16 @@ export function renderQrSvg(container: HTMLElement, url: string, sizePx = 260): 
   qr.addData(url);
   qr.make();
 
-  container.innerHTML = qr.createSvgTag({ cellSize: 5, margin: 4, scalable: true });
-  const svg = container.querySelector('svg');
+  const svgString = qr.createSvgTag({ cellSize: 5, margin: 4, scalable: true });
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(svgString, 'image/svg+xml');
+  const svg = doc.querySelector('svg');
   if (svg) {
-    svg.style.width = `${sizePx}px`;
-    svg.style.height = `${sizePx}px`;
+    (svg as unknown as HTMLElement).setCssStyles?.({
+      width: `${sizePx}px`,
+      height: `${sizePx}px`,
+    });
+    container.appendChild(document.importNode(svg, true));
   }
 }
 
@@ -32,13 +37,17 @@ export class QrLoginModal extends Modal {
     contentEl.createEl('h2', { text: this.title });
 
     const qrContainer = contentEl.createDiv();
-    qrContainer.style.display = 'flex';
-    qrContainer.style.justifyContent = 'center';
-    qrContainer.style.padding = '12px 0';
+    qrContainer.setCssStyles({
+      display: 'flex',
+      justifyContent: 'center',
+      padding: '12px 0',
+    });
     renderQrSvg(qrContainer, this.qrUrl);
 
     this.statusEl = contentEl.createEl('p', { text: 'Waiting for scan...' });
-    this.statusEl.style.textAlign = 'center';
+    this.statusEl.setCssStyles({
+      textAlign: 'center',
+    });
   }
 
   setStatus(text: string): void {

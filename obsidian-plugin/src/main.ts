@@ -792,7 +792,7 @@ export default class WeChatBridgePlugin extends Plugin {
 
     for (let attempt = 0; attempt < MAX_PORT_ATTEMPTS; attempt++) {
       const candidate = PREFERRED_PORT + attempt;
-      // eslint-disable-next-line no-await-in-loop
+      // eslint-disable-next-line no-await-in-loop -- sequential port probe requires attempting one candidate at a time
       const bound = await this.tryListen(server, candidate);
       if (bound) {
         this.server = server;
@@ -1691,7 +1691,7 @@ export default class WeChatBridgePlugin extends Plugin {
           // final block, silently missing the last bit of text. A short
           // grace delay before the final read is a no-cost way to not care
           // whether that's true.
-          await new Promise((resolve) => setTimeout(resolve, 250));
+          await new Promise((resolve) => window.setTimeout(resolve, 250));
           // Computed here, before the final flush, so it can ride along on
           // the very last chunk instead of arriving as its own separate
           // WeChat message (flushProgressive appends it to the last line it
@@ -2582,7 +2582,7 @@ export default class WeChatBridgePlugin extends Plugin {
     const views = this.getClaudianPlugin().getAllViews?.() ?? [];
     const fallbackView = views[0] ?? this.findClaudianViewViaWorkspace();
     if (views.length === 0 && !fallbackView) throw new Error(this.t('noTabManager', lang));
-    const tabManagers = (views.length > 0 ? views : [fallbackView!]).map((v) => v.getTabManager?.()).filter((tm): tm is ClaudianTabManager => !!tm);
+    const tabManagers = (views.length > 0 ? views : [fallbackView]).map((v) => v?.getTabManager?.()).filter((tm): tm is ClaudianTabManager => !!tm);
     if (tabManagers.length === 0) throw new Error(this.t('noTabManager', lang));
     return tabManagers.flatMap((tm) => tm.getAllTabs());
   }
@@ -2632,8 +2632,8 @@ export default class WeChatBridgePlugin extends Plugin {
     const m = text.match(/^\/approve\s+(accept|always|deny|cancel)\b/i);
     if (!m) return this.t('approveUsage', lang);
     const word = m[1].toLowerCase();
-    const decision = word === 'accept' ? 'accept' : word === 'always' ? 'acceptForSession' : word === 'deny' ? 'decline' : 'cancel';
-    pending.resolve(decision as 'accept' | 'acceptForSession' | 'decline' | 'cancel');
+    const decision: 'accept' | 'acceptForSession' | 'decline' | 'cancel' = word === 'accept' ? 'accept' : word === 'always' ? 'acceptForSession' : word === 'deny' ? 'decline' : 'cancel';
+    pending.resolve(decision);
     this.clearPendingInteractive(pending);
     return this.t('approvalResolved', lang, decision);
   }
@@ -2643,14 +2643,6 @@ export default class WeChatBridgePlugin extends Plugin {
    * `tabs.size + pendingTabCreations >= maxTabs` (Claudian's own cap, clamped
    * 3-10 - see main.js's TabManager.createTab). If the bridge's own bound
    * conversation isn't already open as a tab (view was closed/reopened, or
-   * this is the very first message) and the user already has `maxTabs` tabs
-   * open in the desktop UI, createTab() returns null and the caller crashed
-   * with a bare "Cannot read properties of null (reading 'controllers')" -
-   * this is what that error actually was. Rather than fail (or silently
-   * commandeer one of the user's existing tabs), bump the limit by exactly
-   * one slot so the bridge's own tab can be created without disturbing
-   * anything the user already has open. No-ops if there's already room, and
-   * gives up quietly at Claudian's hard cap of 10 (createTab's own null path
    * still applies then; the caller's null check reports it clearly instead
    * of crashing).
    */
