@@ -105,6 +105,24 @@
     "zh": "已切换到供应商: {0}。下一条消息将在这个供应商上开始一个全新的对话。",
     "en": "Switched to provider: {0}. The next message will start a brand-new conversation on it."
   },
+  "modelsClaudeBuiltin": {
+    "zh": "claude 供应商用的是 Claudian 内置的固定模型列表（不是动态发现的），这个命令看不到它 —— 请在 Claudian 桌面端的模型下拉菜单里查看。",
+    "en": "The claude provider uses Claudian's small built-in model list (not dynamically discovered), so this command can't see it - check the model dropdown in Claudian's desktop UI instead."
+  },
+  "modelsNoneDiscovered": {
+    "zh": "还没有为供应商 {0} 发现任何模型。请先在 Claudian 桌面端打开一次这个供应商的设置/模型选择器，触发一次发现，然后再试。",
+    "en": "No models discovered yet for provider {0}. Open that provider's settings/model picker once in Claudian's desktop UI to trigger discovery, then try again."
+  },
+  "modelsHeader": {
+    "zh": "供应商 {0} 已发现的模型：",
+    "en": "Discovered models for provider {0}:"
+  },
+  "modelsDefaultMarker": { "zh": "[默认]", "en": "[default]" },
+  "modelsCurrentMarker": { "zh": "[当前]", "en": "[current]" },
+  "modelsUsageHint": {
+    "zh": "用 /model <模型ID> 切换。",
+    "en": "Use /model <model id> to switch."
+  },
   "reconnectedPendingPrefix": {
     "zh": "（插件刚重新连接，补发一条你还没回答的问题/请求）",
     "en": "(Plugin just reconnected - resending a question/request you haven't answered yet)"
@@ -259,6 +277,7 @@
       "/getfile N — 获取 /files 列出的文件，多个用逗号分隔如 /getfile 1,2",
       "/send <路径> — 直接发送 vault 内某个文件",
       "/schedule HH:MM 内容 — 定时推送提醒到微信，发送 /schedule 查看完整用法",
+      "/models [供应商] — 查看该供应商已发现的可用模型（不填=当前供应商）",
       "/model <名称> — 切换模型，如 /model opus",
       "/effort <等级> — 切换思考强度，如 /effort high",
       "/permission <模式> — 切换权限模式，如 /permission yolo",
@@ -285,6 +304,7 @@
       "/getfile N — fetch a file from /files, comma-separate for several, e.g. /getfile 1,2",
       "/send <path> — send a specific file from the vault directly",
       "/schedule HH:MM text — push a reminder to WeChat; send /schedule alone for full usage",
+      "/models [provider] — list discovered models for that provider (omit for the current one)",
       "/model <name> — switch model, e.g. /model opus",
       "/effort <level> — switch effort level, e.g. /effort high",
       "/permission <mode> — switch permission mode, e.g. /permission yolo",

@@ -861,6 +861,7 @@ export default class WeChatBridgePlugin extends Plugin {
       },
       { pattern: /^\/provider\s+(\S+)/i, run: (m, lang) => this.switchProvider(m[1].toLowerCase(), lang) },
       { pattern: /^\/provider\b/i, run: (_m, lang) => this.t('providerUsage', lang, this.getEnabledProviders().join(', ')) },
+      { pattern: /^\/models\s*(\S+)?\b/i, run: (m, lang) => this.listAvailableModels(m[1]?.toLowerCase(), lang) },
       { pattern: /^\/ls(?:\s+(all))?\b/i, run: (m, lang) => this.listConversations(lang, Boolean(m[1])) },
       { pattern: /^\/goto\s+(\d+)/i, run: (m, lang) => this.switchConversation(Number(m[1]), lang) },
       { pattern: /^\/status\b/i, run: (_m, lang) => this.statusText(lang) },
@@ -1020,6 +1021,66 @@ export default class WeChatBridgePlugin extends Plugin {
     this.data.conversationId = null;
     await this.saveData(this.data);
     return this.t('providerSwitched', lang, name);
+  }
+
+  /**
+   * Lists the models Claudian currently knows about for a provider (default:
+   * whichever one /model would target right now).
+   *
+   * Reverse-engineered source: for the CLI-backed providers (codex, pi,
+   * opencode, grok - anything but claude), Claudian doesn't ship a static
+   * model list at all. It shells out to that provider's CLI to discover what
+   * models are actually available on this machine/account, then caches the
+   * result at `settings.providerConfigs.<id>.discoveredModels` (each entry
+   * `{model, displayName, description, isDefault, ...}` - see
+   * ProviderSettingsCoordinator's normalizeStored/DXe in Claudian's own
+   * main.js). That cache is plain persisted settings data, unlike the
+   * registry class that computes it (a module-private static class not
+   * reachable from outside Claudian's own bundle) - so this reads the cache
+   * directly instead of trying to call Claudian's internal discovery API.
+   * `claude` has no such cache (its model list is a small built-in constant
+   * baked into Claudian's UI code, not discovered) so it's called out
+   * separately rather than guessed at and hardcoded here - hardcoding it
+   * would just trade today's problem for a future silent-staleness one.
+   */
+  private async listAvailableModels(providerArg: string | undefined, lang: Lang): Promise<string> {
+    const enabled = this.getEnabledProviders();
+    let providerId: ProviderId;
+    if (providerArg) {
+      if (!(enabled as string[]).includes(providerArg)) {
+        return this.t('providerUnknown', lang, providerArg, enabled.join(', '));
+      }
+      providerId = providerArg as ProviderId;
+    } else {
+      providerId = this.resolveActiveProviderId(await this.readAllConversationMeta());
+    }
+
+    const settings = this.getClaudianPlugin().settings ?? {};
+    if (providerId === 'claude') {
+      return this.t('modelsClaudeBuiltin', lang);
+    }
+
+    const discovered = settings.providerConfigs?.[providerId]?.discoveredModels;
+    if (!Array.isArray(discovered) || discovered.length === 0) {
+      return this.t('modelsNoneDiscovered', lang, providerId);
+    }
+
+    const isActiveInUi = providerId === (settings.settingsProvider ?? 'claude');
+    const current = isActiveInUi ? settings.model : settings.savedProviderModel?.[providerId];
+
+    const lines = [this.t('modelsHeader', lang, providerId)];
+    for (const entry of discovered) {
+      const id = typeof entry?.model === 'string' ? entry.model : null;
+      if (!id) continue;
+      const displayName = typeof entry?.displayName === 'string' && entry.displayName ? entry.displayName : id;
+      const markers = [
+        entry?.isDefault ? this.t('modelsDefaultMarker', lang) : '',
+        id === current ? this.t('modelsCurrentMarker', lang) : '',
+      ].filter(Boolean).join(' ');
+      lines.push(`- ${id}${displayName !== id ? ` (${displayName})` : ''}${markers ? ` ${markers}` : ''}`);
+    }
+    lines.push('\n' + this.t('modelsUsageHint', lang));
+    return lines.join('\n');
   }
 
   // ---- conversation list / switch / new ----
