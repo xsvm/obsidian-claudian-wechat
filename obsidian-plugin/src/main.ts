@@ -1611,9 +1611,24 @@ export default class WeChatBridgePlugin extends Plugin {
           // after a /compact the meta usage numbers may not have caught up
           // yet, so skip the context-window line for a compact turn here too.
           const turnSoFar = tab.state.messages.length >= beforeCount ? tab.state.messages.slice(beforeCount) : tab.state.messages;
-          const compactedSoFar = this.extractDispatchText(turnSoFar, lang).compacted;
-          const ctxLineForFlush = compactedSoFar ? null : await this.contextWindowLine(tab.conversationId, lang);
-          pushedAnything = this.flushProgressive(tab, beforeCount, true, ctxLineForFlush ?? undefined);
+          const dispatchSoFar = this.extractDispatchText(turnSoFar, lang);
+          const ctxLineForFlush = dispatchSoFar.compacted ? null : await this.contextWindowLine(tab.conversationId, lang);
+          // `dispatchSoFar.empty` means the whole turn - not just this poll
+          // tick - never produced any real narrative text (and it wasn't a
+          // legitimate no-text /compact either). Previously this fell
+          // through silently: flushProgressive had nothing to attach the
+          // context-window line to, so it just sent that bare number on its
+          // own, which reads exactly like a normal (if terse) reply - a
+          // turn that genuinely failed partway (e.g. a stale/detached tab
+          // reference, or the provider erroring after sendMessage() had
+          // already resolved) looked identical to "worked fine, nothing
+          // to say". Surface extractDispatchText's own "did this fail?"
+          // warning here too so that silent-failure case is never mistaken
+          // for success again.
+          const suffixForFlush = dispatchSoFar.empty
+            ? `${dispatchSoFar.text}${ctxLineForFlush ? `\n\n${ctxLineForFlush}` : ''}`
+            : (ctxLineForFlush ?? undefined);
+          pushedAnything = this.flushProgressive(tab, beforeCount, true, suffixForFlush);
           this.progressiveCursors.delete(tab.id);
         }
       }
@@ -1784,7 +1799,7 @@ export default class WeChatBridgePlugin extends Plugin {
    * round-trip); only the `text` content blocks across all of them are
    * user-facing, so those are concatenated in order.
    */
-  private extractDispatchText(messages: ClaudianChatMessage[], lang: Lang): { text: string; compacted: boolean } {
+  private extractDispatchText(messages: ClaudianChatMessage[], lang: Lang): { text: string; compacted: boolean; empty: boolean } {
     const parts: string[] = [];
     let sawCompactBoundary = false;
     for (const msg of messages) {
@@ -1799,14 +1814,19 @@ export default class WeChatBridgePlugin extends Plugin {
         if (trimmed) parts.push(trimmed);
       }
     }
-    if (parts.length > 0) return { text: parts.join('\n\n'), compacted: sawCompactBoundary };
+    if (parts.length > 0) return { text: parts.join('\n\n'), compacted: sawCompactBoundary, empty: false };
     // /compact (and equivalents on other providers) legitimately produce no
     // narrative text on success - the only sign it happened is a
     // context_compacted boundary block. Without this check that success case
     // was indistinguishable from a genuinely empty/errored turn, and got the
     // scary "did this fail?" message below even though nothing went wrong.
-    if (sawCompactBoundary) return { text: this.t('compactedNoText', lang), compacted: true };
-    return { text: this.t('noDispatchText', lang), compacted: false };
+    if (sawCompactBoundary) return { text: this.t('compactedNoText', lang), compacted: true, empty: false };
+    // `empty: true` here (as opposed to non-progressive replies, which just
+    // surface this text directly) also lets the progressive path
+    // (sendChatMessage's finally block) tell "the turn genuinely produced
+    // nothing" apart from "nothing new since the last progressive tick" -
+    // see the comment there for why that distinction matters.
+    return { text: this.t('noDispatchText', lang), compacted: false, empty: true };
   }
 
   // ---- outbound files/images: /files, /getfile, /send ----
