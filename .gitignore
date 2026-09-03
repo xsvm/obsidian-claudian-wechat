@@ -7,3 +7,4 @@ __pycache__/
 qrcode*.png
 venv/
 relay.pid
+*.zip
