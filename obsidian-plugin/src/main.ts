@@ -474,6 +474,15 @@ const WIKILINK_RE = /!?\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g;
  * provider, since a false-positive candidate just gets filtered out later by
  * queueFileForSend's own existence check anyway. */
 const TOOL_INPUT_PATH_KEYS = ['file_path', 'filePath', 'path', 'notebook_path', 'notebookPath'];
+/**
+ * How long a bare (caption-less) inbound image is held before it's sent on
+ * its own. Most photo-picker flows on WeChat deliver the image and any
+ * follow-up caption as two separate messages, not one - without this wait,
+ * a bare image immediately fires off its own isolated, caption-less
+ * Claudian turn, and the caption the user meant to attach lands a moment
+ * later as an unrelated second turn instead of finishing the first one.
+ */
+const IMAGE_CAPTION_WAIT_MS = 12000;
 
 export default class WeChatBridgePlugin extends Plugin {
   private server: http.Server | null = null;
@@ -488,6 +497,16 @@ export default class WeChatBridgePlugin extends Plugin {
    * one. A set, not a single flag, because sends to different tabs can now be
    * in flight concurrently (see sendQueues doc comment). */
   private sendingViaBridgeTabIds: Set<string> = new Set();
+  /**
+   * A bare (caption-less) inbound image, held for IMAGE_CAPTION_WAIT_MS
+   * waiting for a follow-up text message to combine with as its caption -
+   * see handleIncoming and flushPendingImageAlone. In-memory only (not
+   * persisted): losing a not-yet-captioned image across a plugin
+   * reload/crash just means it goes out on its own instead, same as if the
+   * wait had simply timed out - not worth the complexity of persisting it.
+   */
+  private pendingImage: IncomingImage | null = null;
+  private pendingImageTimer: number | null = null;
   private relayManager: RelayManager | null = null;
   private pluginDir: string | null = null;
   /**
@@ -810,6 +829,38 @@ export default class WeChatBridgePlugin extends Plugin {
     // request if there's neither text nor an image to act on.
     if (!text && !image) throw new Error(this.t('emptyText', lang));
 
+    // A bare image (no caption in the same WeChat message) is not sent as
+    // its own isolated turn right away - it's held briefly in case the
+    // caption is on its way as a separate message (see IMAGE_CAPTION_WAIT_MS).
+    if (image && !text) {
+      if (this.pendingImage) {
+        // A second bare image arrived before the first one got a caption -
+        // don't silently drop the first one, send it on its own now.
+        const stale = this.pendingImage;
+        this.pendingImage = null;
+        if (this.pendingImageTimer !== null) {
+          window.clearTimeout(this.pendingImageTimer);
+          this.pendingImageTimer = null;
+        }
+        void this.flushPendingImageAloneNow(stale, lang);
+      }
+      this.pendingImage = image;
+      this.pendingImageTimer = window.setTimeout(() => void this.flushPendingImageAlone(lang), IMAGE_CAPTION_WAIT_MS);
+      return this.t('imageBufferedWaitingCaption', lang, Math.round(IMAGE_CAPTION_WAIT_MS / 1000));
+    }
+
+    // A plain text message (not a bridge command) arriving while an image is
+    // still buffered is treated as that image's caption - combine them into
+    // one turn instead of two disjoint ones.
+    if (this.pendingImage && text && !text.startsWith('/')) {
+      image = this.pendingImage;
+      this.pendingImage = null;
+      if (this.pendingImageTimer !== null) {
+        window.clearTimeout(this.pendingImageTimer);
+        this.pendingImageTimer = null;
+      }
+    }
+
     // Every bridge command is tried, in order, against `text`; the first
     // whose `match` succeeds runs and its result is the reply. None of these
     // touch sendChatMessageQueued - every one of them either reads in-memory
@@ -827,6 +878,30 @@ export default class WeChatBridgePlugin extends Plugin {
     }
 
     return await this.sendChatMessageQueued(text, lang, image);
+  }
+
+  /** Timer callback for a bare image whose caption never arrived within IMAGE_CAPTION_WAIT_MS - sends it on its own. */
+  private async flushPendingImageAlone(lang: Lang): Promise<void> {
+    const image = this.pendingImage;
+    this.pendingImage = null;
+    this.pendingImageTimer = null;
+    if (!image) return;
+    await this.flushPendingImageAloneNow(image, lang);
+  }
+
+  /**
+   * Actually sends a buffered image on its own, outside the normal
+   * request/response cycle (no WeChat message is waiting on this specific
+   * call), so the result has to go out via the /listen-style push queue
+   * instead of a return value.
+   */
+  private async flushPendingImageAloneNow(image: IncomingImage, lang: Lang): Promise<void> {
+    try {
+      const result = await this.sendChatMessageQueued('', lang, image);
+      this.pendingPushes.push(result);
+    } catch (e) {
+      this.pendingPushes.push(this.t('imageSendFailed', lang, e instanceof Error ? e.message : String(e)));
+    }
   }
 
   /**
@@ -1575,6 +1650,22 @@ export default class WeChatBridgePlugin extends Plugin {
           }]
         : undefined;
 
+      // Guard against the tab we resolved earlier (in getOrCreateWeChatTab,
+      // possibly a while ago if this send was queued behind others) no
+      // longer being the bound conversation by the time we're actually about
+      // to send: the WeChat-bound tab is frequently the very same tab
+      // visible on the desktop, so clicking "New chat" (or switching to a
+      // different conversation) *in that tab* mutates this exact `tab`
+      // object's `conversationId` out from under us. Sending anyway would
+      // silently inject the WeChat user's message into whatever unrelated
+      // conversation now happens to be showing - worse than just failing.
+      // Only applies when there's an actual bound conversation to check
+      // against; a brand-new blank-tab send (conversationIdAtQueueTime ===
+      // null) has nothing to compare to yet.
+      if (conversationIdAtQueueTime && tab.conversationId !== conversationIdAtQueueTime) {
+        throw new Error(this.t('conversationSwitchedBeforeSend', lang));
+      }
+
       const progressive = this.data.progressiveReply;
       let progressiveTimer: number | null = null;
       let pushedAnything = false;
@@ -1631,6 +1722,19 @@ export default class WeChatBridgePlugin extends Plugin {
           pushedAnything = this.flushProgressive(tab, beforeCount, true, suffixForFlush);
           this.progressiveCursors.delete(tab.id);
         }
+      }
+
+      // Switched away *during* the send (as opposed to the guard above,
+      // which only catches it *before* sendMessage() was even called) - the
+      // message already went to inputController.sendMessage() on the
+      // original tab object, so this can't be prevented, only reported.
+      // Claudian exposes no signal for what a mid-flight tab-object mutation
+      // actually did to the turn it was running, so don't guess at a normal
+      // reply (which might be a stale/wrong-conversation context-window
+      // line, or the noDispatchText warning above talking about the wrong
+      // thing) - say plainly that the conversation changed mid-send instead.
+      if (conversationIdAtQueueTime && tab.conversationId !== conversationIdAtQueueTime) {
+        return this.t('conversationSwitchedDuringSend', lang);
       }
 
       // Only rebind data.conversationId / lastSeenMessageCount if nothing

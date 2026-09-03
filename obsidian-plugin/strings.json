@@ -105,6 +105,22 @@
     "zh": "已切换到供应商: {0}。下一条消息将在这个供应商上开始一个全新的对话。",
     "en": "Switched to provider: {0}. The next message will start a brand-new conversation on it."
   },
+  "conversationSwitchedBeforeSend": {
+    "zh": "发送前发现电脑端已经切换到了别的对话，为避免把这条消息发错对话，已取消发送 —— 请重试一次。",
+    "en": "The desktop app had already switched to a different conversation right before this could be sent - cancelled to avoid delivering it into the wrong conversation. Please retry."
+  },
+  "conversationSwitchedDuringSend": {
+    "zh": "电脑端在处理这条消息的过程中切换了对话，结果不确定（可能没处理完，也可能被切走了）。建议用 /hist 确认一下，必要时重新发送。",
+    "en": "The desktop app switched conversations while this message was still being processed - the outcome is uncertain (it may not have finished, or landed somewhere unexpected). Check with /hist and resend if needed."
+  },
+  "imageBufferedWaitingCaption": {
+    "zh": "图片已收到，{0} 秒内发的文字会作为这张图的说明一起发送；如果不追加文字，会自动单独发送这张图。",
+    "en": "Photo received - any text sent within {0}s will be attached as its caption; otherwise it'll be sent on its own automatically."
+  },
+  "imageSendFailed": {
+    "zh": "[桥接出错] 单独发送图片时失败：{0}",
+    "en": "[bridge error] Failed to send the buffered photo on its own: {0}"
+  },
   "modelsClaudeBuiltin": {
     "zh": "claude 供应商用的是 Claudian 内置的固定模型列表（不是动态发现的），这个命令看不到它 —— 请在 Claudian 桌面端的模型下拉菜单里查看。",
     "en": "The claude provider uses Claudian's small built-in model list (not dynamically discovered), so this command can't see it - check the model dropdown in Claudian's desktop UI instead."
