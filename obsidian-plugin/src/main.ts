@@ -792,7 +792,6 @@ export default class WeChatBridgePlugin extends Plugin {
 
     for (let attempt = 0; attempt < MAX_PORT_ATTEMPTS; attempt++) {
       const candidate = PREFERRED_PORT + attempt;
-      // eslint-disable-next-line no-await-in-loop -- sequential port probe requires attempting one candidate at a time
       const bound = await this.tryListen(server, candidate);
       if (bound) {
         this.server = server;

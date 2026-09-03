@@ -34,7 +34,7 @@ export class QrLoginModal extends Modal {
   onOpen(): void {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.createEl('h2', { text: this.title });
+    this.titleEl.setText(this.title);
 
     const qrContainer = contentEl.createDiv();
     qrContainer.setCssStyles({
