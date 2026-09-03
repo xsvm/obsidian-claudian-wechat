@@ -3,7 +3,9 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "build": "node esbuild.config.mjs"
+    "build": "node esbuild.config.mjs",
+    "test:verify": "node scripts/verify-install.mjs",
+    "prepublish-check": "node esbuild.config.mjs && node scripts/verify-install.mjs"
   },
   "dependencies": {
     "qrcode-generator": "^1.4.4"

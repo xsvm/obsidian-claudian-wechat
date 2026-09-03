@@ -268,17 +268,46 @@ export class RelayManager {
 
   private async ensureVenv(systemPython: string): Promise<string> {
     const venvPython = this.venvPython();
-    if (await this.fileExists(venvPython)) return venvPython;
+    const venvExists = await this.fileExists(venvPython);
+    const depSignature = PIP_PACKAGES.slice().sort().join(';');
+    const depSigPath = path.join(this.venvDir(), '.installed_deps');
 
-    new Notice('WeChat Bridge: setting up a private Python environment (first run only)...', 10000);
-    const createArgs = systemPython === 'py'
-      ? ['-3', '-m', 'venv', this.venvDir()]
-      : ['-m', 'venv', this.venvDir()];
-    await execFileAsync(systemPython, createArgs);
+    if (!venvExists) {
+      new Notice('WeChat Bridge: setting up a private Python environment (first run only)...', 10000);
+      const createArgs = systemPython === 'py'
+        ? ['-3', '-m', 'venv', this.venvDir()]
+        : ['-m', 'venv', this.venvDir()];
+      await execFileAsync(systemPython, createArgs);
 
-    await execFileAsync(venvPython, ['-m', 'pip', 'install', '--upgrade', 'pip']);
-    await execFileAsync(venvPython, ['-m', 'pip', 'install', ...PIP_PACKAGES]);
-    new Notice('WeChat Bridge: Python environment ready.');
+      await execFileAsync(venvPython, ['-m', 'pip', 'install', '--upgrade', 'pip']);
+      await execFileAsync(venvPython, ['-m', 'pip', 'install', ...PIP_PACKAGES]);
+      try {
+        await fs.writeFile(depSigPath, depSignature, 'utf-8');
+      } catch {
+        // non-fatal
+      }
+      new Notice('WeChat Bridge: Python environment ready.');
+      return venvPython;
+    }
+
+    // Venv exists; verify whether pip packages match current version requirements
+    try {
+      const currentSig = await fs.readFile(depSigPath, 'utf-8');
+      if (currentSig.trim() === depSignature) {
+        return venvPython;
+      }
+    } catch {
+      // Signature missing or unreadable; update packages
+    }
+
+    try {
+      new Notice('WeChat Bridge: updating Python dependencies...', 5000);
+      await execFileAsync(venvPython, ['-m', 'pip', 'install', '--upgrade', ...PIP_PACKAGES]);
+      await fs.writeFile(depSigPath, depSignature, 'utf-8');
+    } catch (e) {
+      console.warn('WeChat Bridge: failed to update python dependencies', e);
+    }
+
     return venvPython;
   }
 

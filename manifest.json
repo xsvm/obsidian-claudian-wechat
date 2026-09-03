@@ -1,0 +1,10 @@
+{
+  "id": "claudian-wechat",
+  "name": "Claudian WeChat Bridge",
+  "version": "1.0.0",
+  "minAppVersion": "1.7.2",
+  "description": "Drive your Obsidian Claudian AI coding agent from WeChat. Chat, send images, switch sessions, run slash commands, and mirror desktop turns to mobile.",
+  "author": "xsvm",
+  "authorUrl": "https://github.com/xsvm",
+  "isDesktopOnly": true
+}

@@ -4,6 +4,7 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import { RelayManager } from './relayManager';
 import { WeChatBridgeSettingTab } from './settingsTab';
+import { EMBEDDED_RELAY_PY, EMBEDDED_STRINGS_JSON } from './embeddedAssets';
 
 /**
  * WeChat Bridge
@@ -574,6 +575,10 @@ export default class WeChatBridgePlugin extends Plugin {
       this.pluginDir = path.join(adapter.getBasePath(), this.manifest.dir ?? `.obsidian/plugins/${this.manifest.id}`);
     }
 
+    if (this.pluginDir) {
+      await this.ensureEmbeddedAssets();
+    }
+
     // Must happen before startServer(): handleIncoming() needs `this.strings`
     // for every reply it produces, including error replies to the very first
     // request. Kept as a plain JSON file next to main.js (see strings.json)
@@ -628,6 +633,33 @@ export default class WeChatBridgePlugin extends Plugin {
   /** Exposed for the settings tab (connection status, QR reconnect, restart/disconnect). */
   getRelayManager(): RelayManager | null {
     return this.relayManager;
+  }
+
+  /**
+   * Ensures essential runtime assets (relay.py, strings.json) exist on disk.
+   * - If installing fresh from the Obsidian Community Store (where only main.js
+   *   and manifest.json are downloaded), this auto-extracts them on first load.
+   * - If updating to a new release where either asset changed, this automatically
+   *   overwrites the on-disk copy to keep them in lockstep with main.js.
+   */
+  private async ensureEmbeddedAssets(): Promise<void> {
+    if (!this.pluginDir) return;
+    await this.ensureFileMatches(path.join(this.pluginDir, 'relay.py'), EMBEDDED_RELAY_PY);
+    await this.ensureFileMatches(path.join(this.pluginDir, STRINGS_FILE_NAME), EMBEDDED_STRINGS_JSON);
+  }
+
+  private async ensureFileMatches(targetPath: string, expectedContent: string): Promise<void> {
+    try {
+      const existing = await fs.readFile(targetPath, 'utf-8');
+      if (existing === expectedContent) return;
+    } catch {
+      // Missing or unreadable: proceed to write
+    }
+    try {
+      await fs.writeFile(targetPath, expectedContent, 'utf-8');
+    } catch (e) {
+      console.error(`[claudian-wechat] Failed to write embedded asset ${targetPath}:`, e);
+    }
   }
 
   // ---- i18n: strings.json loading + lookup ----
