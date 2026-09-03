@@ -21,7 +21,7 @@ export class WeChatBridgeSettingTab extends PluginSettingTab {
   private async render(): Promise<void> {
     const { containerEl } = this;
     containerEl.empty();
-    new Setting(containerEl).setName('Claudian WeChat Bridge').setHeading();
+    new Setting(containerEl).setName('Connection').setHeading();
 
     const relayManager = this.plugin.getRelayManager();
     if (!relayManager) {
