@@ -105,10 +105,6 @@
     "zh": "已切换到供应商: {0}。下一条消息将在这个供应商上开始一个全新的对话。",
     "en": "Switched to provider: {0}. The next message will start a brand-new conversation on it."
   },
-  "conversationSwitchedBeforeSend": {
-    "zh": "发送前发现电脑端已经切换到了别的对话，为避免把这条消息发错对话，已取消发送 —— 请重试一次。",
-    "en": "The desktop app had already switched to a different conversation right before this could be sent - cancelled to avoid delivering it into the wrong conversation. Please retry."
-  },
   "conversationSwitchedDuringSend": {
     "zh": "电脑端在处理这条消息的过程中切换了对话，自动核实后仍未能确定结果（可能没处理完，也可能这个对话已经不在任何窗口里了）。必要时重新发送。",
     "en": "The desktop app switched conversations while this message was still being processed, and an automatic check afterward still couldn't confirm the outcome (it may not have finished, or that conversation is no longer open in any pane). Resend if needed."
@@ -118,16 +114,12 @@
     "en": "(The desktop app switched conversations, but this was automatically confirmed to have gone through anyway - reply from \"{0}\":)\n\n{1}"
   },
   "imageBufferedWaitingCaption": {
-    "zh": "图片已收到，接下来发的文字会作为这张图的说明一起发送；如果不需要配文字，发送 /skip 直接单独发送这张图。",
-    "en": "Photo received - the next text you send will be attached as its caption. If you don't need a caption, send /skip to send it on its own right now."
+    "zh": "如需直接发送图片，请输入 /skip；如需追加文字，请直接发送。",
+    "en": "To send the photo(s) as-is, send /skip. To add a caption, just send it as text."
   },
   "noPendingImage": {
     "zh": "没有等待补充说明的图片。",
     "en": "There's no buffered image waiting for a caption."
-  },
-  "imageSendFailed": {
-    "zh": "[桥接出错] 单独发送图片时失败：{0}",
-    "en": "[bridge error] Failed to send the buffered photo on its own: {0}"
   },
   "modelsClaudeBuiltin": {
     "zh": "claude 供应商用的是 Claudian 内置的固定模型列表（不是动态发现的），这个命令看不到它 —— 请在 Claudian 桌面端的模型下拉菜单里查看。",

@@ -489,14 +489,16 @@ export default class WeChatBridgePlugin extends Plugin {
    * in flight concurrently (see sendQueues doc comment). */
   private sendingViaBridgeTabIds: Set<string> = new Set();
   /**
-   * A bare (caption-less) inbound image, held indefinitely waiting for a
-   * follow-up text message to combine with as its caption (or an explicit
-   * /skip to send it alone) - see handleIncoming. In-memory only (not
-   * persisted): a not-yet-captioned image lost across a plugin
-   * reload/crash is simply gone, same as any other in-flight bridge state -
-   * not worth the complexity of persisting it.
+   * Bare (caption-less) inbound images, held indefinitely waiting for a
+   * follow-up text message to combine with as their shared caption (or an
+   * explicit /skip to send them alone) - see handleIncoming. Multiple bare
+   * images sent back to back accumulate here instead of replacing each
+   * other, so several photos plus one caption become a single turn. In-
+   * memory only (not persisted): images lost across a plugin reload/crash
+   * before a caption or /skip arrives are simply gone, same as any other
+   * in-flight bridge state - not worth the complexity of persisting them.
    */
-  private pendingImage: IncomingImage | null = null;
+  private pendingImages: IncomingImage[] = [];
   private relayManager: RelayManager | null = null;
   private pluginDir: string | null = null;
   /**
@@ -820,29 +822,29 @@ export default class WeChatBridgePlugin extends Plugin {
     if (!text && !image) throw new Error(this.t('emptyText', lang));
 
     // A bare image (no caption in the same WeChat message) is not sent as
-    // its own isolated turn right away - it's held indefinitely, waiting for
-    // a follow-up caption, until either one arrives as plain text or the
-    // user explicitly sends it on its own with /skip. No auto-timeout: a
-    // silent timed auto-send surprised more than it helped (the whole point
-    // is that WeChat's own timing between "pick a photo" and "type a
-    // caption" is unpredictable), and Claude has no way to guess *when*
-    // the user gave up on typing a caption, so it just doesn't guess.
+    // its own isolated turn right away - it's appended to a buffer, waiting
+    // for a follow-up caption, until either one arrives as plain text or the
+    // user explicitly sends it on its own with /skip. Multiple bare images
+    // sent back to back (WeChat has no built-in multi-select-with-one-
+    // caption flow) accumulate in the same buffer instead of replacing each
+    // other, so "send 3 photos, then one caption" becomes a single turn with
+    // all 3 images. No auto-timeout: a silent timed auto-send surprised more
+    // than it helped (WeChat's own timing between picking photos and typing
+    // a caption is unpredictable), and there's no way to guess *when* the
+    // user is done adding photos or gave up on typing a caption, so it just
+    // doesn't guess - see /skip below for the explicit "I'm done" signal.
     if (image && !text) {
-      if (this.pendingImage) {
-        // A second bare image arrived before the first one got a caption -
-        // don't silently drop the first one, send it on its own now.
-        void this.flushPendingImageAloneNow(this.pendingImage, lang);
-      }
-      this.pendingImage = image;
+      this.pendingImages.push(image);
       return this.t('imageBufferedWaitingCaption', lang);
     }
 
-    // A plain text message (not a bridge command) arriving while an image is
-    // still buffered is treated as that image's caption - combine them into
-    // one turn instead of two disjoint ones.
-    if (this.pendingImage && text && !text.startsWith('/')) {
-      image = this.pendingImage;
-      this.pendingImage = null;
+    // A plain text message (not a bridge command) arriving while images are
+    // still buffered is treated as their caption - combine them into one
+    // turn instead of disjoint ones.
+    let images: IncomingImage[] | undefined = image ? [image] : undefined;
+    if (this.pendingImages.length > 0 && text && !text.startsWith('/')) {
+      images = this.pendingImages;
+      this.pendingImages = [];
     }
 
     // Every bridge command is tried, in order, against `text`; the first
@@ -858,34 +860,18 @@ export default class WeChatBridgePlugin extends Plugin {
     // case them.
     for (const route of this.commandRoutes()) {
       const m = text.match(route.pattern);
-      if (m) return await route.run(m, lang, image);
+      if (m) return await route.run(m, lang, images);
     }
 
-    return await this.sendChatMessageQueued(text, lang, image);
+    return await this.sendChatMessageQueued(text, lang, images);
   }
 
-  /** Handles `/skip`: sends the still-buffered image (see handleIncoming) on its own, right now, with no caption. */
+  /** Handles `/skip`: sends every still-buffered image (see handleIncoming) on its own, right now, with no caption. */
   private async handleSkipCaptionCommand(lang: Lang): Promise<string> {
-    const image = this.pendingImage;
-    if (!image) return this.t('noPendingImage', lang);
-    this.pendingImage = null;
-    return await this.sendChatMessageQueued('', lang, image);
-  }
-
-  /**
-   * Sends a buffered image on its own, outside the normal request/response
-   * cycle a WeChat message would give this a reply slot in (this is only
-   * called when a *second* bare image bumps the first one out of the
-   * buffer, so no request is waiting on this specific call) - the result
-   * has to go out via the /listen-style push queue instead of a return value.
-   */
-  private async flushPendingImageAloneNow(image: IncomingImage, lang: Lang): Promise<void> {
-    try {
-      const result = await this.sendChatMessageQueued('', lang, image);
-      this.pendingPushes.push(result);
-    } catch (e) {
-      this.pendingPushes.push(this.t('imageSendFailed', lang, e instanceof Error ? e.message : String(e)));
-    }
+    const images = this.pendingImages;
+    if (images.length === 0) return this.t('noPendingImage', lang);
+    this.pendingImages = [];
+    return await this.sendChatMessageQueued('', lang, images);
   }
 
   /**
@@ -894,7 +880,7 @@ export default class WeChatBridgePlugin extends Plugin {
    * call (cheap - a few dozen closures) rather than cached, so every `run`
    * can close over `this` without a separate bind step.
    */
-  private commandRoutes(): { pattern: RegExp; run: (m: RegExpMatchArray, lang: Lang, image?: IncomingImage) => Promise<string> | string }[] {
+  private commandRoutes(): { pattern: RegExp; run: (m: RegExpMatchArray, lang: Lang, images?: IncomingImage[]) => Promise<string> | string }[] {
     return [
       { pattern: /^\/answer\b/i, run: (m, lang) => this.handleAnswerCommand(m.input as string, lang) },
       { pattern: /^\/approve\b/i, run: (m, lang) => this.handleApproveCommand(m.input as string, lang) },
@@ -1572,7 +1558,7 @@ export default class WeChatBridgePlugin extends Plugin {
    * (outside this queue entirely - see handleIncoming) is never blocked by
    * either.
    */
-  private async sendChatMessageQueued(text: string, lang: Lang, image?: IncomingImage): Promise<string> {
+  private async sendChatMessageQueued(text: string, lang: Lang, images?: IncomingImage[]): Promise<string> {
     const tab = await this.getOrCreateWeChatTab();
     // Snapshot which conversation this send targets and which one is
     // "current" *before* queuing, not after: if the user fires off /switch or
@@ -1583,7 +1569,7 @@ export default class WeChatBridgePlugin extends Plugin {
     // "current" one by the time it completes.
     const conversationIdAtQueueTime = this.data.conversationId;
     const previous = this.sendQueues.get(tab.id) ?? Promise.resolve();
-    const run = previous.catch(() => {}).then(() => this.sendChatMessage(tab, text, lang, image, conversationIdAtQueueTime));
+    const run = previous.catch(() => {}).then(() => this.sendChatMessage(tab, text, lang, images, conversationIdAtQueueTime));
     // Store a settle-agnostic tail so the *next* queued send for this tab
     // waits for this one regardless of whether it threw, without this
     // rejection also propagating to whoever's awaiting `run` for the reply.
@@ -1595,11 +1581,25 @@ export default class WeChatBridgePlugin extends Plugin {
     tab: ClaudianTab,
     text: string,
     lang: Lang,
-    image: IncomingImage | undefined,
+    images: IncomingImage[] | undefined,
     conversationIdAtQueueTime: string | null,
   ): Promise<string> {
     if (!tab.controllers.inputController) {
       throw new Error(this.t('tabNotReady', lang));
+    }
+
+    // Instead of trusting the tab object resolved back when this send was
+    // queued (which may have since been repurposed by a desktop-side
+    // conversation switch happening *in that exact tab* - see
+    // resolveOrCreateTab's doc comment), re-locate the actual tab for
+    // conversationIdAtQueueTime right before sending, the same way /goto
+    // finds a conversation's tab: by id, across every pane, reopening it if
+    // it was closed - rather than a raw JS-object reference that can go
+    // stale. This shrinks the "sent into the wrong conversation" window to
+    // effectively zero instead of merely detecting it after the fact.
+    if (conversationIdAtQueueTime) {
+      tab = await this.getOrCreateTabForConversation(conversationIdAtQueueTime);
+      if (!tab.controllers.inputController) throw new Error(this.t('tabNotReady', lang));
     }
 
     this.sendingViaBridgeTabIds.add(tab.id);
@@ -1624,32 +1624,16 @@ export default class WeChatBridgePlugin extends Plugin {
       // Reconstruct the same shape Claudian's own paste/drop handler builds
       // (id/name/mediaType/data/size/source) - inputController.sendMessage
       // doesn't care how an image got attached, only that it matches this shape.
-      const images: ClaudianImageAttachment[] | undefined = image
-        ? [{
-            id: `wechat-${Date.now()}`,
-            name: `wechat-image.${image.mediaType.split('/')[1] ?? 'jpg'}`,
+      const attachments: ClaudianImageAttachment[] | undefined = images && images.length > 0
+        ? images.map((image, i) => ({
+            id: `wechat-${Date.now()}-${i}`,
+            name: `wechat-image-${i}.${image.mediaType.split('/')[1] ?? 'jpg'}`,
             mediaType: image.mediaType,
             data: image.data,
             size: Math.ceil((image.data.length * 3) / 4),
-            source: 'wechat',
-          }]
+            source: 'wechat' as const,
+          }))
         : undefined;
-
-      // Guard against the tab we resolved earlier (in getOrCreateWeChatTab,
-      // possibly a while ago if this send was queued behind others) no
-      // longer being the bound conversation by the time we're actually about
-      // to send: the WeChat-bound tab is frequently the very same tab
-      // visible on the desktop, so clicking "New chat" (or switching to a
-      // different conversation) *in that tab* mutates this exact `tab`
-      // object's `conversationId` out from under us. Sending anyway would
-      // silently inject the WeChat user's message into whatever unrelated
-      // conversation now happens to be showing - worse than just failing.
-      // Only applies when there's an actual bound conversation to check
-      // against; a brand-new blank-tab send (conversationIdAtQueueTime ===
-      // null) has nothing to compare to yet.
-      if (conversationIdAtQueueTime && tab.conversationId !== conversationIdAtQueueTime) {
-        throw new Error(this.t('conversationSwitchedBeforeSend', lang));
-      }
 
       const progressive = this.data.progressiveReply;
       let progressiveTimer: number | null = null;
@@ -1659,7 +1643,7 @@ export default class WeChatBridgePlugin extends Plugin {
         progressiveTimer = window.setInterval(() => this.flushProgressive(tab, beforeCount, false), PROGRESSIVE_POLL_INTERVAL_MS);
       }
       try {
-        await tab.controllers.inputController.sendMessage({ content: text, images });
+        await tab.controllers.inputController.sendMessage({ content: text, images: attachments });
       } finally {
         if (progressiveTimer !== null) window.clearInterval(progressiveTimer);
         if (progressive) {
@@ -1709,24 +1693,20 @@ export default class WeChatBridgePlugin extends Plugin {
         }
       }
 
-      // Switched away *during* the send (as opposed to the guard above,
-      // which only catches it *before* sendMessage() was even called) - the
-      // message already went to inputController.sendMessage() on the
-      // original tab object, so this can't be prevented, only reported.
-      // Claudian exposes no signal for what a mid-flight tab-object mutation
-      // actually did to the turn it was running, so don't guess at a normal
-      // reply (which might be a stale/wrong-conversation context-window
-      // line, or the noDispatchText warning above talking about the wrong
-      // thing) - so rather than guess, actively go check: the original
-      // conversation may still be open in some *other* tab/pane (Claudian
-      // reuses/creates tabs keyed by conversationId - a desktop "New chat"
-      // in this exact tab doesn't necessarily destroy any other view onto
-      // the old conversation). If a live tab for conversationIdAtQueueTime
-      // is found, its actual latest turn is read straight from it and
-      // returned as a normal, resolved reply instead of a manual-check
-      // prompt. Only when that also comes up empty (conversation not open
-      // anywhere, or genuinely produced no text) does this fall back to the
-      // plain "uncertain" notice.
+      // Switched away *during* the send: the freshly-relocated `tab` above
+      // still got mutated out from under this exact call while
+      // sendMessage() was awaiting (the desktop switched conversations *in
+      // that same tab* again, mid-flight) - the message already went to
+      // inputController.sendMessage() on that object, so this can't be
+      // prevented, only reported. Don't guess at a normal reply here (it
+      // might be a stale/wrong-conversation context-window line) - instead
+      // re-locate conversationIdAtQueueTime by id one more time, the same
+      // /goto-style lookup used above: Claudian persists each conversation's
+      // messages independently of which tab object currently has it open,
+      // so this reliably finds (or, if closed, reopens straight from disk)
+      // the real outcome, not just whatever's left of the original tab
+      // reference. Only falls back to the plain "uncertain" notice if that
+      // still comes up with no real reply text either.
       if (conversationIdAtQueueTime && tab.conversationId !== conversationIdAtQueueTime) {
         const resolved = await this.tryResolveSwitchedDuringSend(conversationIdAtQueueTime, lang);
         return resolved ?? this.t('conversationSwitchedDuringSend', lang);
@@ -2166,12 +2146,39 @@ export default class WeChatBridgePlugin extends Plugin {
    */
   private async getOrCreateWeChatTab(): Promise<ClaudianTab> {
     const previous = this.getTabMutex.catch(() => {});
-    const run = previous.then(() => this.getOrCreateWeChatTabImpl());
+    const run = previous.then(() => this.resolveOrCreateTab(this.data.conversationId));
     this.getTabMutex = run.catch(() => {});
     return run;
   }
 
-  private async getOrCreateWeChatTabImpl(): Promise<ClaudianTab> {
+  /**
+   * Same mutex-serialized lookup as getOrCreateWeChatTab, but for an
+   * explicit conversation id rather than this.data.conversationId - used
+   * wherever a send needs to (re-)locate one *specific* conversation's tab
+   * by id instead of "whichever one the bridge is currently bound to" (see
+   * sendChatMessage and tryResolveSwitchedDuringSend). This is the same
+   * id-based lookup /goto uses to jump to a conversation, reused here so a
+   * stale/mutated tab-object reference is never trusted on its own.
+   */
+  private async getOrCreateTabForConversation(conversationId: string): Promise<ClaudianTab> {
+    const previous = this.getTabMutex.catch(() => {});
+    const run = previous.then(() => this.resolveOrCreateTab(conversationId));
+    this.getTabMutex = run.catch(() => {});
+    return run;
+  }
+
+  /**
+   * Finds the tab already open for `conversationId` (searching every pane,
+   * Claudian 2.1.0+ dual-pane included), or reopens/creates it if none is
+   * open right now. Claudian persists each conversation independently of
+   * which tab object happens to have it open, so reopening by id always
+   * reflects that conversation's real, current state - unlike holding onto
+   * a tab reference across an await, which can get silently repurposed by
+   * a desktop-side "New chat"/conversation switch happening in that same
+   * tab object. `conversationId === null` means "brand-new blank tab", not
+   * "look one up".
+   */
+  private async resolveOrCreateTab(conversationId: string | null): Promise<ClaudianTab> {
     const claudian = this.getClaudianPlugin();
     const view = (claudian.getAllViews?.() ?? [])[0] ?? this.findClaudianViewViaWorkspace();
     if (!view) throw new Error(this.t('noViewOpen', this.getLangSafe()));
@@ -2179,24 +2186,24 @@ export default class WeChatBridgePlugin extends Plugin {
     const tabManager = view.getTabManager?.();
     if (!tabManager) throw new Error(this.t('noTabManager', this.getLangSafe()));
 
-    if (this.data.conversationId) {
+    if (conversationId) {
       // Dual-pane (Claudian 2.1.0+) can open more than one view (one per
       // pane), each with its own tab manager - the bound conversation's tab
       // may live in a pane other than the first one. Search across every
       // view via Claudian's own findConversationAcrossViews when available;
       // only fall back to the single-view lookup below on older builds that
       // predate dual-pane (and thus never have more than one view anyway).
-      const found = claudian.findConversationAcrossViews?.(this.data.conversationId);
+      const found = claudian.findConversationAcrossViews?.(conversationId);
       const foundTabManager = found ? found.view.getTabManager?.() : null;
       const existing = foundTabManager?.getTab?.(found!.tabId)
-        ?? tabManager.getAllTabs().find((t) => t.conversationId === this.data.conversationId);
+        ?? tabManager.getAllTabs().find((t) => t.conversationId === conversationId);
       if (existing) {
         this.installInteractiveHooks(existing);
         return existing;
       }
       // Tab was closed or conversation was never opened in a tab yet; (re)open it.
       await this.ensureTabCapacity(claudian, tabManager);
-      const tab = await tabManager.createTab(this.data.conversationId);
+      const tab = await tabManager.createTab(conversationId);
       if (!tab) throw new Error(this.t('tabLimitReached', this.getLangSafe()));
       this.installInteractiveHooks(tab);
       return tab;
@@ -2551,25 +2558,26 @@ export default class WeChatBridgePlugin extends Plugin {
   /**
    * Called only when a bridge-driven send finds tab.conversationId no
    * longer matches what it was sent to (the desktop switched conversations
-   * in the same tab mid-send - see sendChatMessage). Tries to automatically
-   * determine the real outcome instead of just telling the user to go check
-   * manually: if a live tab for the *original* conversation is still open in
-   * any pane (Claudian keys tabs by conversationId, so a desktop switch in
-   * one tab doesn't necessarily evict every other view of that
-   * conversation), read its actual latest turn straight off it. Returns
-   * null - meaning "still can't tell, fall back to the plain uncertain
-   * notice" - only when no such tab exists at all, or it exists but
-   * genuinely has no reply text yet (turn still running, or truly failed).
+   * in the same tab mid-send, again, even after sendChatMessage already
+   * re-located the tab by id right before sending - see there). Tries to
+   * automatically determine the real outcome instead of just telling the
+   * user to go check manually: re-locates conversationId by id one more
+   * time (the same /goto-style lookup, via getOrCreateTabForConversation -
+   * not a raw pane search), which reflects that conversation's real state
+   * whether or not any tab happened to still be open for it, and reads its
+   * actual latest turn straight off it. Returns null - meaning "still can't
+   * tell, fall back to the plain uncertain notice" - only when that lookup
+   * itself fails, or the turn genuinely has no reply text yet (still
+   * running, or truly failed).
    */
   private async tryResolveSwitchedDuringSend(conversationId: string, lang: Lang): Promise<string | null> {
-    let allTabs: ClaudianTab[];
+    let originalTab: ClaudianTab;
     try {
-      allTabs = this.getAllTabsAcrossPanes(lang);
+      originalTab = await this.getOrCreateTabForConversation(conversationId);
     } catch {
       return null;
     }
-    const originalTab = allTabs.find((t) => t.conversationId === conversationId);
-    if (!originalTab || originalTab.state.isStreaming) return null;
+    if (originalTab.state.isStreaming) return null;
 
     const messages = originalTab.state.messages;
     const userIndices = this.getUserMessageIndices(messages);
