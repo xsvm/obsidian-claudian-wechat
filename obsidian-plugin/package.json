@@ -1,6 +1,6 @@
 {
-  "name": "wechat-bridge",
-  "version": "0.1.0",
+  "name": "claudian-wechat",
+  "version": "1.0.0",
   "private": true,
   "scripts": {
     "build": "node esbuild.config.mjs"

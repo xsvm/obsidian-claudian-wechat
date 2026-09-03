@@ -12,4 +12,4 @@ await esbuild.build({
   treeShaking: true,
 });
 
-console.log('wechat-bridge: build complete -> main.js');
+console.log('claudian-wechat: build complete -> main.js');

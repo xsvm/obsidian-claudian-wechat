@@ -1,5 +1,5 @@
 {
-  "_comment": "Bilingual user-facing text for wechat-bridge, kept out of main.ts so wording can be edited without touching code. Loaded once at plugin startup (see loadStrings() in main.ts). {0}, {1}, ... are positional placeholders substituted by t(key, lang, ...args) in the same order the call site passes them - check main.ts before reordering a template's placeholders.",
+  "_comment": "Bilingual user-facing text for claudian-wechat, kept out of main.ts so wording can be edited without touching code. Loaded once at plugin startup (see loadStrings() in main.ts). {0}, {1}, ... are positional placeholders substituted by t(key, lang, ...args) in the same order the call site passes them - check main.ts before reordering a template's placeholders.",
 
   "emptyText": { "zh": "消息内容为空", "en": "Empty text" },
   "bodyMustBeJson": { "zh": "请求体必须是 JSON: {\"text\": \"...\"}", "en": "Body must be JSON: {\"text\": \"...\"}" },

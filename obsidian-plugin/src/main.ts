@@ -571,7 +571,7 @@ export default class WeChatBridgePlugin extends Plugin {
 
     const adapter = this.app.vault.adapter;
     if (adapter instanceof FileSystemAdapter) {
-      this.pluginDir = path.join(adapter.getBasePath(), this.manifest.dir ?? '.obsidian/plugins/wechat-bridge');
+      this.pluginDir = path.join(adapter.getBasePath(), this.manifest.dir ?? `.obsidian/plugins/${this.manifest.id}`);
     }
 
     // Must happen before startServer(): handleIncoming() needs `this.strings`
