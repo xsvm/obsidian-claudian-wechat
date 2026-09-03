@@ -474,15 +474,6 @@ const WIKILINK_RE = /!?\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g;
  * provider, since a false-positive candidate just gets filtered out later by
  * queueFileForSend's own existence check anyway. */
 const TOOL_INPUT_PATH_KEYS = ['file_path', 'filePath', 'path', 'notebook_path', 'notebookPath'];
-/**
- * How long a bare (caption-less) inbound image is held before it's sent on
- * its own. Most photo-picker flows on WeChat deliver the image and any
- * follow-up caption as two separate messages, not one - without this wait,
- * a bare image immediately fires off its own isolated, caption-less
- * Claudian turn, and the caption the user meant to attach lands a moment
- * later as an unrelated second turn instead of finishing the first one.
- */
-const IMAGE_CAPTION_WAIT_MS = 12000;
 
 export default class WeChatBridgePlugin extends Plugin {
   private server: http.Server | null = null;
@@ -498,15 +489,14 @@ export default class WeChatBridgePlugin extends Plugin {
    * in flight concurrently (see sendQueues doc comment). */
   private sendingViaBridgeTabIds: Set<string> = new Set();
   /**
-   * A bare (caption-less) inbound image, held for IMAGE_CAPTION_WAIT_MS
-   * waiting for a follow-up text message to combine with as its caption -
-   * see handleIncoming and flushPendingImageAlone. In-memory only (not
-   * persisted): losing a not-yet-captioned image across a plugin
-   * reload/crash just means it goes out on its own instead, same as if the
-   * wait had simply timed out - not worth the complexity of persisting it.
+   * A bare (caption-less) inbound image, held indefinitely waiting for a
+   * follow-up text message to combine with as its caption (or an explicit
+   * /skip to send it alone) - see handleIncoming. In-memory only (not
+   * persisted): a not-yet-captioned image lost across a plugin
+   * reload/crash is simply gone, same as any other in-flight bridge state -
+   * not worth the complexity of persisting it.
    */
   private pendingImage: IncomingImage | null = null;
-  private pendingImageTimer: number | null = null;
   private relayManager: RelayManager | null = null;
   private pluginDir: string | null = null;
   /**
@@ -830,23 +820,21 @@ export default class WeChatBridgePlugin extends Plugin {
     if (!text && !image) throw new Error(this.t('emptyText', lang));
 
     // A bare image (no caption in the same WeChat message) is not sent as
-    // its own isolated turn right away - it's held briefly in case the
-    // caption is on its way as a separate message (see IMAGE_CAPTION_WAIT_MS).
+    // its own isolated turn right away - it's held indefinitely, waiting for
+    // a follow-up caption, until either one arrives as plain text or the
+    // user explicitly sends it on its own with /skip. No auto-timeout: a
+    // silent timed auto-send surprised more than it helped (the whole point
+    // is that WeChat's own timing between "pick a photo" and "type a
+    // caption" is unpredictable), and Claude has no way to guess *when*
+    // the user gave up on typing a caption, so it just doesn't guess.
     if (image && !text) {
       if (this.pendingImage) {
         // A second bare image arrived before the first one got a caption -
         // don't silently drop the first one, send it on its own now.
-        const stale = this.pendingImage;
-        this.pendingImage = null;
-        if (this.pendingImageTimer !== null) {
-          window.clearTimeout(this.pendingImageTimer);
-          this.pendingImageTimer = null;
-        }
-        void this.flushPendingImageAloneNow(stale, lang);
+        void this.flushPendingImageAloneNow(this.pendingImage, lang);
       }
       this.pendingImage = image;
-      this.pendingImageTimer = window.setTimeout(() => void this.flushPendingImageAlone(lang), IMAGE_CAPTION_WAIT_MS);
-      return this.t('imageBufferedWaitingCaption', lang, Math.round(IMAGE_CAPTION_WAIT_MS / 1000));
+      return this.t('imageBufferedWaitingCaption', lang);
     }
 
     // A plain text message (not a bridge command) arriving while an image is
@@ -855,10 +843,6 @@ export default class WeChatBridgePlugin extends Plugin {
     if (this.pendingImage && text && !text.startsWith('/')) {
       image = this.pendingImage;
       this.pendingImage = null;
-      if (this.pendingImageTimer !== null) {
-        window.clearTimeout(this.pendingImageTimer);
-        this.pendingImageTimer = null;
-      }
     }
 
     // Every bridge command is tried, in order, against `text`; the first
@@ -880,20 +864,20 @@ export default class WeChatBridgePlugin extends Plugin {
     return await this.sendChatMessageQueued(text, lang, image);
   }
 
-  /** Timer callback for a bare image whose caption never arrived within IMAGE_CAPTION_WAIT_MS - sends it on its own. */
-  private async flushPendingImageAlone(lang: Lang): Promise<void> {
+  /** Handles `/skip`: sends the still-buffered image (see handleIncoming) on its own, right now, with no caption. */
+  private async handleSkipCaptionCommand(lang: Lang): Promise<string> {
     const image = this.pendingImage;
+    if (!image) return this.t('noPendingImage', lang);
     this.pendingImage = null;
-    this.pendingImageTimer = null;
-    if (!image) return;
-    await this.flushPendingImageAloneNow(image, lang);
+    return await this.sendChatMessageQueued('', lang, image);
   }
 
   /**
-   * Actually sends a buffered image on its own, outside the normal
-   * request/response cycle (no WeChat message is waiting on this specific
-   * call), so the result has to go out via the /listen-style push queue
-   * instead of a return value.
+   * Sends a buffered image on its own, outside the normal request/response
+   * cycle a WeChat message would give this a reply slot in (this is only
+   * called when a *second* bare image bumps the first one out of the
+   * buffer, so no request is waiting on this specific call) - the result
+   * has to go out via the /listen-style push queue instead of a return value.
    */
   private async flushPendingImageAloneNow(image: IncomingImage, lang: Lang): Promise<void> {
     try {
@@ -915,6 +899,7 @@ export default class WeChatBridgePlugin extends Plugin {
       { pattern: /^\/answer\b/i, run: (m, lang) => this.handleAnswerCommand(m.input as string, lang) },
       { pattern: /^\/approve\b/i, run: (m, lang) => this.handleApproveCommand(m.input as string, lang) },
       { pattern: /^\/esc\b/i, run: (_m, lang) => this.handleEscCommand(lang) },
+      { pattern: /^\/skip\b/i, run: (_m, lang) => this.handleSkipCaptionCommand(lang) },
       { pattern: /^\/files\b/i, run: (_m, lang) => this.listReferencedFiles(lang) },
       { pattern: /^\/getfile\b/i, run: (m, lang) => this.handleGetFileCommand(m.input as string, lang) },
       { pattern: /^\/send\s+(\S.*)$/i, run: (m, lang) => this.handleSendCommand(m[1].trim(), lang) },
@@ -1732,9 +1717,19 @@ export default class WeChatBridgePlugin extends Plugin {
       // actually did to the turn it was running, so don't guess at a normal
       // reply (which might be a stale/wrong-conversation context-window
       // line, or the noDispatchText warning above talking about the wrong
-      // thing) - say plainly that the conversation changed mid-send instead.
+      // thing) - so rather than guess, actively go check: the original
+      // conversation may still be open in some *other* tab/pane (Claudian
+      // reuses/creates tabs keyed by conversationId - a desktop "New chat"
+      // in this exact tab doesn't necessarily destroy any other view onto
+      // the old conversation). If a live tab for conversationIdAtQueueTime
+      // is found, its actual latest turn is read straight from it and
+      // returned as a normal, resolved reply instead of a manual-check
+      // prompt. Only when that also comes up empty (conversation not open
+      // anywhere, or genuinely produced no text) does this fall back to the
+      // plain "uncertain" notice.
       if (conversationIdAtQueueTime && tab.conversationId !== conversationIdAtQueueTime) {
-        return this.t('conversationSwitchedDuringSend', lang);
+        const resolved = await this.tryResolveSwitchedDuringSend(conversationIdAtQueueTime, lang);
+        return resolved ?? this.t('conversationSwitchedDuringSend', lang);
       }
 
       // Only rebind data.conversationId / lastSeenMessageCount if nothing
@@ -2526,17 +2521,7 @@ export default class WeChatBridgePlugin extends Plugin {
     if (this.sendingViaBridgeTabIds.size === 0) {
       return this.t('escNothingToInterrupt', lang);
     }
-    // The tab this command needs to interrupt can live in any pane's tab
-    // manager (dual-pane, 2.1.0+) - collect all views' tabs, not just
-    // getAllViews()[0]'s, or a genuinely in-flight turn in another pane gets
-    // silently reported as "nothing to interrupt".
-    const views = this.getClaudianPlugin().getAllViews?.() ?? [];
-    const fallbackView = views[0] ?? this.findClaudianViewViaWorkspace();
-    if (views.length === 0 && !fallbackView) throw new Error(this.t('noTabManager', lang));
-    const tabManagers = (views.length > 0 ? views : [fallbackView!]).map((v) => v.getTabManager?.()).filter((tm): tm is ClaudianTabManager => !!tm);
-    if (tabManagers.length === 0) throw new Error(this.t('noTabManager', lang));
-
-    const allTabs = tabManagers.flatMap((tm) => tm.getAllTabs());
+    const allTabs = this.getAllTabsAcrossPanes(lang);
     let interrupted = false;
     for (const tabId of this.sendingViaBridgeTabIds) {
       const tab = allTabs.find((t) => t.id === tabId);
@@ -2546,6 +2531,58 @@ export default class WeChatBridgePlugin extends Plugin {
       }
     }
     return this.t(interrupted ? 'escInterrupted' : 'escNothingToInterrupt', lang);
+  }
+
+  /**
+   * Every tab, across every pane's tab manager (dual-pane, 2.1.0+) -
+   * collecting only getAllViews()[0]'s tabs would silently miss a tab that's
+   * genuinely open in another pane. Shared by /esc and the mid-send
+   * conversation-switch auto-resolution below.
+   */
+  private getAllTabsAcrossPanes(lang: Lang): ClaudianTab[] {
+    const views = this.getClaudianPlugin().getAllViews?.() ?? [];
+    const fallbackView = views[0] ?? this.findClaudianViewViaWorkspace();
+    if (views.length === 0 && !fallbackView) throw new Error(this.t('noTabManager', lang));
+    const tabManagers = (views.length > 0 ? views : [fallbackView!]).map((v) => v.getTabManager?.()).filter((tm): tm is ClaudianTabManager => !!tm);
+    if (tabManagers.length === 0) throw new Error(this.t('noTabManager', lang));
+    return tabManagers.flatMap((tm) => tm.getAllTabs());
+  }
+
+  /**
+   * Called only when a bridge-driven send finds tab.conversationId no
+   * longer matches what it was sent to (the desktop switched conversations
+   * in the same tab mid-send - see sendChatMessage). Tries to automatically
+   * determine the real outcome instead of just telling the user to go check
+   * manually: if a live tab for the *original* conversation is still open in
+   * any pane (Claudian keys tabs by conversationId, so a desktop switch in
+   * one tab doesn't necessarily evict every other view of that
+   * conversation), read its actual latest turn straight off it. Returns
+   * null - meaning "still can't tell, fall back to the plain uncertain
+   * notice" - only when no such tab exists at all, or it exists but
+   * genuinely has no reply text yet (turn still running, or truly failed).
+   */
+  private async tryResolveSwitchedDuringSend(conversationId: string, lang: Lang): Promise<string | null> {
+    let allTabs: ClaudianTab[];
+    try {
+      allTabs = this.getAllTabsAcrossPanes(lang);
+    } catch {
+      return null;
+    }
+    const originalTab = allTabs.find((t) => t.conversationId === conversationId);
+    if (!originalTab || originalTab.state.isStreaming) return null;
+
+    const messages = originalTab.state.messages;
+    const userIndices = this.getUserMessageIndices(messages);
+    if (userIndices.length === 0) return null;
+    const turnMessages = messages.slice(userIndices[userIndices.length - 1] + 1);
+    const { text: reply, compacted, empty } = this.extractDispatchText(turnMessages, lang);
+    if (empty || !reply.trim()) return null;
+
+    const metas = await this.readAllConversationMeta();
+    const title = this.titleFor(conversationId, metas);
+    const ctxLine = compacted ? null : await this.contextWindowLine(conversationId, lang);
+    const body = ctxLine ? `${reply}\n\n${ctxLine}` : reply;
+    return this.t('conversationSwitchedDuringSendResolved', lang, title, body);
   }
 
   /** Handles `/approve accept|always|deny|cancel`, resolving handleApprovalRequestHeadless(). */

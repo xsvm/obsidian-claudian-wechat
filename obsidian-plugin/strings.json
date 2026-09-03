@@ -110,12 +110,20 @@
     "en": "The desktop app had already switched to a different conversation right before this could be sent - cancelled to avoid delivering it into the wrong conversation. Please retry."
   },
   "conversationSwitchedDuringSend": {
-    "zh": "电脑端在处理这条消息的过程中切换了对话，结果不确定（可能没处理完，也可能被切走了）。建议用 /hist 确认一下，必要时重新发送。",
-    "en": "The desktop app switched conversations while this message was still being processed - the outcome is uncertain (it may not have finished, or landed somewhere unexpected). Check with /hist and resend if needed."
+    "zh": "电脑端在处理这条消息的过程中切换了对话，自动核实后仍未能确定结果（可能没处理完，也可能这个对话已经不在任何窗口里了）。必要时重新发送。",
+    "en": "The desktop app switched conversations while this message was still being processed, and an automatic check afterward still couldn't confirm the outcome (it may not have finished, or that conversation is no longer open in any pane). Resend if needed."
+  },
+  "conversationSwitchedDuringSendResolved": {
+    "zh": "（电脑端切换了对话，但已自动核实这条消息确实发送成功 —— 「{0}」的回复：）\n\n{1}",
+    "en": "(The desktop app switched conversations, but this was automatically confirmed to have gone through anyway - reply from \"{0}\":)\n\n{1}"
   },
   "imageBufferedWaitingCaption": {
-    "zh": "图片已收到，{0} 秒内发的文字会作为这张图的说明一起发送；如果不追加文字，会自动单独发送这张图。",
-    "en": "Photo received - any text sent within {0}s will be attached as its caption; otherwise it'll be sent on its own automatically."
+    "zh": "图片已收到，接下来发的文字会作为这张图的说明一起发送；如果不需要配文字，发送 /skip 直接单独发送这张图。",
+    "en": "Photo received - the next text you send will be attached as its caption. If you don't need a caption, send /skip to send it on its own right now."
+  },
+  "noPendingImage": {
+    "zh": "没有等待补充说明的图片。",
+    "en": "There's no buffered image waiting for a caption."
   },
   "imageSendFailed": {
     "zh": "[桥接出错] 单独发送图片时失败：{0}",
@@ -289,6 +297,7 @@
       "/approve accept|always|deny|cancel — 回应 Claudian 的权限请求",
       "/progressive on|off — 开关渐进式回复（每说完一段就单独推送）",
       "/esc — 打断当前回复（已生成内容仍会照常发回）",
+      "/skip — 发图片后不想配文字了，立刻单独发送这张图",
       "/files — 列出最近一轮涉及的文件，配合 /getfile 使用",
       "/getfile N — 获取 /files 列出的文件，多个用逗号分隔如 /getfile 1,2",
       "/send <路径> — 直接发送 vault 内某个文件",
@@ -316,6 +325,7 @@
       "/approve accept|always|deny|cancel — respond to a Claudian approval request",
       "/progressive on|off — toggle progressive replies (push each chunk as it finishes)",
       "/esc — interrupt the current reply (already-generated content is still sent)",
+      "/skip — send a buffered photo on its own right now, without waiting for a caption",
       "/files — list files referenced in the most recent turn, use with /getfile",
       "/getfile N — fetch a file from /files, comma-separate for several, e.g. /getfile 1,2",
       "/send <path> — send a specific file from the vault directly",
