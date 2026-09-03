@@ -24,6 +24,7 @@ import contextlib
 import json
 import os
 import sys
+from pathlib import Path
 
 import anyio
 import httpx
@@ -54,6 +55,7 @@ from wechat_clawbot.auth.accounts import CDN_BASE_URL, DEFAULT_BASE_URL
 from wechat_clawbot.auth.login_qr import start_weixin_login_with_qr, wait_for_weixin_login
 from wechat_clawbot.claude_channel.credentials import (
     AccountData,
+    credentials_dir,
     credentials_file_path,
     load_credentials,
     save_credentials,
@@ -595,6 +597,44 @@ async def _send_file_push(opts: WeixinApiOptions, target: "_LastTarget", item: d
             )
 
 
+def _last_target_path() -> Path:
+    """Where the most-recently-seen WeChat sender/context_token is persisted.
+
+    Lives next to the credentials file (same ~/.claude/channels/wechat dir).
+    """
+    return credentials_dir() / "last_target.json"
+
+
+def _load_last_target() -> tuple[str, str] | None:
+    """Load the last-persisted (sender_id, context_token), or None if never saved / unreadable."""
+    try:
+        data = json.loads(_last_target_path().read_text("utf-8"))
+        sender_id = data.get("senderId")
+        context_token = data.get("contextToken")
+        if sender_id and context_token:
+            return (sender_id, context_token)
+    except (FileNotFoundError, json.JSONDecodeError, OSError, KeyError):
+        pass
+    return None
+
+
+def _save_last_target(sender_id: str, context_token: str) -> None:
+    """Best-effort persist of the last-seen target so a relay restart doesn't
+    forget who to proactively push /listen output to (see _LastTarget's own
+    docstring for why this loop needs *a* target at all). Deliberately
+    swallows any error - this is a convenience cache, not the source of
+    truth, and must never crash the message-handling path that calls it.
+    """
+    try:
+        dir_ = credentials_dir()
+        dir_.mkdir(parents=True, exist_ok=True)
+        _last_target_path().write_text(
+            json.dumps({"senderId": sender_id, "contextToken": context_token}), encoding="utf-8"
+        )
+    except OSError:
+        pass
+
+
 class _LastTarget:
     """Most recent WeChat sender/context_token, shared between the two loops below.
 
@@ -603,6 +643,17 @@ class _LastTarget:
     replies to a specific inbound message, so they reuse the most recent
     context_token instead. This only supports a single active WeChat user,
     matching the rest of this bridge's single-binding design.
+
+    Persisted to disk (see _load_last_target/_save_last_target) because this
+    object itself is otherwise recreated empty on every relay.py restart -
+    and the relay restarts often (plugin reloads, crashes, machine reboots).
+    Without persistence, _pending_push_loop has nowhere to push proactive
+    /listen output (AskUserQuestion prompts, autonomous-agent notifications,
+    etc.) until the user happens to send *something* first - at which point
+    everything queued since the last successful push dumps out all at once.
+    Reusing the last known context_token across a restart carries the same
+    "might be stale" risk /listen pushes already accept between two live
+    messages; it isn't a new risk category, just a longer window.
     """
 
     def __init__(self) -> None:
@@ -641,6 +692,7 @@ async def _handle_one_message(
         context_token = msg.context_token or ""
         target.sender_id = sender_id
         target.context_token = context_token
+        _save_last_target(sender_id, context_token)
         _log(f"收到: from={sender_id} text={text[:50]!r} image={'是' if image else '否'}")
 
         reply = await _reply_with_typing_indicator(client, opts, sender_id, context_token, text, image)
@@ -860,6 +912,14 @@ async def serve() -> None:
     _log(f"使用已保存账号: {account.account_id}")
     opts = WeixinApiOptions(base_url=account.base_url, token=account.token)
     target = _LastTarget()
+    # Restore who to proactively push /listen output to, if we've seen anyone
+    # before - otherwise _pending_push_loop sits idle until the user sends
+    # something, then dumps the whole backlog at once. See _LastTarget's
+    # docstring.
+    restored = _load_last_target()
+    if restored:
+        target.sender_id, target.context_token = restored
+        _log(f"已恢复上次的推送目标: {target.sender_id}")
 
     # One shared client for both loops: avoids rebuilding a connection pool
     # (and its TCP handshake) on every single request to the same local
