@@ -1131,6 +1131,14 @@ export default class WeChatBridgePlugin extends Plugin {
    * (the `bKe` array) and mirrored below as `CLAUDE_STATIC_MODELS`. Every
    * `id` here is exactly what Claudian accepts for `/model <id>`.
    */
+  /** Returns the first argument that is a non-empty string, else undefined. */
+  private static firstString(...vals: unknown[]): string | undefined {
+    for (const v of vals) {
+      if (typeof v === 'string' && v) return v;
+    }
+    return undefined;
+  }
+
   private static readonly CLAUDE_STATIC_MODELS: { id: string; label: string; description: string }[] = [
     { id: 'haiku', label: 'Haiku', description: 'Fast and efficient' },
     { id: 'sonnet', label: 'Sonnet', description: 'Balanced performance' },
@@ -1163,9 +1171,15 @@ export default class WeChatBridgePlugin extends Plugin {
 
     const lines = [this.t('modelsHeader', lang, providerId)];
     for (const entry of discovered) {
-      const id = typeof entry?.model === 'string' ? entry.model : null;
+      // Field names differ per provider in Claudian's own persisted cache:
+      // grok/opencode use `model`/`rawId` as the literal value Claudian's
+      // settings.model accepts; pi instead requires the `pi:provider/id`
+      // form stored in `encodedId` (its plain `id` alone is NOT a valid
+      // /model value - Claudian rejects anything without the `pi:` prefix
+      // for that provider), so encodedId must be preferred over id.
+      const id = WeChatBridgePlugin.firstString(entry?.model, entry?.rawId, entry?.encodedId, entry?.id);
       if (!id) continue;
-      const displayName = typeof entry?.displayName === 'string' && entry.displayName ? entry.displayName : id;
+      const displayName = WeChatBridgePlugin.firstString(entry?.displayName, entry?.label, entry?.name) || id;
       const markers = [
         entry?.isDefault ? this.t('modelsDefaultMarker', lang) : '',
         id === current ? this.t('modelsCurrentMarker', lang) : '',
@@ -1196,18 +1210,20 @@ export default class WeChatBridgePlugin extends Plugin {
    * considers valid for `modelId` under `providerId` right now - used to
    * validate `/effort X` instead of blindly writing whatever the user typed.
    *
-   * Returns `null` when we have no reliable source for this provider (currently:
-   * `pi`, whose settings cache only remembers the last-used value per model via
-   * `preferredThinkingByModel`, not the full set of valid ones) - callers should
-   * skip validation entirely in that case rather than reject everything.
+   * Returns `null` when we have no reliable source for this provider/model
+   * combination - callers should skip validation entirely in that case
+   * rather than reject everything.
    *
    * Source per provider (see class doc comment for how this was derived):
    * - claude / codex: fixed list, independent of the specific model.
    * - grok / opencode: each entry in `providerConfigs.<id>.discoveredModels`
-   *   carries its own `reasoningEfforts` array once Claudian has discovered
-   *   it - same persisted-cache source `/model` already reads model names
-   *   from, just a different field on the same objects.
-   * - pi: no equivalent field exists in what Claudian persists - see above.
+   *   carries its own `reasoningEfforts` array (`{value,label}` pairs) once
+   *   Claudian has discovered it - same persisted-cache source `/model`
+   *   already reads model names from, just a different field on the same
+   *   objects.
+   * - pi: each entry in `providerConfigs.pi.discoveredModels` instead carries
+   *   a `thinkingLevels` array of plain strings, keyed by `id` (not `model`/
+   *   `rawId` like the other providers).
    */
   private getKnownEffortOptions(
     providerId: ProviderId,
@@ -1217,14 +1233,20 @@ export default class WeChatBridgePlugin extends Plugin {
     if (providerId === 'claude' || providerId === 'codex') {
       return WeChatBridgePlugin.STATIC_EFFORT_LEVELS;
     }
-    if (providerId === 'pi') {
-      return null;
-    }
-    // grok, opencode
     if (!modelId) return null;
     const discovered = settings.providerConfigs?.[providerId]?.discoveredModels;
     if (!Array.isArray(discovered)) return null;
-    const entry = discovered.find((m: any) => m?.model === modelId || m?.rawId === modelId);
+    const entry = discovered.find(
+      (m: any) => m?.model === modelId || m?.rawId === modelId || m?.encodedId === modelId || m?.id === modelId,
+    );
+    if (providerId === 'pi') {
+      const levels = entry?.thinkingLevels;
+      if (!Array.isArray(levels) || levels.length === 0) return null;
+      return levels
+        .filter((v: any) => typeof v === 'string' && v)
+        .map((value: string) => ({ value, label: value }));
+    }
+    // grok, opencode
     const efforts = entry?.reasoningEfforts;
     if (!Array.isArray(efforts) || efforts.length === 0) return null;
     return efforts
