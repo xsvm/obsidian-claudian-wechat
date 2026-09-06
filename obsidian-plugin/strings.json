@@ -139,6 +139,22 @@
     "zh": "用 /model <模型ID> 切换。",
     "en": "Use /model <model id> to switch."
   },
+  "effortHeader": {
+    "zh": "供应商 {0} 当前模型的有效 effort 档位：",
+    "en": "Valid effort levels for provider {0}'s current model:"
+  },
+  "effortUsageHint": {
+    "zh": "用 /effort <档位> 切换。",
+    "en": "Use /effort <level> to switch."
+  },
+  "effortUnknown": {
+    "zh": "供应商 {0} 没有可供校验的 effort 档位列表，/effort <档位> 会直接写入，不做校验。",
+    "en": "Provider {0} has no verifiable effort-level list; /effort <level> will be written as-is, without validation."
+  },
+  "effortInvalid": {
+    "zh": "\"{0}\" 不是当前模型的有效 effort 档位。可用档位: {1}",
+    "en": "\"{0}\" is not a valid effort level for the current model. Available levels: {1}"
+  },
   "reconnectedPendingPrefix": {
     "zh": "（插件刚重新连接，补发一条你还没回答的问题/请求）",
     "en": "(Plugin just reconnected - resending a question/request you haven't answered yet)"
@@ -296,7 +312,7 @@
       "/schedule HH:MM 内容 — 定时推送提醒到微信，发送 /schedule 查看完整用法",
       "/models [供应商] — 查看该供应商已发现的可用模型（不填=当前供应商）",
       "/model <名称> — 切换模型，如 /model opus",
-      "/effort <等级> — 切换思考强度，如 /effort high",
+      "/effort [等级] — 查看/切换思考强度（如 /effort high，不带参数查看可选项）",
       "/permission <模式> — 切换权限模式，如 /permission yolo",
       "?/provider <名称> — 切换供应商（会开始新对话），发送 /provider 查看可选项",
       "/commands — 查看 Claude 自带的斜杠命令",
@@ -324,7 +340,7 @@
       "/schedule HH:MM text — push a reminder to WeChat; send /schedule alone for full usage",
       "/models [provider] — list discovered models for that provider (omit for the current one)",
       "/model <name> — switch model, e.g. /model opus",
-      "/effort <level> — switch effort level, e.g. /effort high",
+      "/effort [level] — view or switch effort level, e.g. /effort high (omit to list current options)",
       "/permission <mode> — switch permission mode, e.g. /permission yolo",
       "?/provider <name> — switch provider (starts a new conversation); send /provider alone to see options",
       "/commands — list Claude's own slash commands",

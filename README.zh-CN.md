@@ -2,7 +2,7 @@
 
 中文 | [English](README.md)
 
-![version](https://img.shields.io/badge/version-v1.0.1-blue)
+![version](https://img.shields.io/badge/version-v1.0.2-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![platform](https://img.shields.io/badge/platform-desktop-lightgrey)
 ![Obsidian](https://img.shields.io/badge/Obsidian-plugin-7c3aed)
@@ -130,6 +130,12 @@ npm run build
 - [Claudian](https://github.com/YishenTu/claudian) (by Yishen Tu) —— 强大的 Obsidian Claude Code 嵌入插件。
 - [wechat-clawbot](https://github.com/nightsailer/wechat-clawbot) (by nightsailer / Pan Fan) —— 提供了优秀的微信 ClawBot iLink API Python 封装。
 - 微信 ClawBot ↔ Claude Code 社区（包括 `claude-code-wechat-channel` 等项目）对降噪过滤设计的启发。
+
+## 社区
+
+欢迎加入微信交流群，提问、反馈或获取最新动态：
+
+![微信群二维码](assets/wechat-group-qrcode.png)
 
 ## 许可
 

@@ -2,7 +2,7 @@
 
 [中文](README.zh-CN.md) | English
 
-![version](https://img.shields.io/badge/version-v1.0.1-blue)
+![version](https://img.shields.io/badge/version-v1.0.2-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![platform](https://img.shields.io/badge/platform-desktop-lightgrey)
 ![Obsidian](https://img.shields.io/badge/Obsidian-plugin-7c3aed)
@@ -122,6 +122,12 @@ Copy the built files (`manifest.json`, `main.js`, `relay.py`, `strings.json`) in
 - [Claudian](https://github.com/YishenTu/claudian) by Yishen Tu — The core Obsidian agent plugin driven by this bridge.
 - [wechat-clawbot](https://github.com/nightsailer/wechat-clawbot) by nightsailer (Pan Fan) — Python WeChat ClawBot iLink API client foundation.
 - The wider WeChat ClawBot ↔ Claude Code bridging community.
+
+## Community
+
+Join the WeChat group for questions, feedback, and updates:
+
+![WeChat group QR code](assets/wechat-group-qrcode.png)
 
 ## License
 

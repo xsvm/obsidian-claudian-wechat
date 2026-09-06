@@ -451,7 +451,7 @@ const DEFAULT_DATA: BridgeData = {
   pendingPushQueue: [],
   pendingFileQueue: [],
   providerId: null,
-  progressiveReply: false,
+  progressiveReply: true,
   scheduledSends: [],
 };
 
@@ -936,6 +936,7 @@ export default class WeChatBridgePlugin extends Plugin {
           return this.applySettingsCommand(settingsCmd!.key, settingsCmd!.value, lang);
         },
       },
+      { pattern: /^\/effort\s*$/i, run: (_m, lang) => this.listEffortOptions(lang) },
       { pattern: /^\/provider\s+(\S+)/i, run: (m, lang) => this.switchProvider(m[1].toLowerCase(), lang) },
       { pattern: /^\/provider\b/i, run: (_m, lang) => this.t('providerUsage', lang, this.getEnabledProviders().join(', ')) },
       { pattern: /^\/models\s*(\S+)?\b/i, run: (m, lang) => this.listAvailableModels(m[1]?.toLowerCase(), lang) },
@@ -1032,6 +1033,16 @@ export default class WeChatBridgePlugin extends Plugin {
 
     const metas = await this.readAllConversationMeta();
     const providerId = this.resolveActiveProviderId(metas);
+
+    if (key === 'effortLevel') {
+      const settings = claudian.settings ?? {};
+      const isActiveInUi = providerId === (settings.settingsProvider ?? 'claude');
+      const model = isActiveInUi ? settings.model : settings.savedProviderModel?.[providerId];
+      const known = this.getKnownEffortOptions(providerId, model, settings);
+      if (known && !known.some((o) => o.value === value)) {
+        return this.t('effortInvalid', lang, value, known.map((o) => o.value).join(', '));
+      }
+    }
 
     // Mirrors ProviderSettingsCoordinator.commitProviderSettingsSnapshot: the
     // savedProviderX map is written unconditionally (every provider's last
@@ -1157,6 +1168,89 @@ export default class WeChatBridgePlugin extends Plugin {
       lines.push(`- ${id}${displayName !== id ? ` (${displayName})` : ''}${markers ? ` ${markers}` : ''}`);
     }
     lines.push('\n' + this.t('modelsUsageHint', lang));
+    return lines.join('\n');
+  }
+
+  /**
+   * Providers whose valid effort levels are a fixed, model-independent list
+   * baked into Claudian's own UI (reverse-engineered from Claudian's bundle:
+   * claude's thinking-gear list and codex's subagent reasoning-effort
+   * dropdown are both this exact 5-value set). Not model-dependent the way
+   * claude's `xhigh` availability technically is in Claudian's own code
+   * (there's a per-model-version check gating it) - we deliberately don't
+   * replicate that finer-grained check here (see class doc comment risk
+   * notes), so a `claude` model that doesn't actually support `xhigh` will
+   * still list it as "valid" here even though Claudian's own UI would hide
+   * it for that specific model.
+   */
+  private static readonly STATIC_EFFORT_LEVELS: { value: string; label: string }[] =
+    ['low', 'medium', 'high', 'xhigh', 'max'].map((value) => ({ value, label: value }));
+
+  /**
+   * Best-effort lookup of the effort/reasoning levels Claudian actually
+   * considers valid for `modelId` under `providerId` right now - used to
+   * validate `/effort X` instead of blindly writing whatever the user typed.
+   *
+   * Returns `null` when we have no reliable source for this provider (currently:
+   * `pi`, whose settings cache only remembers the last-used value per model via
+   * `preferredThinkingByModel`, not the full set of valid ones) - callers should
+   * skip validation entirely in that case rather than reject everything.
+   *
+   * Source per provider (see class doc comment for how this was derived):
+   * - claude / codex: fixed list, independent of the specific model.
+   * - grok / opencode: each entry in `providerConfigs.<id>.discoveredModels`
+   *   carries its own `reasoningEfforts` array once Claudian has discovered
+   *   it - same persisted-cache source `/models` already reads model names
+   *   from, just a different field on the same objects.
+   * - pi: no equivalent field exists in what Claudian persists - see above.
+   */
+  private getKnownEffortOptions(
+    providerId: ProviderId,
+    modelId: string | undefined,
+    settings: Record<string, any>,
+  ): { value: string; label: string }[] | null {
+    if (providerId === 'claude' || providerId === 'codex') {
+      return WeChatBridgePlugin.STATIC_EFFORT_LEVELS;
+    }
+    if (providerId === 'pi') {
+      return null;
+    }
+    // grok, opencode
+    if (!modelId) return null;
+    const discovered = settings.providerConfigs?.[providerId]?.discoveredModels;
+    if (!Array.isArray(discovered)) return null;
+    const entry = discovered.find((m: any) => m?.model === modelId || m?.rawId === modelId);
+    const efforts = entry?.reasoningEfforts;
+    if (!Array.isArray(efforts) || efforts.length === 0) return null;
+    return efforts
+      .map((e: any) => {
+        const value = typeof e?.value === 'string' ? e.value : typeof e === 'string' ? e : null;
+        if (!value) return null;
+        const label = typeof e?.label === 'string' && e.label ? e.label : value;
+        return { value, label };
+      })
+      .filter((e: { value: string; label: string } | null): e is { value: string; label: string } => e !== null);
+  }
+
+  /** `/effort` with no args: lists the effort levels valid for whatever /model would target right now, per getKnownEffortOptions. */
+  private async listEffortOptions(lang: Lang): Promise<string> {
+    const settings = this.getClaudianPlugin().settings ?? {};
+    const metas = await this.readAllConversationMeta();
+    const providerId = this.resolveActiveProviderId(metas);
+    const isActiveInUi = providerId === (settings.settingsProvider ?? 'claude');
+    const model = isActiveInUi ? settings.model : settings.savedProviderModel?.[providerId];
+    const current = isActiveInUi ? settings.effortLevel : settings.savedProviderEffort?.[providerId];
+
+    const known = this.getKnownEffortOptions(providerId, model, settings);
+    if (!known) {
+      return this.t('effortUnknown', lang, providerId);
+    }
+    const lines = [this.t('effortHeader', lang, providerId)];
+    for (const o of known) {
+      const marker = o.value === current ? this.t('modelsCurrentMarker', lang) : '';
+      lines.push(`- ${o.value}${o.label !== o.value ? ` (${o.label})` : ''}${marker ? ` ${marker}` : ''}`);
+    }
+    lines.push('\n' + this.t('effortUsageHint', lang));
     return lines.join('\n');
   }
 
