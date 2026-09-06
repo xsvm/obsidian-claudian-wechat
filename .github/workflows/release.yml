@@ -1,0 +1,64 @@
+name: Release
+
+# Fires whenever a version tag is pushed (matches the plugin's own tagging
+# convention: bare semver like "1.0.3", no "v" prefix - see manifest.json).
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write # create/update the GitHub Release
+  id-token: write # required for keyless artifact attestation signing
+  attestations: write # required to publish the attestation
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: obsidian-plugin
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: obsidian-plugin/package-lock.json
+
+      - name: Setup Python (for verify-install.mjs's py_compile/--help checks)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build and verify (esbuild + fresh-install/hash-overwrite simulation)
+        run: npm run prepublish-check
+
+      - name: Check manifest/tag version match
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          MANIFEST_VERSION=$(node -p "require('./manifest.json').version")
+          if [ "$TAG" != "$MANIFEST_VERSION" ]; then
+            echo "::error::Tag ($TAG) does not match manifest.json version ($MANIFEST_VERSION)"
+            exit 1
+          fi
+
+      - name: Generate build provenance attestation for main.js
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: obsidian-plugin/main.js
+
+      - name: Create/update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: v${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            obsidian-plugin/main.js
+            obsidian-plugin/manifest.json
