@@ -56,7 +56,7 @@ Claude Code / Configured Provider
   - `/list` or `/ls` — List known Claudian sessions sorted by update time
   - `/switch N` or `/goto N` — Switch to session `#N`
   - `/new` — Detach and start a fresh session on the next message
-- **Runtime Configuration Control**: Switch `/model`, `/models` (discover available models), `/effort` (thinking level), and `/permission` (permission mode) from WeChat.
+- **Runtime Configuration Control**: Switch `/model` (omit arguments to list available models), `/effort` (thinking level), and `/permission` (permission mode) from WeChat.
 - **Slash Commands Forwarding**: Send `/commands` to discover Claude's native commands, vault commands, and skills; all slash commands can be executed straight from WeChat.
 - **Desktop Mirroring (`/listen`)**: Push desktop Claudian interactions to WeChat in real time.
 - **Noise Filtering**: Cleans out internal tool calls, raw thinking traces, and subagent chatter, forwarding only final assistant text.
@@ -99,7 +99,7 @@ Copy the built files (`manifest.json`, `main.js`, `relay.py`, `strings.json`) in
 | `/list` or `/ls` | List known conversations, numbered |
 | `/switch N` or `/goto N` | Switch to conversation `#N` |
 | `/new` | Start a brand new conversation |
-| `/models` | List all available models discovered by current provider |
+| `/model` | List available models for the current provider (static list for claude, discovered models for others) |
 | `/model <name>` | Change model (e.g. `/model opus`, `/model sonnet`) |
 | `/effort <level>` | Change reasoning effort (e.g. `/effort low`, `/effort high`) |
 | `/permission <mode>` | Change permission mode (e.g. `/permission yolo`, `/permission default`) |

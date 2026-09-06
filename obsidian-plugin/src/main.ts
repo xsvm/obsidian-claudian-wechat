@@ -937,9 +937,9 @@ export default class WeChatBridgePlugin extends Plugin {
         },
       },
       { pattern: /^\/effort\s*$/i, run: (_m, lang) => this.listEffortOptions(lang) },
+      { pattern: /^\/model\s*$/i, run: (_m, lang) => this.listAvailableModels(lang) },
       { pattern: /^\/provider\s+(\S+)/i, run: (m, lang) => this.switchProvider(m[1].toLowerCase(), lang) },
       { pattern: /^\/provider\b/i, run: (_m, lang) => this.t('providerUsage', lang, this.getEnabledProviders().join(', ')) },
-      { pattern: /^\/models\s*(\S+)?\b/i, run: (m, lang) => this.listAvailableModels(m[1]?.toLowerCase(), lang) },
       { pattern: /^\/ls(?:\s+(all))?\b/i, run: (m, lang) => this.listConversations(lang, Boolean(m[1])) },
       { pattern: /^\/goto\s+(\d+)/i, run: (m, lang) => this.switchConversation(Number(m[1]), lang) },
       { pattern: /^\/status\b/i, run: (_m, lang) => this.statusText(lang) },
@@ -1126,26 +1126,31 @@ export default class WeChatBridgePlugin extends Plugin {
    * registry class that computes it (a module-private static class not
    * reachable from outside Claudian's own bundle) - so this reads the cache
    * directly instead of trying to call Claudian's internal discovery API.
-   * `claude` has no such cache (its model list is a small built-in constant
-   * baked into Claudian's UI code, not discovered) so it's called out
-   * separately rather than guessed at and hardcoded here - hardcoding it
-   * would just trade today's problem for a future silent-staleness one.
+   * `claude`'s model list is a small built-in constant baked into Claudian's
+   * UI code, not discovered - reverse-engineered from Claudian's own bundle
+   * (the `bKe` array) and mirrored below as `CLAUDE_STATIC_MODELS`. Every
+   * `id` here is exactly what Claudian accepts for `/model <id>`.
    */
-  private async listAvailableModels(providerArg: string | undefined, lang: Lang): Promise<string> {
-    const enabled = this.getEnabledProviders();
-    let providerId: ProviderId;
-    if (providerArg) {
-      if (!(enabled as string[]).includes(providerArg)) {
-        return this.t('providerUnknown', lang, providerArg, enabled.join(', '));
-      }
-      providerId = providerArg as ProviderId;
-    } else {
-      providerId = this.resolveActiveProviderId(await this.readAllConversationMeta());
-    }
+  private static readonly CLAUDE_STATIC_MODELS: { id: string; label: string; description: string }[] = [
+    { id: 'haiku', label: 'Haiku', description: 'Fast and efficient' },
+    { id: 'sonnet', label: 'Sonnet', description: 'Balanced performance' },
+    { id: 'opus', label: 'Opus', description: 'Most capable' },
+    { id: 'fable', label: 'Fable 5 ($$)', description: "Anthropic's most capable model — premium pricing above Opus" },
+  ];
+
+  private async listAvailableModels(lang: Lang): Promise<string> {
+    const providerId = this.resolveActiveProviderId(await this.readAllConversationMeta());
 
     const settings = this.getClaudianPlugin().settings ?? {};
     if (providerId === 'claude') {
-      return this.t('modelsClaudeBuiltin', lang);
+      const current = settings.model;
+      const lines = [this.t('modelsHeader', lang, providerId)];
+      for (const m of WeChatBridgePlugin.CLAUDE_STATIC_MODELS) {
+        const marker = m.id === current ? this.t('modelsCurrentMarker', lang) : '';
+        lines.push(`- ${m.id} (${m.label}: ${m.description})${marker ? ` ${marker}` : ''}`);
+      }
+      lines.push('\n' + this.t('modelsUsageHint', lang));
+      return lines.join('\n');
     }
 
     const discovered = settings.providerConfigs?.[providerId]?.discoveredModels;
@@ -1200,7 +1205,7 @@ export default class WeChatBridgePlugin extends Plugin {
    * - claude / codex: fixed list, independent of the specific model.
    * - grok / opencode: each entry in `providerConfigs.<id>.discoveredModels`
    *   carries its own `reasoningEfforts` array once Claudian has discovered
-   *   it - same persisted-cache source `/models` already reads model names
+   *   it - same persisted-cache source `/model` already reads model names
    *   from, just a different field on the same objects.
    * - pi: no equivalent field exists in what Claudian persists - see above.
    */

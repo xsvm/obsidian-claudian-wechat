@@ -56,7 +56,7 @@ Claude Code / 你配置的 provider
   - `/list` 或 `/ls` —— 列出 Claudian 已有会话（按更新时间倒序排列）
   - `/switch N` 或 `/goto N` —— 快速切换绑定至列表第 `N` 个会话
   - `/new` —— 解绑当前会话，下一条消息自动开启全新会话
-- **运行时设置切换**：从微信端自由调节 `/model`、`/models`（列出可用模型）、`/effort`（思考强度）、`/permission`（权限模式）。
+- **运行时设置切换**：从微信端自由调节 `/model`（不带参数查看可用模型列表）、`/effort`（思考强度）、`/permission`（权限模式）。
 - **斜杠命令透传**：`/commands` 发现 Claude 内置命令、vault 命令及 skills；所有斜杠命令均可直接发送执行。
 - **双向镜像监听 (`/listen`)**：开启后，你在电脑端直接敲入的 Claudian 交互也会实时同步镜像至微信。
 - **降噪回复过滤**：智能过滤工具调用、中间思考及子代理细节，仅将最终 assistant 叙述推回微信，保持移动端体验清晰整洁。
@@ -107,7 +107,7 @@ npm run build
 | `/list` 或 `/ls` | 按时间倒序分页列出已知会话编号 |
 | `/switch N` 或 `/goto N` | 切换到指定编号的会话 |
 | `/new` | 解绑当前会话并开启全新会话 |
-| `/models` | 列出当前 provider 探测到的所有可用模型 |
+| `/model` | 查看当前 provider 可用模型（claude 为固定列表，其他 provider 为已探测到的模型） |
 | `/model <名称>` | 切换模型（如 `/model opus`、`/model sonnet`） |
 | `/effort <等级>` | 切换思考强度（如 `/effort low`、`/effort high`） |
 | `/permission <模式>` | 切换权限模式（如 `/permission yolo`、`/permission default`） |

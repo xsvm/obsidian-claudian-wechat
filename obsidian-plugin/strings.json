@@ -121,10 +121,6 @@
     "zh": "没有等待补充说明的图片。",
     "en": "There's no buffered image waiting for a caption."
   },
-  "modelsClaudeBuiltin": {
-    "zh": "claude 供应商用的是 Claudian 内置的固定模型列表（不是动态发现的），这个命令看不到它 —— 请在 Claudian 桌面端的模型下拉菜单里查看。",
-    "en": "The claude provider uses Claudian's small built-in model list (not dynamically discovered), so this command can't see it - check the model dropdown in Claudian's desktop UI instead."
-  },
   "modelsNoneDiscovered": {
     "zh": "还没有为供应商 {0} 发现任何模型。请先在 Claudian 桌面端打开一次这个供应商的设置/模型选择器，触发一次发现，然后再试。",
     "en": "No models discovered yet for provider {0}. Open that provider's settings/model picker once in Claudian's desktop UI to trigger discovery, then try again."
@@ -310,8 +306,7 @@
       "/getfile N — 获取 /files 列出的文件，多个用逗号分隔如 /getfile 1,2",
       "/send <路径> — 直接发送 vault 内某个文件",
       "/schedule HH:MM 内容 — 定时推送提醒到微信，发送 /schedule 查看完整用法",
-      "/models [供应商] — 查看该供应商已发现的可用模型（不填=当前供应商）",
-      "/model <名称> — 切换模型，如 /model opus",
+      "/model [名称] — 查看或切换模型，如 /model opus（不带参数=查看当前供应商可用模型）",
       "/effort [等级] — 查看/切换思考强度（如 /effort high，不带参数查看可选项）",
       "/permission <模式> — 切换权限模式，如 /permission yolo",
       "?/provider <名称> — 切换供应商（会开始新对话），发送 /provider 查看可选项",
@@ -338,8 +333,7 @@
       "/getfile N — fetch a file from /files, comma-separate for several, e.g. /getfile 1,2",
       "/send <path> — send a specific file from the vault directly",
       "/schedule HH:MM text — push a reminder to WeChat; send /schedule alone for full usage",
-      "/models [provider] — list discovered models for that provider (omit for the current one)",
-      "/model <name> — switch model, e.g. /model opus",
+      "/model [name] — view or switch model, e.g. /model opus (omit to list current provider's models)",
       "/effort [level] — view or switch effort level, e.g. /effort high (omit to list current options)",
       "/permission <mode> — switch permission mode, e.g. /permission yolo",
       "?/provider <name> — switch provider (starts a new conversation); send /provider alone to see options",
