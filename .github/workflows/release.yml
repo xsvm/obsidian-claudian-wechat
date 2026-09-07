@@ -37,6 +37,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Install relay.py's Python dependencies (same list as RelayManager's own PIP_PACKAGES, so the CI sandbox check exercises the exact packages real users' venvs get)
+        run: pip install wechat-clawbot httpx anyio qrcode
+
       - name: Build and verify (esbuild + fresh-install/hash-overwrite simulation)
         run: npm run prepublish-check
 
