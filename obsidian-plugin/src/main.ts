@@ -440,6 +440,35 @@ function conversationSortKey(m: ConversationMeta): number {
   return m.lastActivityAt ?? m.createdAt ?? 0;
 }
 
+/**
+ * Optimal-string-alignment distance (Levenshtein + adjacent-transposition,
+ * each substring used at most once) - used by suggestBridgeCommand() below
+ * to catch typos like a swapped pair of letters ("usgae" -> "usage", one
+ * transposition) as well as the ordinary single-letter add/drop/substitute
+ * cases, in one edit rather than two.
+ */
+function damerauLevenshtein(a: string, b: string): number {
+  const la = a.length;
+  const lb = b.length;
+  const d: number[][] = Array.from({ length: la + 1 }, () => new Array<number>(lb + 1).fill(0));
+  for (let i = 0; i <= la; i++) d[i][0] = i;
+  for (let j = 0; j <= lb; j++) d[0][j] = j;
+  for (let i = 1; i <= la; i++) {
+    for (let j = 1; j <= lb; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      d[i][j] = Math.min(
+        d[i - 1][j] + 1, // deletion
+        d[i][j - 1] + 1, // insertion
+        d[i - 1][j - 1] + cost, // substitution
+      );
+      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) {
+        d[i][j] = Math.min(d[i][j], d[i - 2][j - 2] + cost); // transposition
+      }
+    }
+  }
+  return d[la][lb];
+}
+
 // ---- i18n ----
 // Language is decided per-request from Claudian's own `settings.locale`
 // (e.g. "zh-CN", "en"), not from any setting of this plugin's own.
@@ -908,7 +937,57 @@ export default class WeChatBridgePlugin extends Plugin {
       if (m) return await route.run(m, lang, images);
     }
 
+    // Nothing matched. If this looks like a typo of one of *this bridge's
+    // own* commands (e.g. "/lsit" for "/ls"), say so instead of silently
+    // forwarding the typo on as if it were a prompt - the same "did you mean"
+    // courtesy /usage-style CLIs give for a mistyped command. Deliberately
+    // narrow: only fires when the first word is close to exactly one bridge
+    // command and isn't itself a recognized command word (an exact word match
+    // that reached here means the *arguments* were malformed, e.g. bare
+    // "/goto" with no number - that's not a typo, so it still falls through
+    // below unchanged). Claude's own native slash commands (/compact, vault
+    // commands, skills, ...) are unrelated words and never close enough to
+    // collide with this list, so this never intercepts those - they still
+    // reach Claudian's own InputController exactly as before.
+    const suggestion = this.suggestBridgeCommand(text);
+    if (suggestion) return this.t('unknownCommandSuggestion', lang, suggestion.typed, suggestion.suggested);
+
     return await this.sendChatMessageQueued(text, lang, images);
+  }
+
+  /**
+   * Every first-word command this bridge itself recognizes (mirrors
+   * commandRoutes() above - kept as a flat list here rather than derived
+   * from the regexes, since several patterns share one literal word, e.g.
+   * model/effort/permission).
+   */
+  private static readonly BRIDGE_COMMAND_WORDS = [
+    'answer', 'approve', 'esc', 'skip', 'files', 'getfile', 'send', 'schedule',
+    'help', 'commands', 'model', 'effort', 'permission', 'provider', 'ls',
+    'goto', 'status', 'hist', 'listen', 'progressive', 'new',
+  ];
+
+  /**
+   * If `text` starts with "/<word>" where <word> is a near-miss (edit
+   * distance <=2, allowing adjacent-letter transpositions like "usgae" ->
+   * "usage") of exactly one bridge command word - and not already an exact
+   * match, which would mean a malformed-argument case instead of a typo -
+   * returns `{typed, suggested}` for the reply. Otherwise null.
+   */
+  private suggestBridgeCommand(text: string): { typed: string; suggested: string } | null {
+    const word = text.match(/^\/([a-zA-Z]+)/)?.[1]?.toLowerCase();
+    if (!word || word.length < 3 || WeChatBridgePlugin.BRIDGE_COMMAND_WORDS.includes(word)) return null;
+    let best: string | null = null;
+    let bestDist = Infinity;
+    for (const candidate of WeChatBridgePlugin.BRIDGE_COMMAND_WORDS) {
+      const dist = damerauLevenshtein(word, candidate);
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = candidate;
+      }
+    }
+    if (!best || bestDist > 2) return null;
+    return { typed: `/${word}`, suggested: `/${best}` };
   }
 
   /** Handles `/skip`: sends every still-buffered image (see handleIncoming) on its own, right now, with no caption. */

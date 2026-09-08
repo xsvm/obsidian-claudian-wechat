@@ -240,6 +240,10 @@
     "zh": "文件过大（约 {1}MB，超过上限），未发送: {0}",
     "en": "File too large (~{1}MB, over the limit) - not sent: {0}"
   },
+  "unknownCommandSuggestion": {
+    "zh": "未知命令: {0}。你是不是想输入 {1}？",
+    "en": "Unknown command: {0}. Did you mean {1}?"
+  },
   "sendUsage": {
     "zh": "用法: /send <vault内的相对路径>，如 /send attachments/report.pdf",
     "en": "Usage: /send <path relative to the vault>, e.g. /send attachments/report.pdf"
