@@ -1,3 +1,9 @@
+// Language is decided per-request from Claudian's own `settings.locale`
+// (e.g. "zh-CN", "en"), not from any setting of this plugin's own. Shared
+// across main.ts and any module (e.g. scheduleManager.ts) that builds
+// user-facing reply text via the same `t()` lookup.
+export type Lang = 'zh' | 'en';
+
 // Every provider Claudian ships. `claude` has no `enabled` flag in its own
 // registration (ProviderRegistry: `isEnabled: () => true`) - it's always on;
 // the others are opt-in and expose `providerConfigs.<id>.enabled` in

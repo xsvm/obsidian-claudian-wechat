@@ -7,6 +7,8 @@ import { WeChatBridgeSettingTab } from './settingsTab';
 import { EMBEDDED_RELAY_PY, EMBEDDED_STRINGS_JSON } from './embeddedAssets';
 import { AckQueue } from './ackQueue';
 import { damerauLevenshtein, extractCommandWords } from './textUtils';
+import { ConversationMetaStore } from './conversationMeta';
+import { ScheduleManager } from './scheduleManager';
 import {
   ALL_PROVIDER_IDS,
   ProviderId,
@@ -15,6 +17,7 @@ import {
   ScheduledSend,
   BridgeData,
   DEFAULT_DATA,
+  Lang,
 } from './bridgeTypes';
 import {
   ContentBlock,
@@ -64,9 +67,7 @@ const CLAUDIAN_PLUGIN_ID = 'realclaudian';
 const VIEW_TYPE_CLAUDIAN = 'claudian-view';
 
 // ---- i18n ----
-// Language is decided per-request from Claudian's own `settings.locale`
-// (e.g. "zh-CN", "en"), not from any setting of this plugin's own.
-type Lang = 'zh' | 'en';
+// `Lang` itself now lives in bridgeTypes.ts (shared with scheduleManager.ts).
 
 // All bilingual user-facing text lives in strings.json (next to main.js in
 // the plugin folder), not here - see loadStrings() below for why, and the
@@ -179,6 +180,16 @@ export default class WeChatBridgePlugin extends Plugin {
   private lastReferencedFiles: { display: string; absolutePath: string }[] = [];
   /** Loaded once in onload() from strings.json - see loadStrings(). */
   private strings: StringsData | null = null;
+  /** Owns reading/caching conversation meta.json files - see ConversationMetaStore. */
+  private metaStore = new ConversationMetaStore(this.app);
+  /** Owns /schedule end to end - see ScheduleManager. Deps are thin closures over this plugin's own state/helpers. */
+  private scheduleManager = new ScheduleManager({
+    getScheduledSends: () => this.data.scheduledSends,
+    setScheduledSends: (list) => { this.data.scheduledSends = list; },
+    saveData: () => this.saveData(this.data),
+    t: (key, lang, ...args) => this.t(key, lang, ...args),
+    pushToWeChat: (text) => this.pendingPushes.push(text),
+  });
 
   async onload() {
     const saved = await this.loadData();
@@ -215,7 +226,7 @@ export default class WeChatBridgePlugin extends Plugin {
     await this.startServer();
 
     this.registerInterval(window.setInterval(() => this.checkForDesktopActivity(), LISTEN_POLL_INTERVAL_MS));
-    this.registerInterval(window.setInterval(() => this.checkScheduledSends(), LISTEN_POLL_INTERVAL_MS));
+    this.registerInterval(window.setInterval(() => void this.scheduleManager.checkDue(), LISTEN_POLL_INTERVAL_MS));
 
     // Owns the whole "get connected" path so installing this plugin is enough
     // on its own: private Python env, one-time QR login, and the relay
@@ -600,7 +611,7 @@ export default class WeChatBridgePlugin extends Plugin {
       { pattern: /^\/getfile\b/i, run: (m, lang) => this.handleGetFileCommand(m.input as string, lang) },
       { pattern: /^\/send\s+(\S.*)$/i, run: (m, lang) => this.handleSendCommand(m[1].trim(), lang) },
       { pattern: /^\/send\b/i, run: (_m, lang) => this.t('sendUsage', lang) },
-      { pattern: /^\/schedule\s+(\S.*)$/i, run: (m, lang) => this.handleScheduleCommand(m[1].trim(), lang) },
+      { pattern: /^\/schedule\s+(\S.*)$/i, run: (m, lang) => this.scheduleManager.handleCommand(m[1].trim(), lang) },
       { pattern: /^\/schedule\b/i, run: (_m, lang) => this.t('scheduleUsage', lang) },
       { pattern: /^\/help\b/i, run: (_m, lang) => this.buildHelpText(lang, this.getEnabledProviders().length > 1) },
       { pattern: /^\/commands\b/i, run: (_m, lang) => this.listClaudeCommands(lang) },
@@ -706,12 +717,12 @@ export default class WeChatBridgePlugin extends Plugin {
         ? 'savedProviderEffort'
         : 'savedProviderPermissionMode';
 
-    const metas = await this.readAllConversationMeta();
+    const metas = await this.metaStore.readAll();
     const providerId = this.resolveActiveProviderId(metas);
 
     if (key === 'effortLevel') {
       const settings = claudian.settings ?? {};
-      const isActiveInUi = providerId === (settings.settingsProvider ?? 'claude');
+      const isActiveInUi = this.isProviderActiveInUi(providerId, settings);
       const model = isActiveInUi ? settings.model : settings.savedProviderModel?.[providerId];
       const known = this.getKnownEffortOptions(providerId, model, settings);
       if (known && !known.some((o) => o.value === value)) {
@@ -731,7 +742,7 @@ export default class WeChatBridgePlugin extends Plugin {
         settings[savedKey] = {};
       }
       settings[savedKey][providerId] = value;
-      if (providerId === (settings.settingsProvider ?? 'claude')) {
+      if (this.isProviderActiveInUi(providerId, settings)) {
         settings[key] = value;
       }
     });
@@ -772,6 +783,19 @@ export default class WeChatBridgePlugin extends Plugin {
     return this.data.providerId ?? 'claude';
   }
 
+  /**
+   * Whether `providerId` is the one Claudian's own UI is currently showing
+   * (i.e. its flat `settings.model`/`settings.effortLevel`/... fields refer
+   * to it, rather than needing the `savedProviderX` map for any other
+   * provider) - the same distinction Claudian's own
+   * ProviderSettingsCoordinator.commitProviderSettingsSnapshot makes on
+   * write. One shared check instead of four separately-written copies of the
+   * same `providerId === (settings.settingsProvider ?? 'claude')` expression.
+   */
+  private isProviderActiveInUi(providerId: ProviderId, settings: Record<string, any>): boolean {
+    return providerId === (settings.settingsProvider ?? 'claude');
+  }
+
   private async switchProvider(name: string, lang: Lang): Promise<string> {
     const enabled = this.getEnabledProviders();
     if (!(enabled as string[]).includes(name)) {
@@ -794,14 +818,17 @@ export default class WeChatBridgePlugin extends Plugin {
     // mutating it here too, /provider would report success but the next
     // /new-style tab would silently reopen on whatever provider Claudian's
     // settings already had.
+    // getClaudianPlugin() never returns falsy (it throws if Claudian isn't
+    // enabled) - the /provider route only ever reaches switchProvider() after
+    // getEnabledProviders() above already succeeded in reading Claudian's own
+    // settings, so Claudian being present is already established by this
+    // point; no separate guard needed here.
     const claudian = this.getClaudianPlugin();
-    if (claudian) {
-      await claudian.mutateSettings((settings) => {
-        settings.settingsProvider = name;
-      });
-      for (const view of claudian.getAllViews?.() ?? []) {
-        view.refreshModelSelector?.();
-      }
+    await claudian.mutateSettings((settings) => {
+      settings.settingsProvider = name;
+    });
+    for (const view of claudian.getAllViews?.() ?? []) {
+      view.refreshModelSelector?.();
     }
     return this.t('providerSwitched', lang, name);
   }
@@ -842,7 +869,7 @@ export default class WeChatBridgePlugin extends Plugin {
   ];
 
   private async listAvailableModels(lang: Lang): Promise<string> {
-    const providerId = this.resolveActiveProviderId(await this.readAllConversationMeta());
+    const providerId = this.resolveActiveProviderId(await this.metaStore.readAll());
 
     const settings = this.getClaudianPlugin().settings ?? {};
     if (providerId === 'claude') {
@@ -861,7 +888,7 @@ export default class WeChatBridgePlugin extends Plugin {
       return this.t('modelsNoneDiscovered', lang, providerId);
     }
 
-    const isActiveInUi = providerId === (settings.settingsProvider ?? 'claude');
+    const isActiveInUi = this.isProviderActiveInUi(providerId, settings);
     const current = isActiveInUi ? settings.model : settings.savedProviderModel?.[providerId];
 
     const lines = [this.t('modelsHeader', lang, providerId)];
@@ -957,9 +984,9 @@ export default class WeChatBridgePlugin extends Plugin {
   /** `/effort` with no args: lists the effort levels valid for whatever /model would target right now, per getKnownEffortOptions. */
   private async listEffortOptions(lang: Lang): Promise<string> {
     const settings = this.getClaudianPlugin().settings ?? {};
-    const metas = await this.readAllConversationMeta();
+    const metas = await this.metaStore.readAll();
     const providerId = this.resolveActiveProviderId(metas);
-    const isActiveInUi = providerId === (settings.settingsProvider ?? 'claude');
+    const isActiveInUi = this.isProviderActiveInUi(providerId, settings);
     const model = isActiveInUi ? settings.model : settings.savedProviderModel?.[providerId];
     const current = isActiveInUi ? settings.effortLevel : settings.savedProviderEffort?.[providerId];
 
@@ -977,127 +1004,10 @@ export default class WeChatBridgePlugin extends Plugin {
   }
 
   // ---- conversation list / switch / new ----
-
-  private getSessionsDir(): string {
-    const adapter = this.app.vault.adapter;
-    if (!(adapter instanceof FileSystemAdapter)) {
-      throw new Error('Vault is not on a local filesystem.');
-    }
-    return path.join(adapter.getBasePath(), '.claudian', 'sessions');
-  }
-
-  /**
-   * Reads every `<id>.meta.json` under `.claudian/sessions/` asynchronously
-   * (fs/promises), so a large, ever-growing session history never blocks
-   * Obsidian's renderer thread the way synchronous fs calls would.
-   *
-   * Layout and tombstone convention reverse-engineered from Claudian's own
-   * `SessionMetadataStore` (its own `.scan()`/`.listAllConversations()`),
-   * which this deliberately mirrors instead of guessing at a simpler shape -
-   * it applies equally to every provider (`providerId` is just a field on
-   * the same meta.json, not something that changes where/how a conversation
-   * is stored):
-   * - Most conversations live directly under `sessions/<id>.meta.json`
-   *   ("unscoped").
-   * - Conversations synced from another device instead (or additionally)
-   *   live under `sessions/devices/<device-key>/<id>.meta.json` - one
-   *   subfolder per device key, sibling to the flat files. Missing this
-   *   subfolder previously made /ls silently skip every conversation stored
-   *   there, regardless of provider (it wasn't provider-specific - the
-   *   whole subfolder was never scanned).
-   * - A conversation the user deleted isn't necessarily removed from disk -
-   *   Claudian instead (or additionally) writes a `<id>.deleted.json`
-   *   tombstone next to the metadata file (same directory), so deletions
-   *   propagate across synced devices. Any id with such a tombstone in a
-   *   given directory must be excluded from that directory's results, or
-   *   /ls would resurrect conversations the user already deleted.
-   * - Claudian also arbitrates between multiple copies of the same id via
-   *   `<id>.assigned.json` ownership markers, and falls back to a legacy
-   *   `.claude/sessions/` path - both intentionally not replicated here:
-   *   this is a read-only listing feature, not the authoritative session
-   *   store, so on the rare id present in more than one place, picking
-   *   whichever copy is read first is an acceptable simplification.
-   *
-   * Result is cached in memory for `META_CACHE_TTL_MS`: within that window,
-   * repeat callers (e.g. /switch reading the title right after /list already
-   * scanned the same directory, or the /listen poller looking up a title on
-   * every push) reuse the same read instead of re-scanning disk.
-   */
-  private metaCache: { at: number; metas: ConversationMeta[] } | null = null;
-  private static readonly META_CACHE_TTL_MS = 5000;
-
-  /**
-   * Reads every non-tombstoned `<id>.meta.json` file directly inside `dir`
-   * (non-recursive). Missing dir -> []. A `<id>.deleted.json` sibling in the
-   * same directory excludes that id from the result (see class doc comment).
-   */
-  private async readMetaFilesIn(dir: string): Promise<ConversationMeta[]> {
-    let files: string[];
-    try {
-      files = await fs.readdir(dir);
-    } catch {
-      return [];
-    }
-    const deletedIds = new Set(
-      files.filter((f) => f.endsWith('.deleted.json')).map((f) => f.slice(0, -'.deleted.json'.length)),
-    );
-    const metaFiles = files.filter((f) => f.endsWith('.meta.json'));
-    const metas: ConversationMeta[] = [];
-    for (const file of metaFiles) {
-      const id = file.slice(0, -'.meta.json'.length);
-      if (deletedIds.has(id)) continue;
-      try {
-        const raw = await fs.readFile(path.join(dir, file), 'utf-8');
-        metas.push(JSON.parse(raw));
-      } catch {
-        // skip unreadable/corrupt meta file
-      }
-    }
-    return metas;
-  }
-
-  private async readAllConversationMeta(): Promise<ConversationMeta[]> {
-    if (this.metaCache && Date.now() - this.metaCache.at < WeChatBridgePlugin.META_CACHE_TTL_MS) {
-      return this.metaCache.metas;
-    }
-
-    const dir = this.getSessionsDir();
-    const topLevel = await this.readMetaFilesIn(dir);
-
-    const devicesDir = path.join(dir, 'devices');
-    let deviceKeys: string[];
-    try {
-      deviceKeys = await fs.readdir(devicesDir);
-    } catch {
-      deviceKeys = [];
-    }
-    const perDevice = await Promise.all(
-      deviceKeys.map((key) => this.readMetaFilesIn(path.join(devicesDir, key))),
-    );
-
-    // Dedupe by id for the rare conversation present in more than one
-    // location (see class doc comment) - unscoped copy wins over any
-    // device-scoped copy, since that's the one Claudian's own UI reads by
-    // default absent an active device assignment.
-    const seen = new Set<string>();
-    const metas: ConversationMeta[] = [];
-    for (const m of [...topLevel, ...perDevice.flat()]) {
-      if (!m?.id || seen.has(m.id)) continue;
-      seen.add(m.id);
-      metas.push(m);
-    }
-
-    // Same field, same fallback, for every provider - lastActivityAt is
-    // what Claudian's own listAllConversations() sorts by; createdAt/0 are
-    // just this bridge's extra defensiveness against an unfamiliar/older
-    // meta.json shape missing that field (see conversationSortKey above).
-    metas.sort((a, b) => conversationSortKey(b) - conversationSortKey(a));
-    this.metaCache = { at: Date.now(), metas };
-    return metas;
-  }
+  // (disk-reading logic itself lives in ConversationMetaStore - see this.metaStore)
 
   private async listConversations(lang: Lang, showAll: boolean): Promise<string> {
-    const metas = await this.readAllConversationMeta();
+    const metas = await this.metaStore.readAll();
     // Always recorded in full (not truncated to what's displayed) so /switch
     // N still resolves correctly for any N within the real list, even one
     // past what a default (non-"all") /list actually printed.
@@ -1132,7 +1042,7 @@ export default class WeChatBridgePlugin extends Plugin {
     // Eagerly resolve/open the tab now so the switch fails fast if something's wrong,
     // instead of silently failing on the next chat message.
     const tab = await this.getOrCreateWeChatTab();
-    const metas = await this.readAllConversationMeta();
+    const metas = await this.metaStore.readAll();
     const title = this.titleFor(tab.conversationId, metas);
     return this.t('switchedTo', lang, title);
   }
@@ -1141,13 +1051,13 @@ export default class WeChatBridgePlugin extends Plugin {
 
   private async statusText(lang: Lang): Promise<string> {
     const settings = this.getClaudianPlugin().settings ?? {};
-    const metas = await this.readAllConversationMeta();
+    const metas = await this.metaStore.readAll();
     const providerId = this.resolveActiveProviderId(metas);
     // The flat fields (settings.model etc.) only reflect whichever provider
     // is currently shown in Claudian's own UI (settings.settingsProvider);
     // for any other provider, its last value lives in the savedProviderX map
     // instead (see applySettingsCommand for the same distinction on write).
-    const isActiveInUi = providerId === (settings.settingsProvider ?? 'claude');
+    const isActiveInUi = this.isProviderActiveInUi(providerId, settings);
     const model = isActiveInUi ? settings.model : settings.savedProviderModel?.[providerId];
     const effort = isActiveInUi ? settings.effortLevel : settings.savedProviderEffort?.[providerId];
     const permission = isActiveInUi ? settings.permissionMode : settings.savedProviderPermissionMode?.[providerId];
@@ -1207,39 +1117,6 @@ export default class WeChatBridgePlugin extends Plugin {
     }
     await this.saveData(this.data);
     return this.t(on ? 'listenOn' : 'listenOff', lang);
-  }
-
-  /**
-   * Runs on a timer (same cadence as checkForDesktopActivity). Fires any
-   * /schedule entry whose nextFireAt has passed: pushes its text straight to
-   * pendingPushes (drained by relay.py's next /pending poll, same as every
-   * other proactive push in this file) and either removes it (one-shot) or
-   * rolls nextFireAt forward by its repeat rule (recurring) so it fires again
-   * next time around. Deliberately does not touch Claudian/sendChatMessage at
-   * all - a scheduled send is a local alarm, not an AI turn.
-   */
-  private async checkScheduledSends(): Promise<void> {
-    if (this.data.scheduledSends.length === 0) return;
-    const now = Date.now();
-    const due = this.data.scheduledSends.filter((s) => s.nextFireAt <= now);
-    if (due.length === 0) return;
-
-    let changed = false;
-    for (const entry of due) {
-      this.pendingPushes.push(entry.text);
-      if (entry.repeat?.type === 'daily') {
-        // Roll forward a whole number of days from the missed slot (not just
-        // "+1 day from now") so a brief Obsidian outage across the fire time
-        // doesn't drift the daily time of day.
-        let next = entry.nextFireAt;
-        while (next <= now) next += 24 * 60 * 60 * 1000;
-        entry.nextFireAt = next;
-      } else {
-        this.data.scheduledSends = this.data.scheduledSends.filter((s) => s.id !== entry.id);
-      }
-      changed = true;
-    }
-    if (changed) await this.saveData(this.data);
   }
 
   /**
@@ -1371,7 +1248,7 @@ export default class WeChatBridgePlugin extends Plugin {
     const { text: reply, compacted } = this.extractDispatchText(newMessages, lang);
     if (!reply.trim()) return; // Genuinely nothing new (e.g. a compact boundary with no narrative text) - see extractDispatchText.
 
-    const metas = await this.readAllConversationMeta();
+    const metas = await this.metaStore.readAll();
     const title = this.titleFor(tab.conversationId, metas);
     // Right after a /compact, Claudian's own conversation-meta usage numbers
     // haven't necessarily caught up yet, so appending them here would show
@@ -1420,8 +1297,8 @@ export default class WeChatBridgePlugin extends Plugin {
     // Bypass the meta cache: this is read right after a turn just completed,
     // and the whole point is to report that turn's up-to-date usage, not a
     // pre-turn snapshot the cache may still be holding.
-    this.metaCache = null;
-    const metas = await this.readAllConversationMeta();
+    this.metaStore.invalidate();
+    const metas = await this.metaStore.readAll();
     const usage = metas.find((m) => m.id === conversationId)?.usage;
     // Explicit null/undefined checks, not `!usage.contextTokens` - a
     // conversation that has genuinely used 0 tokens so far (e.g. right after
@@ -1516,7 +1393,7 @@ export default class WeChatBridgePlugin extends Plugin {
     // stale. This shrinks the "sent into the wrong conversation" window to
     // effectively zero instead of merely detecting it after the fact.
     if (conversationIdAtQueueTime) {
-      tab = await this.getOrCreateTabForConversation(conversationIdAtQueueTime);
+      tab = await this.getOrCreateWeChatTab(conversationIdAtQueueTime);
       if (!tab.controllers.inputController) throw new Error(this.t('tabNotReady', lang));
     }
 
@@ -1684,7 +1561,7 @@ export default class WeChatBridgePlugin extends Plugin {
       // dropping it would silently lose a turn that Claudian actually ran -
       // but tagged with which conversation and prompt it belongs to, since
       // by the time it arrives it's no longer obvious from context.
-      const metas = await this.readAllConversationMeta();
+      const metas = await this.metaStore.readAll();
       const title = this.titleFor(tab.conversationId, metas);
       return this.t('switchedAwayTag', lang, title, text, body);
     } finally {
@@ -1737,11 +1614,11 @@ export default class WeChatBridgePlugin extends Plugin {
     const chunksThisCall: string[] = [];
 
     // Best-effort tag: no time to await a fresh conversation-list read from a
-    // setInterval tick, so this reuses whatever readAllConversationMeta()
+    // setInterval tick, so this reuses whatever this.metaStore
     // last cached (refreshed at least once per /list, /switch, or turn-end),
     // falling back to the raw id if nothing's cached yet.
     const tag = tab.conversationId && tab.conversationId !== this.data.conversationId
-      ? `[${this.metaCache?.metas.find((m) => m.id === tab.conversationId)?.title ?? tab.conversationId}] `
+      ? `[${this.metaStore.peekCached()?.find((m) => m.id === tab.conversationId)?.title ?? tab.conversationId}] `
       : '';
 
     for (let mi = cursor.pushedMessageCount; mi < messages.length; mi++) {
@@ -1942,95 +1819,8 @@ export default class WeChatBridgePlugin extends Plugin {
     return this.queueFileForSend(resolved, lang);
   }
 
-  // ---- /schedule: local reminders pushed straight to WeChat, no Claudian turn involved ----
-
-  /**
-   * `/schedule` dispatcher. Recognized forms:
-   *   /schedule list
-   *   /schedule cancel <n>                     - n is the 1-based index from /schedule list
-   *   /schedule daily HH:MM <text>              - recurring, fires every day at HH:MM local time
-   *   /schedule HH:MM <text>                    - one-shot, next HH:MM (today if not passed yet, else tomorrow)
-   *   /schedule YYYY-MM-DD HH:MM <text>          - one-shot, a specific date/time
-   */
-  private async handleScheduleCommand(rest: string, lang: Lang): Promise<string> {
-    if (/^list\b/i.test(rest)) return this.listScheduledSends(lang);
-
-    const cancelMatch = rest.match(/^cancel\s+(\d+)\b/i);
-    if (cancelMatch) return this.cancelScheduledSend(Number(cancelMatch[1]), lang);
-
-    const dailyMatch = rest.match(/^daily\s+(\d{1,2}):(\d{2})\s+(\S.*)$/i);
-    if (dailyMatch) {
-      const hour = Number(dailyMatch[1]);
-      const minute = Number(dailyMatch[2]);
-      const text = dailyMatch[3].trim();
-      if (hour > 23 || minute > 59) return this.t('scheduleBadTime', lang);
-      const nextFireAt = this.nextDailyFireAt(hour, minute);
-      return this.addScheduledSend({ id: this.newScheduleId(), text, nextFireAt, repeat: { type: 'daily', hour, minute } }, lang);
-    }
-
-    const dateMatch = rest.match(/^(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2})\s+(\S.*)$/);
-    if (dateMatch) {
-      const [, dateStr, hStr, mStr, text] = dateMatch;
-      const [y, mo, d] = dateStr.split('-').map(Number);
-      const hour = Number(hStr);
-      const minute = Number(mStr);
-      if (hour > 23 || minute > 59) return this.t('scheduleBadTime', lang);
-      const fireAt = new Date(y, mo - 1, d, hour, minute, 0, 0).getTime();
-      if (!Number.isFinite(fireAt) || fireAt <= Date.now()) return this.t('scheduleInPast', lang);
-      return this.addScheduledSend({ id: this.newScheduleId(), text: text.trim(), nextFireAt: fireAt, repeat: null }, lang);
-    }
-
-    const onceMatch = rest.match(/^(\d{1,2}):(\d{2})\s+(\S.*)$/);
-    if (onceMatch) {
-      const hour = Number(onceMatch[1]);
-      const minute = Number(onceMatch[2]);
-      const text = onceMatch[3].trim();
-      if (hour > 23 || minute > 59) return this.t('scheduleBadTime', lang);
-      return this.addScheduledSend({ id: this.newScheduleId(), text, nextFireAt: this.nextDailyFireAt(hour, minute), repeat: null }, lang);
-    }
-
-    return this.t('scheduleUsage', lang);
-  }
-
-  /** Next occurrence of HH:MM local time - today if it hasn't passed yet this tick, otherwise tomorrow. */
-  private nextDailyFireAt(hour: number, minute: number): number {
-    const now = new Date();
-    const candidate = new Date(now.getFullYear(), now.getMonth(), now.getDate(), hour, minute, 0, 0);
-    if (candidate.getTime() <= now.getTime()) candidate.setDate(candidate.getDate() + 1);
-    return candidate.getTime();
-  }
-
-  private newScheduleId(): string {
-    return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
-  }
-
-  private async addScheduledSend(entry: ScheduledSend, lang: Lang): Promise<string> {
-    this.data.scheduledSends.push(entry);
-    this.data.scheduledSends.sort((a, b) => a.nextFireAt - b.nextFireAt);
-    await this.saveData(this.data);
-    const when = new Date(entry.nextFireAt).toLocaleString(lang === 'zh' ? 'zh-CN' : 'en-US');
-    return this.t(entry.repeat ? 'scheduleAddedDaily' : 'scheduleAddedOnce', lang, when, entry.text);
-  }
-
-  private listScheduledSends(lang: Lang): string {
-    if (this.data.scheduledSends.length === 0) return this.t('scheduleNone', lang);
-    const localeTag = lang === 'zh' ? 'zh-CN' : 'en-US';
-    const lines: string[] = [this.t('scheduleListHeader', lang)];
-    this.data.scheduledSends.forEach((s, i) => {
-      const when = new Date(s.nextFireAt).toLocaleString(localeTag);
-      const tag = s.repeat ? this.t('scheduleDailyTag', lang) : '';
-      lines.push(`${i + 1}. [${when}]${tag} ${s.text}`);
-    });
-    return lines.join('\n');
-  }
-
-  private async cancelScheduledSend(index: number, lang: Lang): Promise<string> {
-    const entry = this.data.scheduledSends[index - 1];
-    if (!entry) return this.t('outOfRange', lang, this.data.scheduledSends.length);
-    this.data.scheduledSends = this.data.scheduledSends.filter((s) => s.id !== entry.id);
-    await this.saveData(this.data);
-    return this.t('scheduleCancelled', lang, entry.text);
-  }
+  // ---- /schedule: local reminders pushed straight to WeChat ----
+  // (logic itself lives in ScheduleManager - see this.scheduleManager)
 
   private classifyFileCategory(fileName: string): PendingFileItem['category'] {
     const ext = fileName.split('.').pop()?.toLowerCase() ?? '';
@@ -2057,30 +1847,25 @@ export default class WeChatBridgePlugin extends Plugin {
   }
 
   /**
-   * Serializes against getTabMutex - see that field's doc comment for why.
-   * Chains onto the tail regardless of whether the previous call threw, and
-   * always returns/propagates its *own* result independent of that tail
-   * (same settle-agnostic-tail pattern as sendQueues in sendChatMessageQueued).
-   */
-  private async getOrCreateWeChatTab(): Promise<ClaudianTab> {
-    const previous = this.getTabMutex.catch(() => {});
-    const run = previous.then(() => this.resolveOrCreateTab(this.data.conversationId));
-    this.getTabMutex = run.catch(() => {});
-    return run;
-  }
-
-  /**
-   * Same mutex-serialized lookup as getOrCreateWeChatTab, but for an
-   * explicit conversation id rather than this.data.conversationId - used
-   * wherever a send needs to (re-)locate one *specific* conversation's tab
-   * by id instead of "whichever one the bridge is currently bound to" (see
-   * sendChatMessage and tryResolveSwitchedDuringSend). This is the same
+   * Serializes every tab lookup against getTabMutex - see that field's doc
+   * comment for why. Chains onto the tail regardless of whether the previous
+   * call threw, and always returns/propagates its *own* result independent
+   * of that tail (same settle-agnostic-tail pattern as sendQueues in
+   * sendChatMessageQueued).
+   *
+   * `conversationId` defaults to `this.data.conversationId` (the bridge's
+   * currently-bound conversation - what most call sites want) when omitted;
+   * pass one explicitly wherever a send needs to (re-)locate one *specific*
+   * conversation's tab by id instead - see sendChatMessage and
+   * tryResolveSwitchedDuringSend, which look up a snapshot taken before an
+   * await, not necessarily the live "current" one. This is the same
    * id-based lookup /goto uses to jump to a conversation, reused here so a
    * stale/mutated tab-object reference is never trusted on its own.
    */
-  private async getOrCreateTabForConversation(conversationId: string): Promise<ClaudianTab> {
+  private async getOrCreateWeChatTab(conversationId?: string | null): Promise<ClaudianTab> {
+    const target = conversationId === undefined ? this.data.conversationId : conversationId;
     const previous = this.getTabMutex.catch(() => {});
-    const run = previous.then(() => this.resolveOrCreateTab(conversationId));
+    const run = previous.then(() => this.resolveOrCreateTab(target));
     this.getTabMutex = run.catch(() => {});
     return run;
   }
@@ -2144,25 +1929,18 @@ export default class WeChatBridgePlugin extends Plugin {
       return existingTab;
     }
 
-    if (conversationId) {
-      // Tab was closed or conversation was never opened in a tab yet; (re)open it.
-      await this.ensureTabCapacity(claudian, tabManager);
-      const tab = await tabManager.createTab(conversationId);
-      if (!tab) throw new Error(this.t('tabLimitReached', this.getLangSafe()));
-      this.installInteractiveHooks(tab);
-      return tab;
-    }
-
-    // A brand-new blank tab: Claudian's own createTab() has no per-call
-    // "use this provider" option (verified against its real signature -
-    // it only recognizes activate/lifecycleState/draftModel) - a blank tab's
-    // provider/model is decided globally from `settings.settingsProvider`
-    // instead (resolveBlankTabModel reads that field, not anything passed
-    // to createTab). So /provider's actual effect has to land there too -
-    // see switchProvider, which sets settings.settingsProvider before this
-    // ever runs - rather than being (uselessly) threaded through here.
+    // Either re-opening a specific closed conversation, or - when
+    // conversationId is null - a brand-new blank tab. For the blank-tab case:
+    // Claudian's own createTab() has no per-call "use this provider" option
+    // (verified against its real signature - it only recognizes
+    // activate/lifecycleState/draftModel) - a blank tab's provider/model is
+    // decided globally from `settings.settingsProvider` instead
+    // (resolveBlankTabModel reads that field, not anything passed to
+    // createTab). So /provider's actual effect has to land there too - see
+    // switchProvider, which sets settings.settingsProvider before this ever
+    // runs - rather than being (uselessly) threaded through here.
     await this.ensureTabCapacity(claudian, tabManager);
-    const tab = await tabManager.createTab();
+    const tab = conversationId ? await tabManager.createTab(conversationId) : await tabManager.createTab();
     if (!tab) throw new Error(this.t('tabLimitReached', this.getLangSafe()));
     this.installInteractiveHooks(tab);
     return tab;
@@ -2516,7 +2294,7 @@ export default class WeChatBridgePlugin extends Plugin {
    * re-located the tab by id right before sending - see there). Tries to
    * automatically determine the real outcome instead of just telling the
    * user to go check manually: re-locates conversationId by id one more
-   * time (the same /goto-style lookup, via getOrCreateTabForConversation -
+   * time (the same /goto-style lookup, via getOrCreateWeChatTab -
    * not a raw pane search), which reflects that conversation's real state
    * whether or not any tab happened to still be open for it, and reads its
    * actual latest turn straight off it. Returns null - meaning "still can't
@@ -2527,7 +2305,7 @@ export default class WeChatBridgePlugin extends Plugin {
   private async tryResolveSwitchedDuringSend(conversationId: string, lang: Lang): Promise<string | null> {
     let originalTab: ClaudianTab;
     try {
-      originalTab = await this.getOrCreateTabForConversation(conversationId);
+      originalTab = await this.getOrCreateWeChatTab(conversationId);
     } catch {
       return null;
     }
@@ -2540,7 +2318,7 @@ export default class WeChatBridgePlugin extends Plugin {
     const { text: reply, compacted, empty } = this.extractDispatchText(turnMessages, lang);
     if (empty || !reply.trim()) return null;
 
-    const metas = await this.readAllConversationMeta();
+    const metas = await this.metaStore.readAll();
     const title = this.titleFor(conversationId, metas);
     const ctxLine = compacted ? null : await this.contextWindowLine(conversationId, lang);
     const body = ctxLine ? `${reply}\n\n${ctxLine}` : reply;
