@@ -5,6 +5,32 @@ import * as path from 'path';
 import { RelayManager } from './relayManager';
 import { WeChatBridgeSettingTab } from './settingsTab';
 import { EMBEDDED_RELAY_PY, EMBEDDED_STRINGS_JSON } from './embeddedAssets';
+import { AckQueue } from './ackQueue';
+import { damerauLevenshtein, extractCommandWords } from './textUtils';
+import {
+  ALL_PROVIDER_IDS,
+  ProviderId,
+  IncomingImage,
+  PendingFileItem,
+  ScheduledSend,
+  BridgeData,
+  DEFAULT_DATA,
+} from './bridgeTypes';
+import {
+  ContentBlock,
+  ClaudianChatMessage,
+  ClaudianSlashCommand,
+  ClaudianImageAttachment,
+  ClaudianTab,
+  ClaudianTabManager,
+  ClaudianView,
+  ClaudianPluginInstance,
+  ParsedQuestion,
+  WeChatPatchedInputController,
+  PendingInteractive,
+  ConversationMeta,
+  conversationSortKey,
+} from './claudianTypes';
 
 /**
  * WeChat Bridge
@@ -37,438 +63,6 @@ const MAX_PORT_ATTEMPTS = 20; // preferred port + up to 19 fallbacks if it's tak
 const CLAUDIAN_PLUGIN_ID = 'realclaudian';
 const VIEW_TYPE_CLAUDIAN = 'claudian-view';
 
-// Every provider Claudian ships. `claude` has no `enabled` flag in its own
-// registration (ProviderRegistry: `isEnabled: () => true`) - it's always on;
-// the others are opt-in and expose `providerConfigs.<id>.enabled` in
-// Claudian's settings, matching each provider's own registration.ts.
-const ALL_PROVIDER_IDS = ['claude', 'codex', 'opencode', 'pi', 'grok'] as const;
-type ProviderId = (typeof ALL_PROVIDER_IDS)[number];
-
-/** Inbound image payload as sent by relay.py's /message POST body. */
-interface IncomingImage {
-  mediaType: string;
-  data: string; // base64, no "data:" prefix
-}
-
-/**
- * A file queued for outbound delivery to WeChat, drained by relay.py through
- * /pending the same way pendingPushes (text) already is. relay.py and this
- * plugin run on the same machine (the plugin spawns relay.py itself), so
- * this carries a plain local filesystem path rather than base64 bytes - no
- * reason to round-trip a potentially large file through JSON over loopback
- * when relay.py can just read it straight off disk (wechat_clawbot's own
- * upload_*_to_weixin helpers already take a file path, not a buffer).
- */
-interface PendingFileItem {
-  absolutePath: string;
-  fileName: string;
-  /** Picks which wechat_clawbot upload/send pair relay.py uses. */
-  category: 'image' | 'video' | 'file';
-}
-
-/**
- * A /schedule entry: a plain text reminder pushed straight to WeChat via
- * pendingPushes (same drain path as /listen mirrors and progressive-reply
- * chunks) when it comes due - it never touches Claudian/sendChatMessageQueued,
- * it's a local alarm clock, not an AI turn. `nextFireAt` is always the next
- * (or only, for one-shot) fire time in epoch ms; `repeat` describes how to
- * recompute it after firing, or is null for a one-shot entry that gets
- * removed from `scheduledSends` once it fires.
- */
-interface ScheduledSend {
-  id: string;
-  text: string;
-  nextFireAt: number;
-  repeat: null | { type: 'daily'; hour: number; minute: number };
-}
-
-/**
- * Backs pendingPushes/pendingFiles. The naive version of this (a plain array,
- * cleared the instant /pending's GET handler reads it) is at-most-once
- * delivery: if the HTTP response never actually reaches relay.py - a
- * localhost hiccup, or relay.py's own client timing out because Obsidian's
- * event loop was busy with something else for a few seconds - the array is
- * already empty server-side by then, so that batch of text is gone for good,
- * with nothing logged on either side (relay.py's poll loop swallows that
- * exception silently and just retries next tick). Confirmed as the cause of
- * a real "最后一段/几段漏发" report: relay.log showed no error at all for the
- * affected turn, which only makes sense if the loss happened on a request
- * relay.py never even logged as failed - a response that departed the
- * request but never reached it.
- *
- * Fix: don't clear on read. Every item gets a monotonically increasing id
- * when queued; a GET only removes items once the client explicitly says
- * "I successfully processed up through id N" on its *next* call (via the
- * `ack` query param - see /pending). If a response is lost in transit, the
- * client never learns those ids exist, never acks them, and they simply come
- * back (still unacked) on the next poll - a duplicate send in the rare case
- * where the response secretly *did* arrive but the ack for it later got
- * lost, but never a silent loss.
- */
-class AckQueue<T> {
-  private items: T[] = [];
-  private baseSeq = 0;
-
-  /**
-   * Fired after every push()/ack() with the current contents, so the plugin
-   * can mirror them into BridgeData and persist. Without this, an unacked
-   * item only ever lived in this in-memory array - surviving the relay.py
-   * transit problem this class was built to fix, but still lost outright if
-   * the *plugin itself* reloads/crashes before relay.py ever fetched it (a
-   * real, non-theoretical case: every fix this bridge ships requires exactly
-   * that reload). Persisting closes the same class of gap one layer up.
-   */
-  constructor(private onChange?: (items: T[]) => void) {}
-
-  push(...newItems: T[]): void {
-    this.items.push(...newItems);
-    this.onChange?.(this.items);
-  }
-
-  get length(): number {
-    return this.items.length;
-  }
-
-  /** Current contents tagged with the ids a client should echo back via ack(). Does not remove anything. */
-  snapshot(): { id: number; item: T }[] {
-    return this.items.map((item, i) => ({ id: this.baseSeq + i, item }));
-  }
-
-  /** Removes every item whose id is <= ackId. Ignores stale/out-of-range acks instead of throwing. */
-  ack(ackId: number): void {
-    if (!Number.isFinite(ackId) || ackId < this.baseSeq) return;
-    const removeCount = Math.min(this.items.length, ackId - this.baseSeq + 1);
-    if (removeCount <= 0) return;
-    this.items.splice(0, removeCount);
-    this.baseSeq += removeCount;
-    this.onChange?.(this.items);
-  }
-}
-
-interface BridgeData {
-  conversationId: string | null;
-  /** conversation ids in the order shown by the last /ls, for /goto N to index into. */
-  lastListedIds: string[];
-  /** /listen on|off: mirror turns sent from the desktop Claudian UI to WeChat too. */
-  listening: boolean;
-  /**
-   * The conversation /listen was turned on for. Scoped, not global: switching
-   * to a different conversation (via /switch or /new) after turning listening
-   * on must NOT keep mirroring the new one - checkForDesktopActivity() only
-   * acts while this still matches the currently bound conversationId. `null`
-   * means "turned on before any conversation existed yet" - it then binds to
-   * whichever conversation actually gets created by the next message, same as
-   * conversationId itself starts out null and gets filled in lazily.
-   */
-  listeningConversationId: string | null;
-  /** Message count already seen in the bound tab, so the /listen poller only reports new turns. */
-  lastSeenMessageCount: number;
-  /**
-   * Which conversation lastSeenMessageCount was counted against. Autonomous-
-   * turn mirroring (see checkForDesktopActivity) tracks the *currently
-   * WeChat-bound* conversation (data.conversationId) regardless of /listen,
-   * so unlike listeningConversationId this is not an opt-in scope - it's just
-   * bookkeeping to detect "the bound conversation changed under us" (via
-   * /switch, /new, or a fresh tab picking up an id) and resync instead of
-   * either replaying the new conversation's entire history or comparing
-   * against a stale count from a different conversation.
-   */
-  lastSeenConversationId: string | null;
-  /**
-   * Mirror of pendingPushes'/pendingFiles' current (unacked) contents - see
-   * AckQueue's onChange. Rehydrated into the live AckQueues in onload() so a
-   * plugin reload/crash with content still queued but not yet fetched by
-   * relay.py doesn't lose it; onunload's flush (see that comment) makes sure
-   * whatever's here on disk is current at the moment of a reload.
-   */
-  pendingPushQueue: string[];
-  pendingFileQueue: PendingFileItem[];
-  /**
-   * Provider to use for the *next* new conversation (set via /provider).
-   * Irrelevant once bound to a conversation - that conversation's own
-   * providerId (from its session metadata) always wins; Claudian doesn't
-   * allow changing a bound conversation's provider anyway.
-   */
-  providerId: ProviderId | null;
-  /**
-   * /progressive on|off: a genuinely global, not conversation-scoped switch
-   * (unlike /listen) - it changes *how any bridge-driven send delivers its
-   * reply*, for every conversation this bridge talks to, not what it mirrors.
-   * When on, each completed narrative-text chunk of a turn is pushed to
-   * WeChat as its own message as soon as it settles (see flushProgressive),
-   * instead of buffering the whole turn and replying once at the end.
-   */
-  progressiveReply: boolean;
-  /** /schedule entries, checked once per LISTEN_POLL_INTERVAL_MS tick (see checkScheduledSends). */
-  scheduledSends: ScheduledSend[];
-}
-
-// ---- Minimal shape of the parts of Claudian we reach into at runtime. ----
-// These are not Claudian's declared public API; they are the same fields/
-// methods Claudian's own UI code uses internally (verified against source).
-type ContentBlock =
-  | { type: 'text'; content: string }
-  | { type: 'tool_use'; toolId: string }
-  | { type: 'thinking'; content: string; durationSeconds?: number }
-  | { type: 'subagent'; subagentId: string }
-  | { type: 'context_compacted' };
-
-interface ClaudianChatMessage {
-  role: 'user' | 'assistant';
-  content: string;
-  contentBlocks?: ContentBlock[];
-  /**
-   * The raw tool calls behind this message's `tool_use` content blocks -
-   * contentBlocks only carries a bare `toolId` (see ContentBlock above);
-   * this is where the actual `name`/`input` live, reverse-engineered from
-   * Claudian's message-building code (LBe() for the Claude provider,
-   * equivalents for Codex/pi). `input` is provider- and tool-specific -
-   * for Claude Code's own Write/Edit/Read/NotebookEdit tools it's
-   * `{file_path: string, ...}`; used by extractReferencedFiles() to find
-   * files a turn actually touched, without having to guess from prose.
-   */
-  toolCalls?: { id: string; name: string; input?: Record<string, unknown> }[];
-}
-
-interface ClaudianSlashCommand {
-  name: string;
-  description?: string;
-  argumentHint?: string;
-}
-
-/** Shape Claudian's own paste/drop image-attachment code builds (ImageContextManager.addImageFromFile) -
- * `sendMessage`'s `images` option is a plain array of these, verified against the same call site
- * (`this.sendMessage({content, images, turnRequestOverride})`) that the queued-message replay path uses. */
-interface ClaudianImageAttachment {
-  id: string;
-  name: string;
-  mediaType: string;
-  data: string; // base64, no "data:" prefix
-  size: number;
-  source: string;
-}
-
-interface ClaudianTab {
-  id: string;
-  conversationId: string | null;
-  lifecycleState: string;
-  controllers: {
-    inputController: {
-      sendMessage(opts: { content: string; images?: ClaudianImageAttachment[] }): Promise<void>;
-      /** Renders Claudian's inline "AskUserQuestion" widget and resolves with the
-       * user's picks. This bridge replaces it per-tab (see installInteractiveHooks)
-       * so a question can be answered from WeChat via /answer instead of only from
-       * the desktop UI. `input` is the raw tool_use params (shape: `{questions:[...]}`,
-       * reverse-engineered from Claudian's own OA widget class - see parseQuestions). */
-      handleAskUserQuestion?(input: any, signal?: AbortSignal): Promise<any>;
-      /** Renders Claudian's inline command/file/permission approval widget.
-       * Replaced the same way, answerable from WeChat via /approve. `kind` is
-       * "command_execution" | "file_change" | "permissions". */
-      handleApprovalRequest?(kind: string, details: any, title: string, opts: any): Promise<any>;
-      /** Interrupts the in-flight turn (same call the desktop UI's own "Stop"
-       * button and Escape key make - reverse-engineered as InputController's
-       * `cancelStreaming()`: aborts the provider's abortController, marks the
-       * session interrupted, and hides the thinking indicator). The turn's
-       * own `sendMessage()` promise still resolves normally afterward with
-       * whatever text had already streamed in, same as clicking Stop does -
-       * this bridge doesn't need to synthesize a reply for /esc itself. */
-      cancelStreaming?(): void;
-    } | null;
-  };
-  state: {
-    messages: ClaudianChatMessage[];
-    /** True for the whole duration of a turn (set at the start of
-     * executeSendMessage, cleared when it finishes/errors/cancels) - the
-     * actual "is this tab still generating" signal, shared by every
-     * provider's UI-level state class. */
-    isStreaming: boolean;
-  };
-  ui: {
-    /** FileContextManager.autoAttachActiveFile() listens for Obsidian's global
-     * `file-open` workspace event and marks *whatever file the user currently
-     * has open, in any pane* as this tab's "current note" - completely
-     * independent of what conversation the tab is bound to, or who's actually
-     * about to send a message in it. `shouldSendCurrentNote()` then silently
-     * folds that note in as `<linked_note>` context on the tab's next send,
-     * once, until `markCurrentNoteSent()` clears the pending flag. For a
-     * bridge-driven tab nobody is looking at, this means whatever note
-     * happens to be open on the user's screen at that moment rides along on
-     * the next WeChat message with no way to notice from WeChat itself. */
-    fileContextManager: { markCurrentNoteSent(): void } | null;
-  };
-}
-
-interface ClaudianTabManager {
-  getAllTabs(): ClaudianTab[];
-  getTab?(tabId: string): ClaudianTab | null;
-  /**
-   * `options.defaultProviderId`, for a brand-new blank tab (no conversationId),
-   * makes Claudian pick that provider's own saved default model
-   * (`resolveBlankTabModel` -> `ProviderSettingsCoordinator.getProviderSettingsSnapshot`)
-   * instead of inheriting whatever provider the currently active tab happens
-   * to use - this is how the bridge opens a new conversation on a specific
-   * non-default provider without having to guess a model name itself.
-   */
-  createTab(conversationId?: string, tabId?: string, options?: { defaultProviderId?: string }): Promise<ClaudianTab>;
-  getSdkCommands(tabId?: string): Promise<ClaudianSlashCommand[]>;
-}
-
-interface ClaudianView {
-  getTabManager?(): ClaudianTabManager | null;
-  refreshModelSelector?(): void;
-}
-
-interface ClaudianPluginInstance {
-  settings: Record<string, any>;
-  mutateSettings(mutation: (settings: Record<string, any>) => void): Promise<void>;
-  getAllViews?(): ClaudianView[];
-  /**
-   * Added in Claudian's dual-pane release (2.1.0+): `getAllViews()` can now
-   * return more than one view (one per pane), each with its own independent
-   * tab manager/tab set. Before dual-pane, `getOrCreateWeChatTab` picking
-   * `getAllViews()[0]` and searching only its tab manager was safe because
-   * there was only ever one view. Now, if the bridge's bound conversation's
-   * tab happens to live in a *different* pane's view, that search would miss
-   * it and spawn a duplicate tab instead of reusing the real one. Claudian
-   * itself ships this helper to search every view's tab manager in one call
-   * - prefer it over reimplementing the same loop, and fall back to the old
-   * single-view behavior only if an older Claudian build doesn't have it.
-   */
-  findConversationAcrossViews?(conversationId: string): { view: ClaudianView; tabId: string } | null;
-  /**
-   * Claudian's own "get a view, opening/focusing its leaf if none exists
-   * yet" helper (`this.getView() || (await this.activateView(), this.getView())`
-   * in Claudian's main.js) - `getAllViews()` only ever returns views for
-   * leaves *currently attached to the workspace*, so if the user has closed
-   * the Claudian panel entirely (not just switched away from its tab), every
-   * view-dependent bridge command used to throw noViewOpen instead of
-   * working, even though Claudian itself was still running fine in the
-   * background. Calling this (instead of just throwing) is what lets /goto,
-   * a plain chat message, etc. keep working from WeChat with the panel
-   * closed, exactly the way Claudian's own ribbon icon/"Open chat view"
-   * command would recover it.
-   */
-  ensureViewOpen?(): Promise<ClaudianView | null>;
-}
-
-/** One question from an AskUserQuestion tool_use, normalized from the raw
- * `{question, id?, header?, options, multiSelect?}` shape (reverse-engineered
- * from Claudian's OA inline-question widget's own parseQuestions()). */
-interface ParsedQuestion {
-  /** Result object key for this question: `id` if the tool call provided one, else the question text itself - same fallback OA's own submit path uses. */
-  key: string;
-  question: string;
-  header: string;
-  multiSelect: boolean;
-  options: { label: string; value: string }[];
-}
-
-/**
- * Claudian's inputController object, as patched by installInteractiveHooks.
- * `__wechatBridgeOwner` records which plugin instance last patched it (so a
- * post-reload instance knows to re-patch rather than trust a stale one's
- * handlers); `__wechatPendingInteractive` records a still-unresolved
- * question/approval so a fresh instance can adopt it after reload instead of
- * losing all contact with the resolve closure Claudian's own turn is still
- * awaiting.
- */
-type WeChatPatchedInputController = NonNullable<ClaudianTab['controllers']['inputController']> & {
-  __wechatBridgeOwner?: unknown;
-  __wechatPendingInteractive?: PendingInteractive;
-  /**
-   * Claudian's genuinely-native handleAskUserQuestion/handleApprovalRequest,
-   * captured once (ever, across all reloads) the first time
-   * installInteractiveHooks sees this inputController - i.e. before anyone
-   * has patched it. Kept around so the headless path can call the native
-   * handler *alongside* the WeChat push instead of *instead of* it, so a
-   * user sitting at the desktop still sees Claudian's own inline widget and
-   * isn't left staring at nothing just because this tab also happens to be
-   * WeChat-bound.
-   */
-  __wechatOriginalHandleAskUserQuestion?: (input: any) => Promise<Record<string, string | string[]> | null>;
-  __wechatOriginalHandleApprovalRequest?: (
-    kind: string,
-    details: any,
-    title: string,
-    opts: any,
-  ) => Promise<'accept' | 'acceptForSession' | 'decline' | 'cancel'>;
-};
-
-type PendingInteractive =
-  | {
-      kind: 'question';
-      tabId: string;
-      questions: ParsedQuestion[];
-      /** question index -> set of selected option *values* (or a single freeform string for isOther-style answers). */
-      selections: Map<number, Set<string>>;
-      resolve: (value: Record<string, string | string[]> | null) => void;
-      /** The exact text already pushed to WeChat for this question - see the
-       * `__wechatPendingInteractive` adoption path in installInteractiveHooks
-       * for why this needs to be re-sendable after a plugin reload. */
-      promptText: string;
-      /** The inputController this request's `resolve` closure is bound to
-       * (survives a wechat-bridge plugin reload, since Claudian itself isn't
-       * reloaded) - stashed here so the resolving code can clear the
-       * matching `__wechatPendingInteractive` marker off of it once this
-       * request is actually settled. */
-      sourceIc: WeChatPatchedInputController;
-    }
-  | {
-      kind: 'approval';
-      tabId: string;
-      title: string;
-      resolve: (value: 'accept' | 'acceptForSession' | 'decline' | 'cancel') => void;
-      promptText: string;
-      sourceIc: WeChatPatchedInputController;
-    };
-
-interface ConversationMeta {
-  id: string;
-  title?: string;
-  // Claudian 2.0.x writes `lastActivityAt` (and `createdAt`), not
-  // `updatedAt` - there is no `updatedAt` field in real meta.json files.
-  // Kept both here so a future Claudian rename doesn't silently break
-  // sorting again: sortKey() below tries each in order and falls back to 0
-  // (never throws on an unfamiliar shape).
-  lastActivityAt?: number;
-  createdAt?: number;
-  providerId?: string;
-  usage?: { contextTokens?: number; contextWindow?: number };
-}
-
-function conversationSortKey(m: ConversationMeta): number {
-  return m.lastActivityAt ?? m.createdAt ?? 0;
-}
-
-/**
- * Optimal-string-alignment distance (Levenshtein + adjacent-transposition,
- * each substring used at most once) - used by suggestBridgeCommand() below
- * to catch typos like a swapped pair of letters ("usgae" -> "usage", one
- * transposition) as well as the ordinary single-letter add/drop/substitute
- * cases, in one edit rather than two.
- */
-function damerauLevenshtein(a: string, b: string): number {
-  const la = a.length;
-  const lb = b.length;
-  const d: number[][] = Array.from({ length: la + 1 }, () => new Array<number>(lb + 1).fill(0));
-  for (let i = 0; i <= la; i++) d[i][0] = i;
-  for (let j = 0; j <= lb; j++) d[0][j] = j;
-  for (let i = 1; i <= la; i++) {
-    for (let j = 1; j <= lb; j++) {
-      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-      d[i][j] = Math.min(
-        d[i - 1][j] + 1, // deletion
-        d[i][j - 1] + 1, // insertion
-        d[i - 1][j - 1] + cost, // substitution
-      );
-      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) {
-        d[i][j] = Math.min(d[i][j], d[i - 2][j - 2] + cost); // transposition
-      }
-    }
-  }
-  return d[la][lb];
-}
-
 // ---- i18n ----
 // Language is decided per-request from Claudian's own `settings.locale`
 // (e.g. "zh-CN", "en"), not from any setting of this plugin's own.
@@ -483,20 +77,6 @@ interface StringsData {
 }
 
 const STRINGS_FILE_NAME = 'strings.json';
-
-const DEFAULT_DATA: BridgeData = {
-  conversationId: null,
-  lastListedIds: [],
-  listening: false,
-  listeningConversationId: null,
-  lastSeenMessageCount: 0,
-  lastSeenConversationId: null,
-  pendingPushQueue: [],
-  pendingFileQueue: [],
-  providerId: null,
-  progressiveReply: true,
-  scheduledSends: [],
-};
 
 const LISTEN_POLL_INTERVAL_MS = 3000;
 /** /ls defaults to the most recent conversations only; /ls all shows everything. */
@@ -956,16 +536,21 @@ export default class WeChatBridgePlugin extends Plugin {
   }
 
   /**
-   * Every first-word command this bridge itself recognizes (mirrors
-   * commandRoutes() above - kept as a flat list here rather than derived
-   * from the regexes, since several patterns share one literal word, e.g.
-   * model/effort/permission).
+   * Every first-word command this bridge itself recognizes, derived straight
+   * from commandRoutes() (one command's pattern can list several literal
+   * words via alternation, e.g. `/(model|effort|permission)/` - see
+   * extractCommandWords) rather than hand-maintained as a second, parallel
+   * list that could silently drift out of sync with what's actually
+   * registered there. Memoized: commandRoutes() itself doesn't change across
+   * calls, only rebuilds cheap closures each time.
    */
-  private static readonly BRIDGE_COMMAND_WORDS = [
-    'answer', 'approve', 'esc', 'skip', 'files', 'getfile', 'send', 'schedule',
-    'help', 'commands', 'model', 'effort', 'permission', 'provider', 'ls',
-    'goto', 'status', 'hist', 'listen', 'progressive', 'new',
-  ];
+  private bridgeCommandWordsCache: string[] | null = null;
+  private getBridgeCommandWords(): string[] {
+    if (!this.bridgeCommandWordsCache) {
+      this.bridgeCommandWordsCache = this.commandRoutes().flatMap((route) => extractCommandWords(route.pattern));
+    }
+    return this.bridgeCommandWordsCache;
+  }
 
   /**
    * If `text` starts with "/<word>" where <word> is a near-miss (edit
@@ -976,10 +561,11 @@ export default class WeChatBridgePlugin extends Plugin {
    */
   private suggestBridgeCommand(text: string): { typed: string; suggested: string } | null {
     const word = text.match(/^\/([a-zA-Z]+)/)?.[1]?.toLowerCase();
-    if (!word || word.length < 3 || WeChatBridgePlugin.BRIDGE_COMMAND_WORDS.includes(word)) return null;
+    const words = this.getBridgeCommandWords();
+    if (!word || word.length < 3 || words.includes(word)) return null;
     let best: string | null = null;
     let bestDist = Infinity;
-    for (const candidate of WeChatBridgePlugin.BRIDGE_COMMAND_WORDS) {
+    for (const candidate of words) {
       const dist = damerauLevenshtein(word, candidate);
       if (dist < bestDist) {
         bestDist = dist;
@@ -1078,13 +664,9 @@ export default class WeChatBridgePlugin extends Plugin {
     // Must resolve the tab manager that actually owns `tab` - with dual-pane
     // (2.1.0+) that isn't necessarily getAllViews()[0] (see the same concern
     // in getOrCreateWeChatTab). getSdkCommands(tab.id) against the wrong
-    // pane's tab manager would look up an id it's never seen.
-    const found = this.data.conversationId
-      ? this.getClaudianPlugin().findConversationAcrossViews?.(this.data.conversationId)
-      : null;
-    const view = found?.view ?? (this.getClaudianPlugin().getAllViews?.() ?? [])[0] ?? this.findClaudianViewViaWorkspace();
-    const tabManager = view?.getTabManager?.();
-    if (!tabManager) throw new Error(this.t('noTabManager', lang));
+    // pane's tab manager would look up an id it's never seen. Same shared
+    // lookup resolveOrCreateTab uses, for exactly the same reason.
+    const { tabManager } = await this.resolveViewAndTabManager(this.getClaudianPlugin(), this.data.conversationId, lang);
 
     const commands = await tabManager.getSdkCommands(tab.id);
     if (commands.length === 0) return this.t('noClaudeCommands', lang);
@@ -2484,6 +2066,44 @@ export default class WeChatBridgePlugin extends Plugin {
   }
 
   /**
+   * The one place that resolves "which pane's view/tab manager owns (or
+   * should own) `conversationId`'s tab" - previously reimplemented slightly
+   * differently in resolveOrCreateTab, listClaudeCommands and
+   * getAllTabsAcrossPanes, which made it easy for the panel-closed recovery
+   * (ensureClaudianView) to end up applied in one of them but not the
+   * others. Every caller that needs one specific conversation's tab manager
+   * goes through this now.
+   *
+   * Searches every pane via Claudian's own findConversationAcrossViews when
+   * available (dual-pane, 2.1.0+), falling back to ensureClaudianView's
+   * single-view lookup - which also recovers a fully-closed Claudian panel
+   * via ensureViewOpen - for `conversationId === null` (brand-new blank tab)
+   * or on older Claudian builds that predate both dual-pane and
+   * findConversationAcrossViews.
+   */
+  private async resolveViewAndTabManager(
+    claudian: ClaudianPluginInstance,
+    conversationId: string | null,
+    lang: Lang,
+  ): Promise<{ view: ClaudianView; tabManager: ClaudianTabManager; existingTab: ClaudianTab | null }> {
+    if (conversationId) {
+      const found = claudian.findConversationAcrossViews?.(conversationId);
+      const foundTabManager = found ? found.view.getTabManager?.() : null;
+      if (found && foundTabManager) {
+        const existingTab = foundTabManager.getTab?.(found.tabId) ?? null;
+        if (existingTab) return { view: found.view, tabManager: foundTabManager, existingTab };
+      }
+    }
+
+    const view = await this.ensureClaudianView(claudian);
+    if (!view) throw new Error(this.t('noViewOpen', lang));
+    const tabManager = view.getTabManager?.();
+    if (!tabManager) throw new Error(this.t('noTabManager', lang));
+    const existingTab = conversationId ? tabManager.getAllTabs().find((t) => t.conversationId === conversationId) ?? null : null;
+    return { view, tabManager, existingTab };
+  }
+
+  /**
    * Finds the tab already open for `conversationId` (searching every pane,
    * Claudian 2.1.0+ dual-pane included), or reopens/creates it if none is
    * open right now. Claudian persists each conversation independently of
@@ -2496,27 +2116,15 @@ export default class WeChatBridgePlugin extends Plugin {
    */
   private async resolveOrCreateTab(conversationId: string | null): Promise<ClaudianTab> {
     const claudian = this.getClaudianPlugin();
-    const view = await this.ensureClaudianView(claudian);
-    if (!view) throw new Error(this.t('noViewOpen', this.getLangSafe()));
+    const lang = this.getLangSafe();
+    const { tabManager, existingTab } = await this.resolveViewAndTabManager(claudian, conversationId, lang);
 
-    const tabManager = view.getTabManager?.();
-    if (!tabManager) throw new Error(this.t('noTabManager', this.getLangSafe()));
+    if (existingTab) {
+      this.installInteractiveHooks(existingTab);
+      return existingTab;
+    }
 
     if (conversationId) {
-      // Dual-pane (Claudian 2.1.0+) can open more than one view (one per
-      // pane), each with its own tab manager - the bound conversation's tab
-      // may live in a pane other than the first one. Search across every
-      // view via Claudian's own findConversationAcrossViews when available;
-      // only fall back to the single-view lookup below on older builds that
-      // predate dual-pane (and thus never have more than one view anyway).
-      const found = claudian.findConversationAcrossViews?.(conversationId);
-      const foundTabManager = found ? found.view.getTabManager?.() : null;
-      const existing = foundTabManager?.getTab?.(found!.tabId)
-        ?? tabManager.getAllTabs().find((t) => t.conversationId === conversationId);
-      if (existing) {
-        this.installInteractiveHooks(existing);
-        return existing;
-      }
       // Tab was closed or conversation was never opened in a tab yet; (re)open it.
       await this.ensureTabCapacity(claudian, tabManager);
       const tab = await tabManager.createTab(conversationId);
@@ -2844,7 +2452,7 @@ export default class WeChatBridgePlugin extends Plugin {
     if (this.sendingViaBridgeTabIds.size === 0) {
       return this.t('escNothingToInterrupt', lang);
     }
-    const allTabs = this.getAllTabsAcrossPanes(lang);
+    const allTabs = await this.getAllTabsAcrossPanes(lang);
     let interrupted = false;
     for (const tabId of this.sendingViaBridgeTabIds) {
       const tab = allTabs.find((t) => t.id === tabId);
@@ -2859,16 +2467,26 @@ export default class WeChatBridgePlugin extends Plugin {
   /**
    * Every tab, across every pane's tab manager (dual-pane, 2.1.0+) -
    * collecting only getAllViews()[0]'s tabs would silently miss a tab that's
-   * genuinely open in another pane. Shared by /esc and the mid-send
-   * conversation-switch auto-resolution below.
+   * genuinely open in another pane. A genuinely different query shape from
+   * resolveViewAndTabManager (that one resolves *one* conversation's tab;
+   * this one enumerates *every* tab in *every* pane), so it isn't folded
+   * into that helper - but it shares the same panel-closed recovery via
+   * ensureClaudianView, so /esc still works with the Claudian panel closed
+   * instead of only when at least one pane happens to be open. Shared by
+   * /esc and the mid-send conversation-switch auto-resolution below.
    */
-  private getAllTabsAcrossPanes(lang: Lang): ClaudianTab[] {
-    const views = this.getClaudianPlugin().getAllViews?.() ?? [];
-    const fallbackView = views[0] ?? this.findClaudianViewViaWorkspace();
-    if (views.length === 0 && !fallbackView) throw new Error(this.t('noTabManager', lang));
-    const tabManagers = (views.length > 0 ? views : [fallbackView]).map((v) => v?.getTabManager?.()).filter((tm): tm is ClaudianTabManager => !!tm);
-    if (tabManagers.length === 0) throw new Error(this.t('noTabManager', lang));
-    return tabManagers.flatMap((tm) => tm.getAllTabs());
+  private async getAllTabsAcrossPanes(lang: Lang): Promise<ClaudianTab[]> {
+    const claudian = this.getClaudianPlugin();
+    const views = claudian.getAllViews?.() ?? [];
+    if (views.length > 0) {
+      const tabManagers = views.map((v) => v.getTabManager?.()).filter((tm): tm is ClaudianTabManager => !!tm);
+      if (tabManagers.length === 0) throw new Error(this.t('noTabManager', lang));
+      return tabManagers.flatMap((tm) => tm.getAllTabs());
+    }
+    const view = await this.ensureClaudianView(claudian);
+    const tabManager = view?.getTabManager?.();
+    if (!tabManager) throw new Error(this.t('noTabManager', lang));
+    return tabManager.getAllTabs();
   }
 
   /**

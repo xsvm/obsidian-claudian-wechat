@@ -53,8 +53,8 @@ Claude Code / Configured Provider
 - **Multi-Image Batching**: Send multiple photos in sequence with cached buffering; append a follow-up caption to send together, or use `/skip` to send buffered images immediately.
 - **Mid-Send Tab Switch Protection**: Automatically tracks and verifies target conversation IDs before and during message dispatch to prevent sending to the wrong tab or losing responses.
 - **Remote Session Management**:
-  - `/list` or `/ls` — List known Claudian sessions sorted by update time
-  - `/switch N` or `/goto N` — Switch to session `#N`
+  - `/ls` — List known Claudian sessions sorted by update time
+  - `/goto N` — Switch to session `#N`
   - `/new` — Detach and start a fresh session on the next message
 - **Runtime Configuration Control**: Switch `/model` (omit arguments to list available models), `/effort` (thinking level), and `/permission` (permission mode) from WeChat.
 - **Slash Commands Forwarding**: Send `/commands` to discover Claude's native commands, vault commands, and skills; all slash commands can be executed straight from WeChat.
@@ -96,8 +96,8 @@ Copy the built files (`manifest.json`, `main.js`, `relay.py`, `strings.json`) in
 | Command | Description |
 | :--- | :--- |
 | `/help` | Display command reference and usage |
-| `/list` or `/ls` | List known conversations, numbered |
-| `/switch N` or `/goto N` | Switch to conversation `#N` |
+| `/ls` | List known conversations, numbered |
+| `/goto N` | Switch to conversation `#N` |
 | `/new` | Start a brand new conversation |
 | `/model` | List available models for the current provider (static list for claude, discovered models for others) |
 | `/model <name>` | Change model (e.g. `/model opus`, `/model sonnet`) |
