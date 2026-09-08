@@ -98,14 +98,15 @@ export interface ClaudianTabManager {
   getAllTabs(): ClaudianTab[];
   getTab?(tabId: string): ClaudianTab | null;
   /**
-   * `options.defaultProviderId`, for a brand-new blank tab (no conversationId),
-   * makes Claudian pick that provider's own saved default model
-   * (`resolveBlankTabModel` -> `ProviderSettingsCoordinator.getProviderSettingsSnapshot`)
-   * instead of inheriting whatever provider the currently active tab happens
-   * to use - this is how the bridge opens a new conversation on a specific
-   * non-default provider without having to guess a model name itself.
+   * Verified against Claudian's real implementation: the only options it
+   * recognizes are `activate`, `lifecycleState`, and `draftModel` - there is
+   * no per-call "use this provider" option. A brand-new blank tab's
+   * provider/model comes from the *global* `settings.settingsProvider`
+   * field instead (resolveBlankTabModel reads that, not anything passed
+   * here) - see switchProvider in main.ts, which sets it via
+   * mutateSettings() before creating a new tab.
    */
-  createTab(conversationId?: string, tabId?: string, options?: { defaultProviderId?: string }): Promise<ClaudianTab>;
+  createTab(conversationId?: string, tabId?: string, options?: { activate?: boolean; lifecycleState?: string; draftModel?: string }): Promise<ClaudianTab>;
   getSdkCommands(tabId?: string): Promise<ClaudianSlashCommand[]>;
 }
 

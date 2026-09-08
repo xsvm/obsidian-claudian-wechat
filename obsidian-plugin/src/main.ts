@@ -783,6 +783,26 @@ export default class WeChatBridgePlugin extends Plugin {
     // here always means "start fresh", same as /new.
     this.data.conversationId = null;
     await this.saveData(this.data);
+
+    // this.data.providerId alone is only the bridge's own bookkeeping - it
+    // has zero effect on what provider a brand-new blank tab actually gets
+    // (verified against Claudian's real createTab/createReservedTab: there is
+    // no per-call provider option). Claudian decides that globally from
+    // `settings.settingsProvider` (resolveSettingsProviderId, and the same
+    // field the blank-tab model resolver reads) - the exact field
+    // applySettingsCommand already conditions its own writes on. Without
+    // mutating it here too, /provider would report success but the next
+    // /new-style tab would silently reopen on whatever provider Claudian's
+    // settings already had.
+    const claudian = this.getClaudianPlugin();
+    if (claudian) {
+      await claudian.mutateSettings((settings) => {
+        settings.settingsProvider = name;
+      });
+      for (const view of claudian.getAllViews?.() ?? []) {
+        view.refreshModelSelector?.();
+      }
+    }
     return this.t('providerSwitched', lang, name);
   }
 
@@ -2133,16 +2153,16 @@ export default class WeChatBridgePlugin extends Plugin {
       return tab;
     }
 
-    // A brand-new blank tab: if /provider selected something other than the
-    // default, pass it through so Claudian seeds the tab with *that*
-    // provider's own saved model (resolveBlankTabModel) instead of inheriting
-    // whatever provider the currently active Claudian tab happens to be on.
+    // A brand-new blank tab: Claudian's own createTab() has no per-call
+    // "use this provider" option (verified against its real signature -
+    // it only recognizes activate/lifecycleState/draftModel) - a blank tab's
+    // provider/model is decided globally from `settings.settingsProvider`
+    // instead (resolveBlankTabModel reads that field, not anything passed
+    // to createTab). So /provider's actual effect has to land there too -
+    // see switchProvider, which sets settings.settingsProvider before this
+    // ever runs - rather than being (uselessly) threaded through here.
     await this.ensureTabCapacity(claudian, tabManager);
-    const tab = await tabManager.createTab(
-      undefined,
-      undefined,
-      this.data.providerId ? { defaultProviderId: this.data.providerId } : undefined,
-    );
+    const tab = await tabManager.createTab();
     if (!tab) throw new Error(this.t('tabLimitReached', this.getLangSafe()));
     this.installInteractiveHooks(tab);
     return tab;
