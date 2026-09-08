@@ -335,6 +335,20 @@ interface ClaudianPluginInstance {
    * single-view behavior only if an older Claudian build doesn't have it.
    */
   findConversationAcrossViews?(conversationId: string): { view: ClaudianView; tabId: string } | null;
+  /**
+   * Claudian's own "get a view, opening/focusing its leaf if none exists
+   * yet" helper (`this.getView() || (await this.activateView(), this.getView())`
+   * in Claudian's main.js) - `getAllViews()` only ever returns views for
+   * leaves *currently attached to the workspace*, so if the user has closed
+   * the Claudian panel entirely (not just switched away from its tab), every
+   * view-dependent bridge command used to throw noViewOpen instead of
+   * working, even though Claudian itself was still running fine in the
+   * background. Calling this (instead of just throwing) is what lets /goto,
+   * a plain chat message, etc. keep working from WeChat with the panel
+   * closed, exactly the way Claudian's own ribbon icon/"Open chat view"
+   * command would recover it.
+   */
+  ensureViewOpen?(): Promise<ClaudianView | null>;
 }
 
 /** One question from an AskUserQuestion tool_use, normalized from the raw
@@ -2403,7 +2417,7 @@ export default class WeChatBridgePlugin extends Plugin {
    */
   private async resolveOrCreateTab(conversationId: string | null): Promise<ClaudianTab> {
     const claudian = this.getClaudianPlugin();
-    const view = (claudian.getAllViews?.() ?? [])[0] ?? this.findClaudianViewViaWorkspace();
+    const view = await this.ensureClaudianView(claudian);
     if (!view) throw new Error(this.t('noViewOpen', this.getLangSafe()));
 
     const tabManager = view.getTabManager?.();
@@ -2850,6 +2864,30 @@ export default class WeChatBridgePlugin extends Plugin {
   private findClaudianViewViaWorkspace(): ClaudianView | null {
     const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_CLAUDIAN);
     return (leaves[0]?.view as unknown as ClaudianView) ?? null;
+  }
+
+  /**
+   * The one place that's allowed to *open* Claudian's panel rather than just
+   * looking for an already-open one - every other view lookup in this file
+   * (findClaudianViewViaWorkspace, getAllViews()[0], ...) only sees leaves
+   * already attached to the workspace, so if the user closed the Claudian
+   * panel entirely (not just switched to another tab), those all come back
+   * null and every WeChat command used to fail with "no view open" even
+   * though Claudian itself was still running fine unattended. Calling
+   * Claudian's own ensureViewOpen() recovers exactly the way its ribbon
+   * icon/"Open chat view" command would (see the interface doc comment).
+   * Kept as a last-resort fallback, not the first lookup, since it briefly
+   * steals workspace focus to the Claudian pane - only worth paying that
+   * cost when nothing usable is already open.
+   */
+  private async ensureClaudianView(claudian: ClaudianPluginInstance): Promise<ClaudianView | null> {
+    const existing = (claudian.getAllViews?.() ?? [])[0] ?? this.findClaudianViewViaWorkspace();
+    if (existing) return existing;
+    try {
+      return (await claudian.ensureViewOpen?.()) ?? null;
+    } catch {
+      return null;
+    }
   }
 
   private getClaudianPlugin(): ClaudianPluginInstance {
