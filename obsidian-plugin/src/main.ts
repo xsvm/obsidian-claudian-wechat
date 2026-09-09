@@ -188,7 +188,16 @@ export default class WeChatBridgePlugin extends Plugin {
     setScheduledSends: (list) => { this.data.scheduledSends = list; },
     saveData: () => this.saveData(this.data),
     t: (key, lang, ...args) => this.t(key, lang, ...args),
-    pushToWeChat: (text) => this.pendingPushes.push(text),
+    sendToConversation: async (text, lang) => {
+      const reply = await this.sendChatMessageQueued(text, lang);
+      // Progressive replies already pushed every chunk themselves (see
+      // sendChatMessage's `progressive && pushedAnything` branch, which
+      // returns '' in that case) - only the non-progressive/no-chunk-yet
+      // case still needs its result delivered here, since there's no
+      // inbound HTTP request for a scheduled fire whose response could
+      // otherwise carry it.
+      if (reply) this.pendingPushes.push(reply);
+    },
   });
 
   async onload() {
@@ -226,7 +235,7 @@ export default class WeChatBridgePlugin extends Plugin {
     await this.startServer();
 
     this.registerInterval(window.setInterval(() => this.checkForDesktopActivity(), LISTEN_POLL_INTERVAL_MS));
-    this.registerInterval(window.setInterval(() => void this.scheduleManager.checkDue(), LISTEN_POLL_INTERVAL_MS));
+    this.registerInterval(window.setInterval(() => void this.scheduleManager.checkDue(this.getLangSafe()), LISTEN_POLL_INTERVAL_MS));
 
     // Owns the whole "get connected" path so installing this plugin is enough
     // on its own: private Python env, one-time QR login, and the relay

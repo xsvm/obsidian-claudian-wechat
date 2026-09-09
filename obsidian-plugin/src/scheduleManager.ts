@@ -11,17 +11,29 @@ export interface ScheduleManagerDeps {
   setScheduledSends(list: ScheduledSend[]): void;
   saveData(): Promise<void>;
   t(key: string, lang: Lang, ...args: (string | number)[]): string;
-  /** Pushes text straight to WeChat, bypassing Claudian entirely - a scheduled send is a local alarm, not an AI turn. */
-  pushToWeChat(text: string): void;
+  /**
+   * Sends `text` into the bound conversation as if the user had typed it
+   * (same queued path a real WeChat message takes - see
+   * sendChatMessageQueued), and delivers whatever Claudian replies with back
+   * to WeChat. A scheduled send is meant to prompt the AI in the current
+   * conversation, not just parrot the reminder text back verbatim - use
+   * `getLangSafe()`-equivalent for `lang` since there's no inbound request to
+   * read a language from at fire time.
+   */
+  sendToConversation(text: string, lang: Lang): Promise<void>;
 }
 
 /**
  * Owns `/schedule` end to end: parsing the command, storing entries, and
  * firing them on their own timer tick (checkDue, called from the same
- * interval main.ts already runs for checkForDesktopActivity). Entries
- * themselves still live in BridgeData (see ScheduledSend) so they persist
- * across reloads the same way every other piece of bridge state does; this
- * class only owns the logic that reads/writes that array, not the array's
+ * interval main.ts already runs for checkForDesktopActivity). Firing an
+ * entry sends its text into the bound conversation as a real prompt (see
+ * ScheduleManagerDeps.sendToConversation) - the same way any WeChat message
+ * would - and relays Claudian's reply back to WeChat; it is not a bare
+ * "echo this text back at the scheduled time" alarm. Entries themselves
+ * still live in BridgeData (see ScheduledSend) so they persist across
+ * reloads the same way every other piece of bridge state does; this class
+ * only owns the logic that reads/writes that array, not the array's
  * storage.
  */
 export class ScheduleManager {
@@ -76,11 +88,15 @@ export class ScheduleManager {
   }
 
   /**
-   * Fires any entry whose nextFireAt has passed: pushes its text straight to
-   * WeChat and either removes it (one-shot) or rolls nextFireAt forward by
-   * its repeat rule (recurring) so it fires again next time around.
+   * Fires any entry whose nextFireAt has passed: sends its text into the
+   * bound conversation (so Claudian actually acts on it, same as if the user
+   * had typed it) and either removes it (one-shot) or rolls nextFireAt
+   * forward by its repeat rule (recurring) so it fires again next time
+   * around. Entries are sent one at a time (awaited in order) - firing
+   * several at once into the same tab is exactly what sendChatMessageQueued
+   * already serializes safely, but there's no reason to race them here too.
    */
-  async checkDue(): Promise<void> {
+  async checkDue(lang: Lang): Promise<void> {
     const scheduledSends = this.deps.getScheduledSends();
     if (scheduledSends.length === 0) return;
     const now = Date.now();
@@ -90,7 +106,7 @@ export class ScheduleManager {
     let list = scheduledSends;
     let changed = false;
     for (const entry of due) {
-      this.deps.pushToWeChat(entry.text);
+      await this.deps.sendToConversation(entry.text, lang);
       if (entry.repeat?.type === 'daily') {
         // Roll forward a whole number of days from the missed slot (not just
         // "+1 day from now") so a brief Obsidian outage across the fire time

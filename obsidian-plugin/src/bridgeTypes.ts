@@ -34,10 +34,10 @@ export interface PendingFileItem {
 }
 
 /**
- * A /schedule entry: a plain text reminder pushed straight to WeChat via
- * pendingPushes (same drain path as /listen mirrors and progressive-reply
- * chunks) when it comes due - it never touches Claudian/sendChatMessageQueued,
- * it's a local alarm clock, not an AI turn. `nextFireAt` is always the next
+ * A /schedule entry: `text` is sent into the bound conversation as a real
+ * prompt (via sendChatMessageQueued, same as any WeChat message) when it
+ * comes due, and Claudian's reply is what actually reaches WeChat - see
+ * ScheduleManager.checkDue. `nextFireAt` is always the next
  * (or only, for one-shot) fire time in epoch ms; `repeat` describes how to
  * recompute it after firing, or is null for a one-shot entry that gets
  * removed from `scheduledSends` once it fires.
