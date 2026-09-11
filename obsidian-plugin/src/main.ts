@@ -754,6 +754,10 @@ export default class WeChatBridgePlugin extends Plugin {
       if (this.isProviderActiveInUi(providerId, settings)) {
         settings[key] = value;
       }
+      if (key === 'model') {
+        // 同步更新 Claudian 内部优先读取的 lastSelectedChatModel，防止模型选择器漂移
+        settings.lastSelectedChatModel = { providerId, model: value };
+      }
     });
 
     for (const view of claudian.getAllViews?.() ?? []) {
@@ -805,36 +809,63 @@ export default class WeChatBridgePlugin extends Plugin {
     return providerId === (settings.settingsProvider ?? 'claude');
   }
 
+  /**
+   * 解析指定供应商应当使用的默认或已保存模型 ID。
+   * 对于 claude，优先从 savedProviderModel.claude、defaultModel 或兜底 'sonnet'；
+   * 对于 CLI-backed providers (pi/codex/opencode/grok)，优先 savedProviderModel[id]，其次从 discoveredModels 寻找默认/第一个。
+   */
+  private resolveDefaultModelForProvider(providerId: ProviderId, settings: Record<string, any>): string {
+    const activeModel = this.isProviderActiveInUi(providerId, settings) && typeof settings.model === 'string' && settings.model
+      ? settings.model
+      : undefined;
+
+    if (providerId === 'claude') {
+      return (
+        activeModel ||
+        settings.savedProviderModel?.claude ||
+        settings.providerConfigs?.claude?.defaultModel ||
+        'sonnet'
+      );
+    }
+    const saved = activeModel || settings.savedProviderModel?.[providerId];
+    if (typeof saved === 'string' && saved) return saved;
+
+    const discovered = settings.providerConfigs?.[providerId]?.discoveredModels;
+    if (Array.isArray(discovered) && discovered.length > 0) {
+      const defaultEntry = discovered.find((d: any) => d?.isDefault) || discovered[0];
+      const id = WeChatBridgePlugin.firstString(defaultEntry?.encodedId, defaultEntry?.model, defaultEntry?.rawId, defaultEntry?.id);
+      if (id) return id;
+    }
+    return '';
+  }
+
   private async switchProvider(name: string, lang: Lang): Promise<string> {
     const enabled = this.getEnabledProviders();
     if (!(enabled as string[]).includes(name)) {
       return this.t('providerUnknown', lang, name, enabled.join(', '));
     }
-    this.data.providerId = name as ProviderId;
-    // A bound conversation's provider can't be changed after the fact
-    // (Claudian itself rejects that from its own UI); switching provider
-    // here always means "start fresh", same as /new.
+    const providerId = name as ProviderId;
+    this.data.providerId = providerId;
+    // 绑定会话的供应商无法中途切换，切换供应商必须开启全新会话
     this.data.conversationId = null;
     await this.saveData(this.data);
 
-    // this.data.providerId alone is only the bridge's own bookkeeping - it
-    // has zero effect on what provider a brand-new blank tab actually gets
-    // (verified against Claudian's real createTab/createReservedTab: there is
-    // no per-call provider option). Claudian decides that globally from
-    // `settings.settingsProvider` (resolveSettingsProviderId, and the same
-    // field the blank-tab model resolver reads) - the exact field
-    // applySettingsCommand already conditions its own writes on. Without
-    // mutating it here too, /provider would report success but the next
-    // /new-style tab would silently reopen on whatever provider Claudian's
-    // settings already had.
-    // getClaudianPlugin() never returns falsy (it throws if Claudian isn't
-    // enabled) - the /provider route only ever reaches switchProvider() after
-    // getEnabledProviders() above already succeeded in reading Claudian's own
-    // settings, so Claudian being present is already established by this
-    // point; no separate guard needed here.
+    // 关键修正：Claudian 2.x 的空白 Tab 模型与供应商解析器 Aut(settings) 优先读取
+    // settings.lastSelectedChatModel，而非 settings.settingsProvider。
+    // 若只改 settingsProvider，Claudian 新建空白 Tab 时依然会读取残留的 lastSelectedChatModel
+    // 导致新会话依然在旧供应商上初始化。因此必须在此同步更新 lastSelectedChatModel 与 model。
     const claudian = this.getClaudianPlugin();
     await claudian.mutateSettings((settings) => {
-      settings.settingsProvider = name;
+      settings.settingsProvider = providerId;
+      const targetModel = this.resolveDefaultModelForProvider(providerId, settings);
+      if (targetModel) {
+        settings.lastSelectedChatModel = { providerId, model: targetModel };
+        settings.model = targetModel;
+        if (!settings.savedProviderModel || typeof settings.savedProviderModel !== 'object') {
+          settings.savedProviderModel = {};
+        }
+        settings.savedProviderModel[providerId] = targetModel;
+      }
     });
     for (const view of claudian.getAllViews?.() ?? []) {
       view.refreshModelSelector?.();
@@ -1938,18 +1969,23 @@ export default class WeChatBridgePlugin extends Plugin {
       return existingTab;
     }
 
-    // Either re-opening a specific closed conversation, or - when
-    // conversationId is null - a brand-new blank tab. For the blank-tab case:
-    // Claudian's own createTab() has no per-call "use this provider" option
-    // (verified against its real signature - it only recognizes
-    // activate/lifecycleState/draftModel) - a blank tab's provider/model is
-    // decided globally from `settings.settingsProvider` instead
-    // (resolveBlankTabModel reads that field, not anything passed to
-    // createTab). So /provider's actual effect has to land there too - see
-    // switchProvider, which sets settings.settingsProvider before this ever
-    // runs - rather than being (uselessly) threaded through here.
+    // 打开特定已有关闭的会话，或者当 conversationId 为 null 时新建空白 Tab。
+    // 针对空白 Tab：Claudian 2.x 的 createTab() 接受 { draftModel: string } 选项。
+    // 显式传入目标 Provider 的 draftModel，能够直接指定新 Tab 的 Provider 与 Model，
+    // 双保险杜绝 Claudian 内部任何残留的旧模型/旧 Provider 回退。
     await this.ensureTabCapacity(claudian, tabManager);
-    const tab = conversationId ? await tabManager.createTab(conversationId) : await tabManager.createTab();
+    let tab: ClaudianTab;
+    if (conversationId) {
+      tab = await tabManager.createTab(conversationId);
+    } else {
+      const settings = claudian.settings ?? {};
+      const targetProvider = this.data.providerId
+        ?? (settings.lastSelectedChatModel?.providerId as ProviderId | undefined)
+        ?? (settings.settingsProvider as ProviderId | undefined)
+        ?? 'claude';
+      const targetModel = this.resolveDefaultModelForProvider(targetProvider, settings);
+      tab = await tabManager.createTab(undefined, undefined, targetModel ? { draftModel: targetModel } : undefined);
+    }
     if (!tab) throw new Error(this.t('tabLimitReached', this.getLangSafe()));
     this.installInteractiveHooks(tab);
     return tab;
