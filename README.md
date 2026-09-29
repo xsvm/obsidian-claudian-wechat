@@ -2,7 +2,7 @@
 
 [中文](README.zh-CN.md) | English
 
-![version](https://img.shields.io/badge/version-v1.0.8-blue)
+![version](https://img.shields.io/badge/version-v1.0.9-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![platform](https://img.shields.io/badge/platform-desktop-lightgrey)
 ![Obsidian](https://img.shields.io/badge/Obsidian-plugin-7c3aed)
@@ -66,7 +66,7 @@ Claude Code / Configured Provider
 ## Requirements
 
 - Desktop Obsidian (`isDesktopOnly`, Windows / macOS / Linux).
-- [Claudian](https://github.com/YishenTu/claudian) plugin installed, enabled, and configured with a working provider.
+- [Claudian](https://github.com/YishenTu/claudian) **2.3+** plugin installed, enabled, and configured with a working provider.
 - WeChat account with official ClawBot access.
 - Python 3.11+ available on system `PATH`.
 - Node.js & npm (only required if building from source).

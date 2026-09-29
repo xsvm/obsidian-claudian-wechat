@@ -10,6 +10,20 @@ import { damerauLevenshtein, extractCommandWords } from './textUtils';
 import { ConversationMetaStore } from './conversationMeta';
 import { ScheduleManager } from './scheduleManager';
 import {
+  ToolbarOption,
+  getToolbar,
+  refreshToolbar,
+  pickOption,
+  modelOptions,
+  reasoningState,
+  setReasoning,
+  permissionToggle,
+  modeSelector,
+  serviceTierToggle,
+} from './claudianToolbar';
+
+type ToolbarCommand = 'model' | 'effort' | 'permission' | 'mode' | 'fast';
+import {
   ALL_PROVIDER_IDS,
   ProviderId,
   IncomingImage,
@@ -29,6 +43,7 @@ import {
   ClaudianView,
   ClaudianPluginInstance,
   ParsedQuestion,
+  ApprovalDecision,
   WeChatPatchedInputController,
   PendingInteractive,
   ConversationMeta,
@@ -151,6 +166,11 @@ export default class WeChatBridgePlugin extends Plugin {
    * the first turn's reply is silently stranded on the discarded tab.
    */
   private getTabMutex: Promise<unknown> = Promise.resolve();
+  /** Last blank tab the bridge created for `conversationId === null`. Reused
+   * while it still has no conversation, so a send Claudian silently refuses
+   * (sendMessage returns without starting a turn) can't make every following
+   * WeChat message spawn yet another blank tab. */
+  private lastBlankTabId: string | null = null;
   /**
    * A single outstanding AskUserQuestion or approval request, surfaced via
    * pendingPushes and resolved by /answer or /approve. Adopted back from a
@@ -626,17 +646,14 @@ export default class WeChatBridgePlugin extends Plugin {
       { pattern: /^\/commands\b/i, run: (_m, lang) => this.listClaudeCommands(lang) },
       {
         pattern: /^\/(model|effort|permission)\s+(\S+)/i,
-        run: (_m, lang) => {
-          const settingsCmd = this.parseSettingsCommand(_m.input as string);
-          // Always non-null here - the route's own pattern is a superset of
-          // parseSettingsCommand's, so a match on one implies a match on the
-          // other. Re-parsing (rather than duplicating its key-mapping logic
-          // inline) keeps that mapping defined in exactly one place.
-          return this.applySettingsCommand(settingsCmd!.key, settingsCmd!.value, lang);
-        },
+        run: async (_m, lang) =>
+          (await this.runToolbarCommand(_m[1].toLowerCase() as ToolbarCommand, _m[2], lang)) ?? this.t('toolbarUnavailable', lang),
       },
-      { pattern: /^\/effort\s*$/i, run: (_m, lang) => this.listEffortOptions(lang) },
-      { pattern: /^\/model\s*$/i, run: (_m, lang) => this.listAvailableModels(lang) },
+      { pattern: /^\/effort\s*$/i, run: async (_m, lang) => (await this.runToolbarCommand('effort', '', lang)) ?? this.t('toolbarUnavailable', lang) },
+      { pattern: /^\/model\s*$/i, run: async (_m, lang) => (await this.runToolbarCommand('model', '', lang)) ?? this.t('toolbarUnavailable', lang) },
+      { pattern: /^\/permission\s*$/i, run: async (_m, lang) => (await this.runToolbarCommand('permission', '', lang)) ?? this.t('toolbarUnavailable', lang) },
+      { pattern: /^\/mode(?:\s+(\S+))?\s*$/i, run: async (m, lang) => (await this.runToolbarCommand('mode', m[1] ?? '', lang)) ?? this.t('toolbarUnavailable', lang) },
+      { pattern: /^\/fast(?:\s+(on|off))?\s*$/i, run: async (m, lang) => (await this.runToolbarCommand('fast', m[1]?.toLowerCase() ?? '', lang)) ?? this.t('toolbarUnavailable', lang) },
       { pattern: /^\/provider\s+(\S+)/i, run: (m, lang) => this.switchProvider(m[1].toLowerCase(), lang) },
       { pattern: /^\/provider\b/i, run: (_m, lang) => this.t('providerUsage', lang, this.getEnabledProviders().join(', ')) },
       { pattern: /^\/ls(?:\s+(all))?\b/i, run: (m, lang) => this.listConversations(lang, Boolean(m[1])) },
@@ -702,81 +719,85 @@ export default class WeChatBridgePlugin extends Plugin {
 
   // ---- settings commands: /model, /effort, /permission ----
 
-  private parseSettingsCommand(text: string): { key: 'model' | 'effortLevel' | 'permissionMode'; value: string } | null {
-    const match = text.match(/^\/(model|effort|permission)\s+(\S+)/i);
-    if (!match) return null;
-    const [, cmd, value] = match;
-    const key = cmd.toLowerCase() === 'model'
-      ? 'model'
-      : cmd.toLowerCase() === 'effort'
-        ? 'effortLevel'
-        : 'permissionMode';
-    return { key, value };
-  }
+  /**
+   * /model, /effort, /permission, /mode, /fast against the bridge tab's own
+   * input toolbar (see claudianToolbar.ts) - lists exactly what the desktop
+   * dropdowns show and applies through the same handlers a click runs.
+   * `arg === ''` lists; otherwise it's a 1-based index, value, or label.
+   * Returns null when this Claudian build has no such toolbar, so callers
+   * can fall back to the older settings-write path.
+   */
+  private async runToolbarCommand(cmd: ToolbarCommand, arg: string, lang: Lang): Promise<string | null> {
+    let tab: ClaudianTab;
+    try {
+      tab = await this.getOrCreateWeChatTab();
+    } catch {
+      return null;
+    }
+    const cb = getToolbar(tab);
+    if (!cb) return null;
 
-  private async applySettingsCommand(
-    key: 'model' | 'effortLevel' | 'permissionMode',
-    value: string,
-    lang: Lang,
-  ): Promise<string> {
-    const claudian = this.getClaudianPlugin();
-    const savedKey = key === 'model'
-      ? 'savedProviderModel'
-      : key === 'effortLevel'
-        ? 'savedProviderEffort'
-        : 'savedProviderPermissionMode';
+    const current = this.t('modelsCurrentMarker', lang);
+    const render = (header: string, options: ToolbarOption[], currentValue: string | undefined) => [
+      header,
+      ...options.map((o, i) => {
+        const name = o.label && o.label !== o.value ? `${o.label} (${o.value})` : o.value;
+        return `${i + 1}. ${o.group ? `[${o.group}] ` : ''}${name}${o.value === currentValue ? ` ${current}` : ''}`;
+      }),
+      '',
+      this.t('toolbarUsage', lang, `/${cmd}`),
+    ].join('\n');
+    const apply = async (options: ToolbarOption[], run: (value: string) => Promise<void>) => {
+      const picked = pickOption(options, arg);
+      if (!picked) return this.t('optionInvalid', lang, arg, `/${cmd}`);
+      await run(picked.value);
+      refreshToolbar(tab);
+      return this.t('settingApplied', lang, cmd, picked.label || picked.value);
+    };
 
-    const metas = await this.metaStore.readAll();
-    const providerId = this.resolveActiveProviderId(metas);
-
-    if (key === 'effortLevel') {
-      const settings = claudian.settings ?? {};
-      const isActiveInUi = this.isProviderActiveInUi(providerId, settings);
-      const model = isActiveInUi ? settings.model : settings.savedProviderModel?.[providerId];
-      const known = this.getKnownEffortOptions(providerId, model, settings);
-      if (known && !known.some((o) => o.value === value)) {
-        return this.t('effortInvalid', lang, value, known.map((o) => o.value).join(', '));
+    switch (cmd) {
+      case 'model': {
+        const options = modelOptions(cb);
+        if (options.length === 0) return this.t('toolbarNone', lang, cmd);
+        return arg ? apply(options, (v) => cb.onModelChange(v)) : render(this.t('toolbarHeader', lang, cmd), options, cb.getSettings().model);
+      }
+      case 'effort': {
+        const state = reasoningState(cb);
+        if (!state) return this.t('toolbarNone', lang, cmd);
+        return arg ? apply(state.options, (v) => setReasoning(cb, v, state.adaptive)) : render(this.t('toolbarHeader', lang, cmd), state.options, state.current);
+      }
+      case 'permission': {
+        const toggle = permissionToggle(cb);
+        if (!toggle) return this.t('toolbarNone', lang, cmd);
+        const options = [
+          { value: toggle.inactiveValue, label: toggle.inactiveLabel },
+          { value: toggle.activeValue, label: toggle.activeLabel },
+        ];
+        return arg ? apply(options, (v) => cb.onPermissionModeChange(v)) : render(this.t('toolbarHeader', lang, cmd), options, toggle.current);
+      }
+      case 'mode': {
+        const mode = modeSelector(cb);
+        if (!mode) return this.t('toolbarNone', lang, cmd);
+        return arg ? apply(mode.options, (v) => cb.onModeChange(v)) : render(this.t('toolbarHeader', lang, cmd), mode.options, mode.value);
+      }
+      case 'fast': {
+        const toggle = serviceTierToggle(cb);
+        if (!toggle) return this.t('toolbarNone', lang, cmd);
+        const turnOn = arg === 'on' ? true : arg === 'off' ? false : !toggle.isActive;
+        await cb.onServiceTierChange(turnOn ? toggle.activeValue : toggle.inactiveValue);
+        refreshToolbar(tab);
+        return this.t('settingApplied', lang, cmd, turnOn ? toggle.activeLabel : toggle.inactiveLabel);
       }
     }
-
-    // Mirrors ProviderSettingsCoordinator.commitProviderSettingsSnapshot: the
-    // savedProviderX map is written unconditionally (every provider's last
-    // value is always remembered), but the flat field - what Claudian's own
-    // UI is showing *right now* - is only overwritten when the provider this
-    // command targets is the one currently active in settings.settingsProvider.
-    // Otherwise we'd silently change what the Claudian sidebar displays for a
-    // provider you're not even looking at.
-    await claudian.mutateSettings((settings) => {
-      if (!settings[savedKey] || typeof settings[savedKey] !== 'object') {
-        settings[savedKey] = {};
-      }
-      settings[savedKey][providerId] = value;
-      if (this.isProviderActiveInUi(providerId, settings)) {
-        settings[key] = value;
-      }
-      if (key === 'model') {
-        // 同步更新 Claudian 内部优先读取的 lastSelectedChatModel，防止模型选择器漂移
-        settings.lastSelectedChatModel = { providerId, model: value };
-      }
-    });
-
-    for (const view of claudian.getAllViews?.() ?? []) {
-      view.refreshModelSelector?.();
-    }
-
-    const label = lang === 'zh' ? '已设置' : 'OK';
-    const providerSuffix = this.getEnabledProviders().length > 1
-      ? `${this.t('providerLabel', lang)}${providerId}, `
-      : '';
-    return `${label}: ${providerSuffix}${key} -> ${value}`;
   }
 
   // ---- provider selection (only relevant for users with more than one Claudian provider enabled) ----
 
-  /** Every provider id Claudian actually has enabled right now. `claude` has no on/off switch - it's always enabled. */
+  /** Every provider id Claudian actually has enabled right now. */
   private getEnabledProviders(): ProviderId[] {
     const configs = this.getClaudianPlugin().settings?.providerConfigs ?? {};
-    return ALL_PROVIDER_IDS.filter((id) => id === 'claude' || configs[id]?.enabled === true);
+    // Claudian 2.3+ gives claude an on/off switch too (default on).
+    return ALL_PROVIDER_IDS.filter((id) => (configs[id]?.enabled ?? id === 'claude') === true);
   }
 
   /**
@@ -811,29 +832,21 @@ export default class WeChatBridgePlugin extends Plugin {
 
   /**
    * 解析指定供应商应当使用的默认或已保存模型 ID。
-   * 对于 claude，优先从 savedProviderModel.claude、defaultModel 或兜底 'sonnet'；
-   * 对于 CLI-backed providers (pi/codex/opencode/grok)，优先 savedProviderModel[id]，其次从 discoveredModels 寻找默认/第一个。
+   * 所有供应商一视同仁：当前模型 → savedProviderModel[id] → Claudian 已发现模型里的默认/第一个。
+   * 不硬编码任何模型名；都没有时返回 ''，交给 Claudian 自己选默认模型。
    */
   private resolveDefaultModelForProvider(providerId: ProviderId, settings: Record<string, any>): string {
     const activeModel = this.isProviderActiveInUi(providerId, settings) && typeof settings.model === 'string' && settings.model
       ? settings.model
       : undefined;
 
-    if (providerId === 'claude') {
-      return (
-        activeModel ||
-        settings.savedProviderModel?.claude ||
-        settings.providerConfigs?.claude?.defaultModel ||
-        'sonnet'
-      );
-    }
     const saved = activeModel || settings.savedProviderModel?.[providerId];
     if (typeof saved === 'string' && saved) return saved;
 
     const discovered = settings.providerConfigs?.[providerId]?.discoveredModels;
     if (Array.isArray(discovered) && discovered.length > 0) {
       const defaultEntry = discovered.find((d: any) => d?.isDefault) || discovered[0];
-      const id = WeChatBridgePlugin.firstString(defaultEntry?.encodedId, defaultEntry?.model, defaultEntry?.rawId, defaultEntry?.id);
+      const id = WeChatBridgePlugin.firstString(defaultEntry?.encodedId, defaultEntry?.value, defaultEntry?.model, defaultEntry?.rawId, defaultEntry?.id);
       if (id) return id;
     }
     return '';
@@ -873,174 +886,12 @@ export default class WeChatBridgePlugin extends Plugin {
     return this.t('providerSwitched', lang, name);
   }
 
-  /**
-   * Lists the models Claudian currently knows about for a provider (default:
-   * whichever one /model would target right now).
-   *
-   * Reverse-engineered source: for the CLI-backed providers (codex, pi,
-   * opencode, grok - anything but claude), Claudian doesn't ship a static
-   * model list at all. It shells out to that provider's CLI to discover what
-   * models are actually available on this machine/account, then caches the
-   * result at `settings.providerConfigs.<id>.discoveredModels` (each entry
-   * `{model, displayName, description, isDefault, ...}` - see
-   * ProviderSettingsCoordinator's normalizeStored/DXe in Claudian's own
-   * main.js). That cache is plain persisted settings data, unlike the
-   * registry class that computes it (a module-private static class not
-   * reachable from outside Claudian's own bundle) - so this reads the cache
-   * directly instead of trying to call Claudian's internal discovery API.
-   * `claude`'s model list is a small built-in constant baked into Claudian's
-   * UI code, not discovered - reverse-engineered from Claudian's own bundle
-   * (the `bKe` array) and mirrored below as `CLAUDE_STATIC_MODELS`. Every
-   * `id` here is exactly what Claudian accepts for `/model <id>`.
-   */
   /** Returns the first argument that is a non-empty string, else undefined. */
   private static firstString(...vals: unknown[]): string | undefined {
     for (const v of vals) {
       if (typeof v === 'string' && v) return v;
     }
     return undefined;
-  }
-
-  private static readonly CLAUDE_STATIC_MODELS: { id: string; label: string; description: string }[] = [
-    { id: 'haiku', label: 'Haiku', description: 'Fast and efficient' },
-    { id: 'sonnet', label: 'Sonnet', description: 'Balanced performance' },
-    { id: 'opus', label: 'Opus', description: 'Most capable' },
-    { id: 'fable', label: 'Fable 5 ($$)', description: "Anthropic's most capable model — premium pricing above Opus" },
-  ];
-
-  private async listAvailableModels(lang: Lang): Promise<string> {
-    const providerId = this.resolveActiveProviderId(await this.metaStore.readAll());
-
-    const settings = this.getClaudianPlugin().settings ?? {};
-    if (providerId === 'claude') {
-      const current = settings.model;
-      const lines = [this.t('modelsHeader', lang, providerId)];
-      for (const m of WeChatBridgePlugin.CLAUDE_STATIC_MODELS) {
-        const marker = m.id === current ? this.t('modelsCurrentMarker', lang) : '';
-        lines.push(`- ${m.id} (${m.label}: ${m.description})${marker ? ` ${marker}` : ''}`);
-      }
-      lines.push('\n' + this.t('modelsUsageHint', lang));
-      return lines.join('\n');
-    }
-
-    const discovered = settings.providerConfigs?.[providerId]?.discoveredModels;
-    if (!Array.isArray(discovered) || discovered.length === 0) {
-      return this.t('modelsNoneDiscovered', lang, providerId);
-    }
-
-    const isActiveInUi = this.isProviderActiveInUi(providerId, settings);
-    const current = isActiveInUi ? settings.model : settings.savedProviderModel?.[providerId];
-
-    const lines = [this.t('modelsHeader', lang, providerId)];
-    for (const entry of discovered) {
-      // Field names differ per provider in Claudian's own persisted cache:
-      // grok/opencode use `model`/`rawId` as the literal value Claudian's
-      // settings.model accepts; pi instead requires the `pi:provider/id`
-      // form stored in `encodedId` (its plain `id` alone is NOT a valid
-      // /model value - Claudian rejects anything without the `pi:` prefix
-      // for that provider), so encodedId must be preferred over id.
-      const id = WeChatBridgePlugin.firstString(entry?.model, entry?.rawId, entry?.encodedId, entry?.id);
-      if (!id) continue;
-      const displayName = WeChatBridgePlugin.firstString(entry?.displayName, entry?.label, entry?.name) || id;
-      const markers = [
-        entry?.isDefault ? this.t('modelsDefaultMarker', lang) : '',
-        id === current ? this.t('modelsCurrentMarker', lang) : '',
-      ].filter(Boolean).join(' ');
-      lines.push(`- ${id}${displayName !== id ? ` (${displayName})` : ''}${markers ? ` ${markers}` : ''}`);
-    }
-    lines.push('\n' + this.t('modelsUsageHint', lang));
-    return lines.join('\n');
-  }
-
-  /**
-   * Providers whose valid effort levels are a fixed, model-independent list
-   * baked into Claudian's own UI (reverse-engineered from Claudian's bundle:
-   * claude's thinking-gear list and codex's subagent reasoning-effort
-   * dropdown are both this exact 5-value set). Not model-dependent the way
-   * claude's `xhigh` availability technically is in Claudian's own code
-   * (there's a per-model-version check gating it) - we deliberately don't
-   * replicate that finer-grained check here (see class doc comment risk
-   * notes), so a `claude` model that doesn't actually support `xhigh` will
-   * still list it as "valid" here even though Claudian's own UI would hide
-   * it for that specific model.
-   */
-  private static readonly STATIC_EFFORT_LEVELS: { value: string; label: string }[] =
-    ['low', 'medium', 'high', 'xhigh', 'max'].map((value) => ({ value, label: value }));
-
-  /**
-   * Best-effort lookup of the effort/reasoning levels Claudian actually
-   * considers valid for `modelId` under `providerId` right now - used to
-   * validate `/effort X` instead of blindly writing whatever the user typed.
-   *
-   * Returns `null` when we have no reliable source for this provider/model
-   * combination - callers should skip validation entirely in that case
-   * rather than reject everything.
-   *
-   * Source per provider (see class doc comment for how this was derived):
-   * - claude / codex: fixed list, independent of the specific model.
-   * - grok / opencode: each entry in `providerConfigs.<id>.discoveredModels`
-   *   carries its own `reasoningEfforts` array (`{value,label}` pairs) once
-   *   Claudian has discovered it - same persisted-cache source `/model`
-   *   already reads model names from, just a different field on the same
-   *   objects.
-   * - pi: each entry in `providerConfigs.pi.discoveredModels` instead carries
-   *   a `thinkingLevels` array of plain strings, keyed by `id` (not `model`/
-   *   `rawId` like the other providers).
-   */
-  private getKnownEffortOptions(
-    providerId: ProviderId,
-    modelId: string | undefined,
-    settings: Record<string, any>,
-  ): { value: string; label: string }[] | null {
-    if (providerId === 'claude' || providerId === 'codex') {
-      return WeChatBridgePlugin.STATIC_EFFORT_LEVELS;
-    }
-    if (!modelId) return null;
-    const discovered = settings.providerConfigs?.[providerId]?.discoveredModels;
-    if (!Array.isArray(discovered)) return null;
-    const entry = discovered.find(
-      (m: any) => m?.model === modelId || m?.rawId === modelId || m?.encodedId === modelId || m?.id === modelId,
-    );
-    if (providerId === 'pi') {
-      const levels = entry?.thinkingLevels;
-      if (!Array.isArray(levels) || levels.length === 0) return null;
-      return levels
-        .filter((v: any) => typeof v === 'string' && v)
-        .map((value: string) => ({ value, label: value }));
-    }
-    // grok, opencode
-    const efforts = entry?.reasoningEfforts;
-    if (!Array.isArray(efforts) || efforts.length === 0) return null;
-    return efforts
-      .map((e: any) => {
-        const value = typeof e?.value === 'string' ? e.value : typeof e === 'string' ? e : null;
-        if (!value) return null;
-        const label = typeof e?.label === 'string' && e.label ? e.label : value;
-        return { value, label };
-      })
-      .filter((e: { value: string; label: string } | null): e is { value: string; label: string } => e !== null);
-  }
-
-  /** `/effort` with no args: lists the effort levels valid for whatever /model would target right now, per getKnownEffortOptions. */
-  private async listEffortOptions(lang: Lang): Promise<string> {
-    const settings = this.getClaudianPlugin().settings ?? {};
-    const metas = await this.metaStore.readAll();
-    const providerId = this.resolveActiveProviderId(metas);
-    const isActiveInUi = this.isProviderActiveInUi(providerId, settings);
-    const model = isActiveInUi ? settings.model : settings.savedProviderModel?.[providerId];
-    const current = isActiveInUi ? settings.effortLevel : settings.savedProviderEffort?.[providerId];
-
-    const known = this.getKnownEffortOptions(providerId, model, settings);
-    if (!known) {
-      return this.t('effortUnknown', lang, providerId);
-    }
-    const lines = [this.t('effortHeader', lang, providerId)];
-    for (const o of known) {
-      const marker = o.value === current ? this.t('modelsCurrentMarker', lang) : '';
-      lines.push(`- ${o.value}${o.label !== o.value ? ` (${o.label})` : ''}${marker ? ` ${marker}` : ''}`);
-    }
-    lines.push('\n' + this.t('effortUsageHint', lang));
-    return lines.join('\n');
   }
 
   // ---- conversation list / switch / new ----
@@ -1441,18 +1292,17 @@ export default class WeChatBridgePlugin extends Plugin {
     try {
       // The user's currently-open note in Obsidian - whatever that happens to
       // be, unrelated to this conversation - would otherwise silently ride
-      // along as `<linked_note>` context on this send (see ClaudianTab.ui's
-      // fileContextManager doc comment for why). WeChat has no way to see or
-      // veto that, so pre-empt it before every bridge-driven send.
+      // along as `<linked_content>` on a new conversation's first turn (see
+      // ClaudianTab.ui's linkedContentController doc comment). WeChat has no
+      // way to see or veto that, so pre-empt it before every bridge-driven send.
       //
-      // Guarded with a typeof check (not just `?.`) because this was
-      // reverse-engineered from Claudian's internals: if a Claudian update
-      // renames/removes/changes the shape of fileContextManager, `?.` alone
-      // would still throw "markCurrentNoteSent is not a function" and abort
-      // the whole send - best-effort here, a missed pre-empt is much less
-      // bad than silently failing to deliver the user's message at all.
-      if (typeof tab.ui.fileContextManager?.markCurrentNoteSent === 'function') {
-        tab.ui.fileContextManager.markCurrentNoteSent();
+      // Best-effort: selectExplicit throws once the conversation is locked
+      // (nothing to pre-empt then), and a future Claudian reshaping this
+      // internal must not abort delivering the user's message.
+      if (tab.state.messages.length === 0) {
+        try {
+          tab.ui.linkedContentController?.selectExplicit(null);
+        } catch { /* locked or reshaped - nothing to do */ }
       }
 
       const beforeCount = tab.state.messages.length;
@@ -1477,11 +1327,16 @@ export default class WeChatBridgePlugin extends Plugin {
         this.progressiveCursors.set(tab.id, { pushedMessageCount: 0, pushedBlocksInCurrent: 0, everPushed: false });
         progressiveTimer = window.setInterval(() => this.flushProgressive(tab, beforeCount, false), PROGRESSIVE_POLL_INTERVAL_MS);
       }
+      let notAccepted = false;
       try {
         await tab.controllers.inputController.sendMessage({ content: text, images: attachments });
+        // Claudian 2.3+ sendMessage() returns silently without starting a turn
+        // when the tab isn't accepting intents or has no usable model - no
+        // user message gets added. Say so instead of a generic "no reply".
+        notAccepted = tab.state.messages.length === beforeCount;
       } finally {
         if (progressiveTimer !== null) window.clearInterval(progressiveTimer);
-        if (progressive) {
+        if (progressive && !notAccepted) {
           // Unverified-but-cheap safety margin: inputController.sendMessage()'s
           // promise is trusted to resolve only once the whole turn is done
           // (extractDispatchText has relied on that for non-progressive
@@ -1527,6 +1382,7 @@ export default class WeChatBridgePlugin extends Plugin {
           this.progressiveCursors.delete(tab.id);
         }
       }
+      if (notAccepted) return this.t('sendNotAccepted', lang);
 
       // Switched away *during* the send: the freshly-relocated `tab` above
       // still got mutated out from under this exact call while
@@ -1978,6 +1834,11 @@ export default class WeChatBridgePlugin extends Plugin {
     if (conversationId) {
       tab = await tabManager.createTab(conversationId);
     } else {
+      const reusable = this.lastBlankTabId ? tabManager.getTab?.(this.lastBlankTabId) ?? null : null;
+      if (reusable && !reusable.conversationId && reusable.state.messages.length === 0) {
+        this.installInteractiveHooks(reusable);
+        return reusable;
+      }
       const settings = claudian.settings ?? {};
       const targetProvider = this.data.providerId
         ?? (settings.lastSelectedChatModel?.providerId as ProviderId | undefined)
@@ -1987,6 +1848,7 @@ export default class WeChatBridgePlugin extends Plugin {
       tab = await tabManager.createTab(undefined, undefined, targetModel ? { draftModel: targetModel } : undefined);
     }
     if (!tab) throw new Error(this.t('tabLimitReached', this.getLangSafe()));
+    if (!conversationId) this.lastBlankTabId = tab.id;
     this.installInteractiveHooks(tab);
     return tab;
   }
@@ -2040,9 +1902,10 @@ export default class WeChatBridgePlugin extends Plugin {
 
     if (ic.__wechatBridgeOwner === this) return;
     ic.__wechatBridgeOwner = this;
-    ic.handleAskUserQuestion = async (input: any) => this.handleAskUserQuestionHeadless(tab, input);
-    ic.handleApprovalRequest = async (kind: string, details: any, title: string, opts: any) =>
-      this.handleApprovalRequestHeadless(tab, kind, details, title, opts);
+    ic.handleAskUserQuestion = async (interactionId: string, input: any, signal?: AbortSignal) =>
+      this.handleAskUserQuestionHeadless(tab, interactionId, input, signal);
+    ic.handleApprovalRequest = async (interactionId: string, toolName: string, input: any, description: string, opts: any, signal?: AbortSignal) =>
+      this.handleApprovalRequestHeadless(tab, interactionId, toolName, input, description, opts, signal);
   }
 
   /**
@@ -2052,16 +1915,17 @@ export default class WeChatBridgePlugin extends Plugin {
    * /answer has collected an answer for every question - matching the result
    * shape OA's own submit path builds: `{[question.id ?? question.question]: value | value[]}`.
    */
-  private async handleAskUserQuestionHeadless(tab: ClaudianTab, input: any): Promise<Record<string, string | string[]> | null> {
+  private async handleAskUserQuestionHeadless(tab: ClaudianTab, interactionId: string, input: any, signal?: AbortSignal): Promise<Record<string, string | string[]> | null> {
     const rawQuestions = Array.isArray(input?.questions) ? input.questions : [];
     const questions: ParsedQuestion[] = rawQuestions
-      .filter((q: any) => q && typeof q === 'object' && typeof q.question === 'string' && Array.isArray(q.options) && q.options.length > 0)
+      // Same filter as Claudian's own parseQuestions(): options, or a freeform-only `isOther` question.
+      .filter((q: any) => q && typeof q === 'object' && typeof q.question === 'string' && ((Array.isArray(q.options) && q.options.length > 0) || q.isOther === true))
       .map((q: any, i: number) => ({
         key: typeof q.id === 'string' ? q.id : q.question,
         question: q.question,
         header: typeof q.header === 'string' ? q.header.slice(0, 12) : `Q${i + 1}`,
         multiSelect: q.multiSelect === true,
-        options: (q.options as any[]).map((o) => {
+        options: ((q.options ?? []) as any[]).map((o) => {
           if (o && typeof o === 'object') {
             const label = typeof o.label === 'string' ? o.label : typeof o.value === 'string' ? o.value : typeof o.text === 'string' ? o.text : typeof o.name === 'string' ? o.name : 'Option';
             const value = typeof o.value === 'string' ? o.value : typeof o.id === 'string' ? o.id : label;
@@ -2071,7 +1935,12 @@ export default class WeChatBridgePlugin extends Plugin {
         }),
       }));
 
-    if (questions.length === 0) return null;
+    const ic = tab.controllers.inputController as WeChatPatchedInputController;
+    // Nothing we can render, or a secret (password/token) we must not route
+    // through WeChat's servers: leave it to Claudian's own desktop widget.
+    if (questions.length === 0 || rawQuestions.some((q: any) => q?.isSecret === true)) {
+      return ic.__wechatOriginalHandleAskUserQuestion?.(interactionId, input, signal) ?? null;
+    }
 
     const lang = this.getLangSafe();
     const lines: string[] = [this.t('askUserQuestionHeader', lang)];
@@ -2082,14 +1951,13 @@ export default class WeChatBridgePlugin extends Plugin {
     lines.push('\n' + this.t(questions.length > 1 ? 'askUserQuestionUsageMulti' : 'askUserQuestionUsageSingle', lang));
     const promptText = lines.join('\n');
 
-    const ic = tab.controllers.inputController as WeChatPatchedInputController;
     let pending: Extract<PendingInteractive, { kind: 'question' }> | null = null;
     let settled = false;
 
     const wechatPromise = new Promise<Record<string, string | string[]> | null>((resolve) => {
       pending = {
         kind: 'question', tabId: tab.id, questions, selections: new Map(), promptText, sourceIc: ic,
-        resolve: (value) => { settled = true; resolve(value); },
+        resolve: (value) => { settled = true; ic.dismissProviderInteraction?.(interactionId); resolve(value); },
       };
       this.pendingInteractive = pending;
       ic.__wechatPendingInteractive = pending;
@@ -2103,11 +1971,11 @@ export default class WeChatBridgePlugin extends Plugin {
     // answers first wins; the other is cleaned up.
     const nativeHandler = ic.__wechatOriginalHandleAskUserQuestion;
     const nativePromise: Promise<Record<string, string | string[]> | null> = nativeHandler
-      ? Promise.resolve(nativeHandler(input)).then((value) => {
+      ? Promise.resolve(nativeHandler(interactionId, input, signal)).then((value) => {
           if (!settled && pending) {
             settled = true;
             this.clearPendingInteractive(pending);
-            this.pendingPushes.push(this.t('answeredOnDesktop', lang));
+            if (!signal?.aborted) this.pendingPushes.push(this.t('answeredOnDesktop', lang));
           }
           return value;
         }).catch(() => null)
@@ -2119,24 +1987,27 @@ export default class WeChatBridgePlugin extends Plugin {
   /** Headless stand-in for Claudian's inline command/file/permission approval widget. */
   private async handleApprovalRequestHeadless(
     tab: ClaudianTab,
-    kind: string,
-    details: any,
-    title: string,
-    _opts: any,
-  ): Promise<'accept' | 'acceptForSession' | 'decline' | 'cancel'> {
+    interactionId: string,
+    toolName: string,
+    input: any,
+    description: string,
+    opts: any,
+    signal?: AbortSignal,
+  ): Promise<ApprovalDecision> {
     const lang = this.getLangSafe();
-    const desc = kind === 'command_execution' && typeof details?.command === 'string'
-      ? details.command
-      : String(details?.reason ?? title ?? kind);
+    const title = toolName;
+    const desc = typeof input?.command === 'string'
+      ? input.command
+      : String(description || opts?.decisionReason || toolName);
     const promptText = this.t('approvalHeader', lang, title, desc);
     const ic = tab.controllers.inputController as WeChatPatchedInputController;
     let pending: Extract<PendingInteractive, { kind: 'approval' }> | null = null;
     let settled = false;
 
-    const wechatPromise = new Promise<'accept' | 'acceptForSession' | 'decline' | 'cancel'>((resolve) => {
+    const wechatPromise = new Promise<ApprovalDecision>((resolve) => {
       pending = {
         kind: 'approval', tabId: tab.id, title, promptText, sourceIc: ic,
-        resolve: (value) => { settled = true; resolve(value); },
+        resolve: (value) => { settled = true; ic.dismissProviderInteraction?.(interactionId); resolve(value); },
       };
       this.pendingInteractive = pending;
       ic.__wechatPendingInteractive = pending;
@@ -2146,16 +2017,16 @@ export default class WeChatBridgePlugin extends Plugin {
     // See handleAskUserQuestionHeadless: also drive the native approval
     // widget in parallel so a desktop user isn't stuck looking at nothing.
     const nativeHandler = ic.__wechatOriginalHandleApprovalRequest;
-    const nativePromise: Promise<'accept' | 'acceptForSession' | 'decline' | 'cancel'> = nativeHandler
-      ? Promise.resolve(nativeHandler(kind, details, title, _opts)).then((value) => {
+    const nativePromise: Promise<ApprovalDecision> = nativeHandler
+      ? Promise.resolve(nativeHandler(interactionId, toolName, input, description, opts, signal)).then((value) => {
           if (!settled && pending) {
             settled = true;
             this.clearPendingInteractive(pending);
-            this.pendingPushes.push(this.t('answeredOnDesktop', lang));
+            if (!signal?.aborted) this.pendingPushes.push(this.t('answeredOnDesktop', lang));
           }
           return value;
         }).catch(() => 'cancel' as const)
-      : new Promise<'accept' | 'acceptForSession' | 'decline' | 'cancel'>(() => {});
+      : new Promise<ApprovalDecision>(() => {});
 
     return Promise.race([wechatPromise, nativePromise]);
   }
@@ -2377,7 +2248,7 @@ export default class WeChatBridgePlugin extends Plugin {
     const m = text.match(/^\/approve\s+(accept|always|deny|cancel)\b/i);
     if (!m) return this.t('approveUsage', lang);
     const word = m[1].toLowerCase();
-    const decision: 'accept' | 'acceptForSession' | 'decline' | 'cancel' = word === 'accept' ? 'accept' : word === 'always' ? 'acceptForSession' : word === 'deny' ? 'decline' : 'cancel';
+    const decision: ApprovalDecision = word === 'accept' ? 'allow' : word === 'always' ? 'allow-always' : word === 'deny' ? 'deny' : 'cancel';
     pending.resolve(decision);
     this.clearPendingInteractive(pending);
     return this.t('approvalResolved', lang, decision);

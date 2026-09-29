@@ -2,7 +2,7 @@
 
 中文 | [English](README.md)
 
-![version](https://img.shields.io/badge/version-v1.0.8-blue)
+![version](https://img.shields.io/badge/version-v1.0.9-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![platform](https://img.shields.io/badge/platform-desktop-lightgrey)
 ![Obsidian](https://img.shields.io/badge/Obsidian-plugin-7c3aed)
@@ -66,7 +66,7 @@ Claude Code / 你配置的 provider
 ## 依赖要求
 
 - 桌面版 Obsidian（Claudian 与本项目均为 `isDesktopOnly`，支持 Windows / macOS / Linux）。
-- 已安装并启用 [Claudian](https://github.com/YishenTu/claudian) 插件，并配置好可用的 provider（默认 `claude`）。
+- 已安装并启用 [Claudian](https://github.com/YishenTu/claudian) **2.3 及以上**插件，并配置好可用的 provider（默认 `claude`）。
 - 微信账号具备官方 ClawBot 功能权限。
 - 系统 `PATH` 中具备 Python 3.11+（用于首次自动构建专用 `venv/`）。
 - Node.js 与 npm（仅从源码编译时需要；直接下载 Release 解压则无需安装）。

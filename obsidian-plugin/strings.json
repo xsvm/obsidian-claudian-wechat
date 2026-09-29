@@ -12,6 +12,7 @@
     "en": "No Claudian view is open. Open the Claudian sidebar once."
   },
   "noTabManager": { "zh": "Claudian 的 tab manager 不可用。", "en": "Claudian tab manager not available." },
+  "sendNotAccepted": { "zh": "Claudian 没有接受这条消息(标签页正忙或当前 Provider 没有可用模型)。请稍后重试,或用 /provider /model 检查设置。", "en": "Claudian did not accept this message (tab busy, or no available model for the current provider). Retry shortly, or check /provider and /model."},
   "tabLimitReached": {
     "zh": "Claudian 标签页已达上限(10个),无法为桥接创建新标签页。请在桌面端关闭一个标签页后重试。",
     "en": "Claudian has hit its hard tab limit (10) and could not create a tab for the bridge. Close a tab in the desktop UI and try again."
@@ -121,36 +122,13 @@
     "zh": "没有等待补充说明的图片。",
     "en": "There's no buffered image waiting for a caption."
   },
-  "modelsNoneDiscovered": {
-    "zh": "还没有为供应商 {0} 发现任何模型。请先在 Claudian 桌面端打开一次这个供应商的设置/模型选择器，触发一次发现，然后再试。",
-    "en": "No models discovered yet for provider {0}. Open that provider's settings/model picker once in Claudian's desktop UI to trigger discovery, then try again."
-  },
-  "modelsHeader": {
-    "zh": "供应商 {0} 已发现的模型：",
-    "en": "Discovered models for provider {0}:"
-  },
-  "modelsDefaultMarker": { "zh": "[默认]", "en": "[default]" },
   "modelsCurrentMarker": { "zh": "[当前]", "en": "[current]" },
-  "modelsUsageHint": {
-    "zh": "用 /model <模型ID> 切换。",
-    "en": "Use /model <model id> to switch."
-  },
-  "effortHeader": {
-    "zh": "供应商 {0} 当前模型的有效 effort 档位：",
-    "en": "Valid effort levels for provider {0}'s current model:"
-  },
-  "effortUsageHint": {
-    "zh": "用 /effort <档位> 切换。",
-    "en": "Use /effort <level> to switch."
-  },
-  "effortUnknown": {
-    "zh": "供应商 {0} 没有可供校验的 effort 档位列表，/effort <档位> 会直接写入，不做校验。",
-    "en": "Provider {0} has no verifiable effort-level list; /effort <level> will be written as-is, without validation."
-  },
-  "effortInvalid": {
-    "zh": "\"{0}\" 不是当前模型的有效 effort 档位。可用档位: {1}",
-    "en": "\"{0}\" is not a valid effort level for the current model. Available levels: {1}"
-  },
+  "toolbarHeader": { "zh": "{0} 可选项（与 Claudian 桌面端一致）：", "en": "{0} options (same as Claudian's desktop toolbar):" },
+  "toolbarUsage": { "zh": "用 {0} <编号或名称> 切换。", "en": "Use {0} <number or name> to switch." },
+  "toolbarNone": { "zh": "当前供应商/模型没有 {0} 这个选项（桌面端也不显示）。", "en": "The current provider/model has no {0} control (hidden on the desktop too)." },
+  "toolbarUnavailable": { "zh": "这个版本的 Claudian 不支持从微信调整该项，需要 Claudian 2.3 及以上。", "en": "This Claudian version doesn't support changing that from WeChat; Claudian 2.3+ is required." },
+  "optionInvalid": { "zh": "\"{0}\" 不是有效选项。发送 {1} 查看可选项。", "en": "\"{0}\" is not a valid option. Send {1} to see the options." },
+  "settingApplied": { "zh": "已设置 {0} → {1}", "en": "Set {0} → {1}" },
   "reconnectedPendingPrefix": {
     "zh": "（插件刚重新连接，补发一条你还没回答的问题/请求）",
     "en": "(Plugin just reconnected - resending a question/request you haven't answered yet)"
@@ -310,9 +288,11 @@
       "/getfile N — 获取 /files 列出的文件，多个用逗号分隔如 /getfile 1,2",
       "/send <路径> — 直接发送 vault 内某个文件",
       "/schedule HH:MM 内容 — 定时把内容发给当前对话（Claudian 的回复会推送到微信），发送 /schedule 查看完整用法",
-      "/model [名称] — 查看或切换模型，如 /model opus（不带参数=查看当前供应商可用模型）",
-      "/effort [等级] — 查看/切换思考强度（如 /effort high，不带参数查看可选项）",
-      "/permission <模式> — 切换权限模式，如 /permission yolo",
+      "/model [编号或名称] — 查看或切换模型，如 /model 2（不带参数=列出桌面端下拉框里的模型）",
+      "/effort [编号或档位] — 查看/切换思考强度（如 /effort high，不带参数查看可选项）",
+      "/permission [模式] — 查看/切换权限（Safe / YOLO）",
+      "/mode [模式] — 查看/切换供应商的模式开关（桌面端有显示时才可用）",
+      "/fast [on|off] — 切换快速模式（桌面端闪电按钮）",
       "?/provider <名称> — 切换供应商（会开始新对话），发送 /provider 查看可选项",
       "/commands — 查看 Claude 自带的斜杠命令",
       "其他任何文字 — 直接发给 Claudian（Claude 自带的斜杠命令也这样发）"
@@ -337,9 +317,11 @@
       "/getfile N — fetch a file from /files, comma-separate for several, e.g. /getfile 1,2",
       "/send <path> — send a specific file from the vault directly",
       "/schedule HH:MM text — send text to the current conversation at that time (Claudian's reply is pushed to WeChat); send /schedule alone for full usage",
-      "/model [name] — view or switch model, e.g. /model opus (omit to list current provider's models)",
+      "/model [name] — view or switch model, e.g. /model 2 (omit to list current provider's models)",
       "/effort [level] — view or switch effort level, e.g. /effort high (omit to list current options)",
-      "/permission <mode> — switch permission mode, e.g. /permission yolo",
+      "/permission [mode] — view or switch permission (Safe / YOLO)",
+      "/mode [mode] — view or switch the provider's mode toggle (when the desktop shows one)",
+      "/fast [on|off] — toggle fast mode (the desktop lightning button)",
       "?/provider <name> — switch provider (starts a new conversation); send /provider alone to see options",
       "/commands — list Claude's own slash commands",
       "anything else — sent to Claudian directly (also how you use Claude's own slash commands)"

@@ -54,13 +54,15 @@ export interface ClaudianTab {
       /** Renders Claudian's inline "AskUserQuestion" widget and resolves with the
        * user's picks. This bridge replaces it per-tab (see installInteractiveHooks)
        * so a question can be answered from WeChat via /answer instead of only from
-       * the desktop UI. `input` is the raw tool_use params (shape: `{questions:[...]}`,
-       * reverse-engineered from Claudian's own OA widget class - see parseQuestions). */
-      handleAskUserQuestion?(input: any, signal?: AbortSignal): Promise<any>;
-      /** Renders Claudian's inline command/file/permission approval widget.
-       * Replaced the same way, answerable from WeChat via /approve. `kind` is
-       * "command_execution" | "file_change" | "permissions". */
-      handleApprovalRequest?(kind: string, details: any, title: string, opts: any): Promise<any>;
+       * the desktop UI. `input` is the raw tool_use params (shape: `{questions:[...]}`).
+       * Claudian 2.3+ signature: `(interactionId, input, signal)`. */
+      handleAskUserQuestion?(interactionId: string, input: any, signal?: AbortSignal): Promise<any>;
+      /** Renders Claudian's inline approval widget. Replaced the same way,
+       * answerable from WeChat via /approve. Claudian 2.3+ signature:
+       * `(interactionId, toolName, input, description, opts, signal)`. */
+      handleApprovalRequest?(interactionId: string, toolName: string, input: any, description: string, opts: any, signal?: AbortSignal): Promise<any>;
+      /** Removes a still-open inline question/approval widget by interactionId. */
+      dismissProviderInteraction?(interactionId: string): void;
       /** Interrupts the in-flight turn (same call the desktop UI's own "Stop"
        * button and Escape key make - reverse-engineered as InputController's
        * `cancelStreaming()`: aborts the provider's abortController, marks the
@@ -80,17 +82,12 @@ export interface ClaudianTab {
     isStreaming: boolean;
   };
   ui: {
-    /** FileContextManager.autoAttachActiveFile() listens for Obsidian's global
-     * `file-open` workspace event and marks *whatever file the user currently
-     * has open, in any pane* as this tab's "current note" - completely
-     * independent of what conversation the tab is bound to, or who's actually
-     * about to send a message in it. `shouldSendCurrentNote()` then silently
-     * folds that note in as `<linked_note>` context on the tab's next send,
-     * once, until `markCurrentNoteSent()` clears the pending flag. For a
-     * bridge-driven tab nobody is looking at, this means whatever note
-     * happens to be open on the user's screen at that moment rides along on
-     * the next WeChat message with no way to notice from WeChat itself. */
-    fileContextManager: { markCurrentNoteSent(): void } | null;
+    /** Claudian 2.3+ "linked content": while a new conversation's tab is in
+     * auto-draft mode it follows whatever file the user currently has open
+     * (any pane), and that path rides along as `<linked_content>` on the
+     * conversation's *first* turn. `selectExplicit(null)` pins it to "none";
+     * throws once the conversation is locked (already has turns) or mid-submit. */
+    linkedContentController?: { selectExplicit(path: string | null): void } | null;
   };
 }
 
@@ -182,14 +179,20 @@ export type WeChatPatchedInputController = NonNullable<ClaudianTab['controllers'
    * isn't left staring at nothing just because this tab also happens to be
    * WeChat-bound.
    */
-  __wechatOriginalHandleAskUserQuestion?: (input: any) => Promise<Record<string, string | string[]> | null>;
+  __wechatOriginalHandleAskUserQuestion?: (interactionId: string, input: any, signal?: AbortSignal) => Promise<Record<string, string | string[]> | null>;
   __wechatOriginalHandleApprovalRequest?: (
-    kind: string,
-    details: any,
-    title: string,
+    interactionId: string,
+    toolName: string,
+    input: any,
+    description: string,
     opts: any,
-  ) => Promise<'accept' | 'acceptForSession' | 'decline' | 'cancel'>;
+    signal?: AbortSignal,
+  ) => Promise<ApprovalDecision>;
 };
+
+/** Decision values Claudian 2.3+'s approval pipeline expects back (its own
+ * widget's Deny / Allow once / Always allow map to these). */
+export type ApprovalDecision = 'allow' | 'allow-always' | 'deny' | 'cancel';
 
 export type PendingInteractive =
   | {
@@ -214,7 +217,7 @@ export type PendingInteractive =
       kind: 'approval';
       tabId: string;
       title: string;
-      resolve: (value: 'accept' | 'acceptForSession' | 'decline' | 'cancel') => void;
+      resolve: (value: ApprovalDecision) => void;
       promptText: string;
       sourceIc: WeChatPatchedInputController;
     };
