@@ -29,6 +29,9 @@ interface UIConfig {
   getModelOptions(settings: Record<string, any>): ToolbarOption[];
   getReasoningOptions(model: string, settings: Record<string, any>): ToolbarOption[];
   isAdaptiveReasoningModel(model: string, settings: Record<string, any>): boolean;
+  /** Claudian 2.3.10+: permission is a menu of N modes. */
+  getPermissionModeOptions?(settings: Record<string, any>): ToolbarOption[] | null;
+  /** Claudian <= 2.3.9: two-state toggle. */
   getPermissionModeToggle?(): ToggleConfig | null;
   getModeSelector?(settings: Record<string, any>): { value: string; label?: string; options: ToolbarOption[] } | null;
   getServiceTierToggle?(settings: Record<string, any>): ToggleConfig | null;
@@ -91,9 +94,15 @@ export function setReasoning(cb: ToolbarCallbacks, value: string, adaptive: bool
   return adaptive ? cb.onEffortLevelChange(value) : cb.onThinkingBudgetChange(value);
 }
 
-export function permissionToggle(cb: ToolbarCallbacks): (ToggleConfig & { current: string }) | null {
-  const toggle = cb.getUIConfig().getPermissionModeToggle?.() ?? null;
-  return toggle ? { ...toggle, current: cb.getSettings().permissionMode } : null;
+export function permissionOptions(cb: ToolbarCallbacks): { options: ToolbarOption[]; current: string } | null {
+  const ui = cb.getUIConfig();
+  const settings = cb.getSettings();
+  let options = ui.getPermissionModeOptions?.(settings) ?? [];
+  if (options.length === 0) {
+    const t = ui.getPermissionModeToggle?.();
+    if (t) options = [{ value: t.inactiveValue, label: t.inactiveLabel }, { value: t.activeValue, label: t.activeLabel }];
+  }
+  return options.length ? { options, current: settings.permissionMode } : null;
 }
 
 /** The mode switch only renders for exactly two options (same rule as Claudian's own mode selector). */

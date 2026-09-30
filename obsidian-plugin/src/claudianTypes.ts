@@ -94,6 +94,10 @@ export interface ClaudianTab {
 export interface ClaudianTabManager {
   getAllTabs(): ClaudianTab[];
   getTab?(tabId: string): ClaudianTab | null;
+  /** Claudian 2.3+: every tab incl. not-yet-hydrated ("cold") ones, which getTab/getAllTabs skip. */
+  getTabIdentities?(): { id: string; conversationId: string | null }[];
+  /** Activating a cold tab is what hydrates it. */
+  switchToTab?(tabId: string): Promise<void>;
   /**
    * Verified against Claudian's real implementation: the only options it
    * recognizes are `activate`, `lifecycleState`, and `draftModel` - there is

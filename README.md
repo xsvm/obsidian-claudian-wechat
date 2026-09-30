@@ -2,7 +2,7 @@
 
 [中文](README.zh-CN.md) | English
 
-![version](https://img.shields.io/badge/version-v1.0.9-blue)
+![version](https://img.shields.io/badge/version-v1.0.10-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![platform](https://img.shields.io/badge/platform-desktop-lightgrey)
 ![Obsidian](https://img.shields.io/badge/Obsidian-plugin-7c3aed)
@@ -127,7 +127,7 @@ Copy the built files (`manifest.json`, `main.js`, `relay.py`, `strings.json`) in
 
 Join the WeChat group for questions, feedback, and updates:
 
-![WeChat group QR code](assets/wechat-group-qrcode.png)
+![WeChat group QR code](assets/wechat-group-qrcode.jpg)
 
 ## License
 

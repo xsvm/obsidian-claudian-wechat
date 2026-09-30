@@ -17,7 +17,7 @@ import {
   modelOptions,
   reasoningState,
   setReasoning,
-  permissionToggle,
+  permissionOptions,
   modeSelector,
   serviceTierToggle,
 } from './claudianToolbar';
@@ -767,13 +767,9 @@ export default class WeChatBridgePlugin extends Plugin {
         return arg ? apply(state.options, (v) => setReasoning(cb, v, state.adaptive)) : render(this.t('toolbarHeader', lang, cmd), state.options, state.current);
       }
       case 'permission': {
-        const toggle = permissionToggle(cb);
-        if (!toggle) return this.t('toolbarNone', lang, cmd);
-        const options = [
-          { value: toggle.inactiveValue, label: toggle.inactiveLabel },
-          { value: toggle.activeValue, label: toggle.activeLabel },
-        ];
-        return arg ? apply(options, (v) => cb.onPermissionModeChange(v)) : render(this.t('toolbarHeader', lang, cmd), options, toggle.current);
+        const perm = permissionOptions(cb);
+        if (!perm) return this.t('toolbarNone', lang, cmd);
+        return arg ? apply(perm.options, (v) => cb.onPermissionModeChange(v)) : render(this.t('toolbarHeader', lang, cmd), perm.options, perm.current);
       }
       case 'mode': {
         const mode = modeSelector(cb);
@@ -1048,7 +1044,7 @@ export default class WeChatBridgePlugin extends Plugin {
 
     let tab: ClaudianTab;
     try {
-      tab = await this.getOrCreateWeChatTab();
+      tab = await this.getOrCreateWeChatTab(undefined, false);
     } catch {
       return; // No Claudian view open yet, or similar transient state; try again next tick.
     }
@@ -1758,10 +1754,10 @@ export default class WeChatBridgePlugin extends Plugin {
    * id-based lookup /goto uses to jump to a conversation, reused here so a
    * stale/mutated tab-object reference is never trusted on its own.
    */
-  private async getOrCreateWeChatTab(conversationId?: string | null): Promise<ClaudianTab> {
+  private async getOrCreateWeChatTab(conversationId?: string | null, allowCreate = true): Promise<ClaudianTab> {
     const target = conversationId === undefined ? this.data.conversationId : conversationId;
     const previous = this.getTabMutex.catch(() => {});
-    const run = previous.then(() => this.resolveOrCreateTab(target));
+    const run = previous.then(() => this.resolveOrCreateTab(target, allowCreate));
     this.getTabMutex = run.catch(() => {});
     return run;
   }
@@ -1815,7 +1811,7 @@ export default class WeChatBridgePlugin extends Plugin {
    * tab object. `conversationId === null` means "brand-new blank tab", not
    * "look one up".
    */
-  private async resolveOrCreateTab(conversationId: string | null): Promise<ClaudianTab> {
+  private async resolveOrCreateTab(conversationId: string | null, allowCreate = true): Promise<ClaudianTab> {
     const claudian = this.getClaudianPlugin();
     const lang = this.getLangSafe();
     const { tabManager, existingTab } = await this.resolveViewAndTabManager(claudian, conversationId, lang);
@@ -1824,15 +1820,36 @@ export default class WeChatBridgePlugin extends Plugin {
       this.installInteractiveHooks(existingTab);
       return existingTab;
     }
+    // Background callers (the desktop-activity poller) must never open,
+    // create or activate tabs - doing so every tick is what kept stealing
+    // focus from the user's input box and spawning fresh "new chat" tabs.
+    if (!allowCreate) throw new Error('tab not open');
+
+    // Claudian 2.3+ keeps restored-but-unopened tabs as cold identities that
+    // getTab()/getAllTabs() skip. Creating another tab for the same
+    // conversation would duplicate it; hydrate the existing one instead.
+    if (conversationId) {
+      for (const view of claudian.getAllViews?.() ?? []) {
+        const tm = view.getTabManager?.();
+        const cold = tm?.getTabIdentities?.().find((t) => t.conversationId === conversationId);
+        if (tm && cold && tm.switchToTab) {
+          await tm.switchToTab(cold.id);
+          const hydrated = tm.getTab?.(cold.id);
+          if (hydrated) {
+            this.installInteractiveHooks(hydrated);
+            return hydrated;
+          }
+        }
+      }
+    }
 
     // 打开特定已有关闭的会话，或者当 conversationId 为 null 时新建空白 Tab。
     // 针对空白 Tab：Claudian 2.x 的 createTab() 接受 { draftModel: string } 选项。
     // 显式传入目标 Provider 的 draftModel，能够直接指定新 Tab 的 Provider 与 Model，
     // 双保险杜绝 Claudian 内部任何残留的旧模型/旧 Provider 回退。
-    await this.ensureTabCapacity(claudian, tabManager);
     let tab: ClaudianTab;
     if (conversationId) {
-      tab = await tabManager.createTab(conversationId);
+      tab = await tabManager.createTab(conversationId, undefined, { activate: false });
     } else {
       const reusable = this.lastBlankTabId ? tabManager.getTab?.(this.lastBlankTabId) ?? null : null;
       if (reusable && !reusable.conversationId && reusable.state.messages.length === 0) {
@@ -1845,7 +1862,7 @@ export default class WeChatBridgePlugin extends Plugin {
         ?? (settings.settingsProvider as ProviderId | undefined)
         ?? 'claude';
       const targetModel = this.resolveDefaultModelForProvider(targetProvider, settings);
-      tab = await tabManager.createTab(undefined, undefined, targetModel ? { draftModel: targetModel } : undefined);
+      tab = await tabManager.createTab(undefined, undefined, targetModel ? { draftModel: targetModel, activate: false } : { activate: false });
     }
     if (!tab) throw new Error(this.t('tabLimitReached', this.getLangSafe()));
     if (!conversationId) this.lastBlankTabId = tab.id;
@@ -2252,24 +2269,6 @@ export default class WeChatBridgePlugin extends Plugin {
     pending.resolve(decision);
     this.clearPendingInteractive(pending);
     return this.t('approvalResolved', lang, decision);
-  }
-
-  /**
-   * TabManager.createTab() silently returns `null` instead of a tab once
-   * `tabs.size + pendingTabCreations >= maxTabs` (Claudian's own cap, clamped
-   * 3-10 - see main.js's TabManager.createTab). If the bridge's own bound
-   * conversation isn't already open as a tab (view was closed/reopened, or
-   * still applies then; the caller's null check reports it clearly instead
-   * of crashing).
-   */
-  private async ensureTabCapacity(claudian: ClaudianPluginInstance, tabManager: ClaudianTabManager): Promise<void> {
-    const configured = claudian.settings?.maxTabs;
-    const maxTabs = typeof configured === 'number' ? Math.max(3, Math.min(10, configured)) : 3;
-    if (tabManager.getAllTabs().length < maxTabs) return;
-    if (maxTabs >= 10) return;
-    await claudian.mutateSettings((settings) => {
-      settings.maxTabs = maxTabs + 1;
-    });
   }
 
   private findClaudianViewViaWorkspace(): ClaudianView | null {

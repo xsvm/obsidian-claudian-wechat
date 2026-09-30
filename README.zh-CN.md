@@ -2,7 +2,7 @@
 
 中文 | [English](README.md)
 
-![version](https://img.shields.io/badge/version-v1.0.9-blue)
+![version](https://img.shields.io/badge/version-v1.0.10-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![platform](https://img.shields.io/badge/platform-desktop-lightgrey)
 ![Obsidian](https://img.shields.io/badge/Obsidian-plugin-7c3aed)
@@ -135,7 +135,7 @@ npm run build
 
 欢迎加入微信交流群，提问、反馈或获取最新动态：
 
-![微信群二维码](assets/wechat-group-qrcode.png)
+![微信群二维码](assets/wechat-group-qrcode.jpg)
 
 ## 许可
 
